@@ -1,0 +1,33 @@
+# configs/emo_tts_map.yaml
+# emo_id -> TTS用スタイルプロンプト
+
+"1_0": "A friendly female voice"
+"1_1": "An excited female voice"
+"1_2": "A fast-talking, excited female voice (about 1.2 times faster than normal)"
+
+"2_1": "An angry female voice"
+"2_2": "Fast-talking, angry female voice"
+
+"3_1": "A sad female voice"
+"3_2": "A female sad whispering voice"
+
+"4_1": "A female panicked voice"
+"4_2": "A fast-talking panicked female voice"
+
+"5_1": "A female scared voice"
+"5_2": "A female scared whispering voice"
+
+"6_1": "A female grumpy voice"
+"6_2": "A female fast-talking grumpy voice"
+
+"7_1": "A female coyly voice"
+"7_2": "A female coyly whispering voice"
+
+"8_1": "A female surprised voice"
+"8_2": "loud screams of girl"
+
+"9_1": "A female sleepy voice"
+"9_2": "A female sleepy whispering voice"
+
+"10_1": "A female shaky voice"
+"10_2": "A fast-talking shaky female voice"
