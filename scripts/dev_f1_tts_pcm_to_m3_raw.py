@@ -51,6 +51,7 @@ def main() -> None:
     # outputs
     ap.add_argument("--out_streamer_json", default="streamer.json")
     ap.add_argument("--out_raw_json", default="mouth_timeline.formant.raw.json")
+    ap.add_argument("--out_audio_meta_json", default="audio_meta.json")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -69,6 +70,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     streamer_json = out_dir / args.out_streamer_json
     raw_json = out_dir / args.out_raw_json
+    audio_meta_json = out_dir / args.out_audio_meta_json
 
     # M3 streamer init（1回のみ、再生成禁止）
     m3_cfg = MouthOCConfig(
@@ -95,11 +97,23 @@ def main() -> None:
 
     ms.finalize()
 
+    # M2 SSOT: audio_ms を別JSONに書き出す
+    audio_meta = {
+        "format": "audio_meta.v1",
+        "session_id": str(args.session_id),
+        "utt_id": str(args.utt_id),
+        "step_ms": int(args.step_ms),
+        "sample_rate": int(sample_rate),
+        "audio_ms": int(audio_ms),
+    }
+    audio_meta_json.write_text(json.dumps(audio_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     raw_obj = project_streamer_to_raw(streamer_json)
     raw_json.write_text(json.dumps(raw_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
     print("[OK] sample_rate =", sample_rate)
     print("[OK] audio_ms (M2 SSOT) =", audio_ms)
+    print("[OK] wrote:", audio_meta_json.as_posix())
     print("[OK] wrote:", raw_json.as_posix())
 
 
