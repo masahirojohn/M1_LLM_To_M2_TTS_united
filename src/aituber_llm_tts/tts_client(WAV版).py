@@ -5,7 +5,7 @@ import math
 import os
 import wave
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 try:
     from google import genai
@@ -51,20 +51,31 @@ class DummyTTSClient:
         """
         文字数ベースで適当な長さのサイン波ビープ音を生成。
         """
-        pcm_bytes, sample_rate, audio_ms = self.synthesize_pcm_bytes(
-            m1,
-            tts_style_prompt=tts_style_prompt,
-        )
+        text = m1.text or ""
+        cfg = self._config.tts
 
+        # 長さはだいたい base_ms_per_char * 文字数（最低 base_ms_min）
+        est_ms = max(cfg.base_ms_min, cfg.base_ms_per_char * max(1, len(text)))
+        sample_rate = cfg.sample_rate
         num_channels = 1
         sample_width = 2  # 16bit
+
+        n_frames = int(est_ms / 1000.0 * sample_rate)
+        freq = 880.0  # A5 くらいのビープ
 
         audio_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(audio_path), "wb") as wf:
             wf.setnchannels(num_channels)
             wf.setsampwidth(sample_width)
             wf.setframerate(sample_rate)
-            wf.writeframes(pcm_bytes)
+
+            for i in range(n_frames):
+                t = i / sample_rate
+                val = int(0.2 * 32767 * math.sin(2 * math.pi * freq * t))
+                wf.writeframesraw(val.to_bytes(2, byteorder="little", signed=True))
+
+        # 実際の長さで再計算（フレーム数から算出）
+        audio_ms = int(round(n_frames / sample_rate * 1000.0))
 
         return M2Output(
             schema_version=self._config.schema_version,
@@ -79,43 +90,6 @@ class DummyTTSClient:
             tts_preset=tts_style_prompt or "",
             tts_kana=None,
         )
-
-    def synthesize_pcm_bytes(
-        self,
-        m1: M1Output,
-        tts_style_prompt: Optional[str] = None,
-    ) -> Tuple[bytes, int, int]:
-        """
-        wavを書かずに、PCM16 mono の bytes を返す。
-        Returns:
-            pcm_bytes: bytes (PCM16 little-endian mono)
-            sample_rate: int
-            audio_ms: int
-        """
-        text = m1.text or ""
-        cfg = self._config.tts
-
-        # 長さはだいたい base_ms_per_char * 文字数（最低 base_ms_min）
-        est_ms = max(cfg.base_ms_min, cfg.base_ms_per_char * max(1, len(text)))
-        sample_rate = cfg.sample_rate
-        num_channels = 1
-        sample_width = 2  # 16bit
-        bytes_per_frame = num_channels * sample_width
-
-        n_frames = int(est_ms / 1000.0 * sample_rate)
-        freq = 880.0  # A5 くらいのビープ
-
-        buf = bytearray()
-        for i in range(n_frames):
-            t = i / sample_rate
-            val = int(0.2 * 32767 * math.sin(2 * math.pi * freq * t))
-            buf.extend(val.to_bytes(2, byteorder="little", signed=True))
-
-        # 念のため bytes_per_frame で割り切れることを保証（Dummyは必ずOKだがガード）
-        n_frames2 = len(buf) // bytes_per_frame
-        audio_ms = int(round(n_frames2 / sample_rate * 1000.0))
-
-        return (bytes(buf), int(sample_rate), int(audio_ms))
 
 
 # ========== Gemini TTS ==========
@@ -145,47 +119,6 @@ class RealTTSClient:
         audio_path: Path,
         tts_style_prompt: Optional[str] = None,
     ) -> M2Output:
-        pcm_bytes, sample_rate, audio_ms = self.synthesize_pcm_bytes(
-            m1,
-            tts_style_prompt=tts_style_prompt,
-        )
-
-        num_channels = 1
-        sample_width = 2  # 16bit
-
-        audio_path.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(audio_path), "wb") as wf:
-            wf.setnchannels(num_channels)
-            wf.setsampwidth(sample_width)
-            wf.setframerate(sample_rate)
-            wf.writeframes(pcm_bytes)
-
-        return M2Output(
-            schema_version=self._config.schema_version,
-            session_id=m1.session_id,
-            utt_id=m1.utt_id,
-            wav_path=str(audio_path),
-            audio_ms=audio_ms,
-            sample_rate=sample_rate,
-            num_channels=num_channels,
-            fmt="wav",
-            tts_engine="gemini-tts",
-            tts_preset=tts_style_prompt or "",
-            tts_kana=None,
-        )
-
-    def synthesize_pcm_bytes(
-        self,
-        m1: M1Output,
-        tts_style_prompt: Optional[str] = None,
-    ) -> Tuple[bytes, int, int]:
-        """
-        wavを書かずに、PCM16 mono の bytes を返す（方法Bの核）。
-        Returns:
-            pcm_bytes: bytes (PCM16 little-endian mono)
-            sample_rate: int
-            audio_ms: int
-        """
         text = m1.text or ""
         style_prompt = tts_style_prompt or ""
 
@@ -212,22 +145,36 @@ class RealTTSClient:
             ),
         )
 
-        # LINEAR16 PCM が返ってくる想定（cfg.sample_rate / mono）
+        # LINEAR16 PCM (24kHz mono) が返ってくる想定
         pcm_bytes: bytes = response.candidates[0].content.parts[0].inline_data.data
 
-        sample_rate = int(cfg.sample_rate)
+        sample_rate = cfg.sample_rate
         num_channels = 1
         sample_width = 2  # 16bit
         bytes_per_frame = num_channels * sample_width
         n_frames = len(pcm_bytes) // bytes_per_frame
         audio_ms = int(round(n_frames / sample_rate * 1000.0))
 
-        # ガード：端数（万一）があれば切り捨て（PCM16 mono の2byte境界を守る）
-        trim_n = n_frames * bytes_per_frame
-        if trim_n != len(pcm_bytes):
-            pcm_bytes = pcm_bytes[:trim_n]
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(audio_path), "wb") as wf:
+            wf.setnchannels(num_channels)
+            wf.setsampwidth(sample_width)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm_bytes)
 
-        return (pcm_bytes, sample_rate, int(audio_ms))
+        return M2Output(
+            schema_version=self._config.schema_version,
+            session_id=m1.session_id,
+            utt_id=m1.utt_id,
+            wav_path=str(audio_path),
+            audio_ms=audio_ms,
+            sample_rate=sample_rate,
+            num_channels=num_channels,
+            fmt="wav",
+            tts_engine="gemini-tts",
+            tts_preset=style_prompt,
+            tts_kana=None,
+        )
 
 
 # ========== Factory ==========

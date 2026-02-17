@@ -1,14 +1,21 @@
-# configs/default.yaml
 schema_version: "llm_tts_contracts_v0.2"
 
 llm:
+  provider: "openai"
+  model: "gpt-4.1-mini"
+  temperature: 0.7
   max_turns: 5
-  mode: "monologue"   # "monologue" / "reply" / 将来拡張
+  mode: "monologue"
+  system_prompt_path: "system_prompt_m1.txt"
 
 tts:
+  engine: "gemini"
+  model: "gemini-2.5-flash-preview-tts"
+  voice_name: "Kore"
   sample_rate: 24000
-  base_ms_per_char: 90   # ダミーTTSの長さ計算用（本番 TTS では無視）
-  base_ms_min: 600       # 文字数が少ないときの最低長
+  # dummy TTS を使う場合の長さ計算用（Real TTS では無視される想定）
+  base_ms_per_char: 90
+  base_ms_min: 600
 
 paths:
   out_root: "out"
@@ -18,3 +25,10 @@ paths:
 session:
   id_prefix: "sess_"
   seed: 12345
+
+  # ★追加：今日の配信テーマ（LLMへのヒント用）
+  episode_theme: "ゲーム配信・テトリス実況"
+
+  # ★追加：将来の「配信時間制御」用（今はまだ使わなくてOK）
+  # 例: 30分配信なら 30 * 60 * 1000 = 1_800_000
+  max_total_ms: 1800000

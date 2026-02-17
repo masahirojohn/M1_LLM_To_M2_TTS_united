@@ -1,0 +1,13 @@
+README.md
+setup.py
+src/aituber_llm_tts/__init__.py
+src/aituber_llm_tts/config.py
+src/aituber_llm_tts/emo_mapping.py
+src/aituber_llm_tts/init.py
+src/aituber_llm_tts/llm_client.py
+src/aituber_llm_tts/orchestrator.py
+src/aituber_llm_tts/tts_client.py
+src/aituber_llm_tts.egg-info/PKG-INFO
+src/aituber_llm_tts.egg-info/SOURCES.txt
+src/aituber_llm_tts.egg-info/dependency_links.txt
+src/aituber_llm_tts.egg-info/top_level.txt
