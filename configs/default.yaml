@@ -1,3 +1,17 @@
+# ==========================================================
+# M2 TTS Default Config (SSOT-aligned)
+#
+# この設定は統一コマンド合格時点の本番想定設定である。
+#
+# 重要:
+# - 本番運用はこのファイルをSSOTとする
+# - 無断で voice / model / sample_rate を変更しない
+# - audio_ms は最終SSOTであり、M3/M0はこれに従う
+#
+# 将来、dev / staging / prod を分ける場合のみ
+# default_dev.yaml 等を作成する。
+# ==========================================================
+
 schema_version: "llm_tts_contracts_v0.2"
 
 llm:
