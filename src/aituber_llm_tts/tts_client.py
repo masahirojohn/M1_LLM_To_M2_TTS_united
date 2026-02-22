@@ -4,6 +4,7 @@ from dataclasses import dataclass, asdict
 import math
 import os
 import wave
+import json
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
@@ -212,8 +213,49 @@ class RealTTSClient:
             ),
         )
 
-        # LINEAR16 PCM が返ってくる想定（cfg.sample_rate / mono）
-        pcm_bytes: bytes = response.candidates[0].content.parts[0].inline_data.data
+        # ---- robust audio extraction (avoid NoneType crash) ----
+        def _dump(obj) -> str:
+            # google-genai objects often support model_dump()
+            try:
+                return json.dumps(obj.model_dump(), ensure_ascii=False)  # type: ignore
+            except Exception:
+                try:
+                    return json.dumps(obj.__dict__, ensure_ascii=False)  # type: ignore
+                except Exception:
+                    return repr(obj)
+
+        if not getattr(response, "candidates", None):
+            raise RuntimeError(
+                "TTS response has no candidates. "
+                "Likely model/config/quota issue. response=" + _dump(response)
+            )
+
+        pcm_bytes_raw = None
+        for cand in response.candidates:
+            content = getattr(cand, "content", None)
+            if content is None:
+                continue
+            parts = getattr(content, "parts", None) or []
+            for p in parts:
+                inline = getattr(p, "inline_data", None)
+                if inline is None:
+                    continue
+                data = getattr(inline, "data", None)
+                if data:
+                    pcm_bytes_raw = data
+                    break
+            if pcm_bytes_raw:
+                break
+
+        if not pcm_bytes_raw:
+            # no audio returned -> print the whole response to debug
+            raise RuntimeError(
+                "TTS response contains no inline audio data (content/parts missing). "
+                "Check: (1) model is a TTS model, (2) response_modalities includes AUDIO, "
+                "(3) quota/transient errors. response=" + _dump(response)
+            )
+
+        pcm_bytes = bytes(pcm_bytes_raw)
 
         sample_rate = int(cfg.sample_rate)
         num_channels = 1
