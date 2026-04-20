@@ -259,6 +259,17 @@ def main() -> None:
         encoding="utf-8",
     )
 
+    # M2 SSOT: audio_ms を別JSONに書き出す
+    audio_meta = {
+        "format": "audio_meta.v1",
+        "session_id": str(args.session_id),
+        "utt_id": str(args.utt_id),
+        "step_ms": int(args.step_ms),
+        "sample_rate": int(sample_rate),
+        "audio_ms": int(audio_ms),
+    }
+    audio_meta_json.write_text(json.dumps(audio_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
     raw_obj = project_streamer_to_raw(streamer_json)
     raw_json.write_text(
         json.dumps(raw_obj, ensure_ascii=False, indent=2),
