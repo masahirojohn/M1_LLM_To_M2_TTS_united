@@ -1,0 +1,32 @@
+{
+  "comments": [
+    {
+      "id": "comment-101",
+      "service": "youtube",
+      "name": "視聴者B",
+      "user_id": "user_101",
+      "comment": "こんばんは！",
+      "timestamp": 1711627300000,
+      "has_gift": false,
+      "is_first": false,
+      "is_mod": false,
+      "is_owner": false,
+      "is_member": false,
+      "badges": []
+    },
+    {
+      "id": "comment-102",
+      "service": "youtube",
+      "name": "配信者本人",
+      "user_id": "owner_001",
+      "comment": "配信終了",
+      "timestamp": 1711627310000,
+      "has_gift": false,
+      "is_first": false,
+      "is_mod": false,
+      "is_owner": true,
+      "is_member": false,
+      "badges": []
+    }
+  ]
+}

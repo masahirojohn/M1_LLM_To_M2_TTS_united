@@ -1,0 +1,21 @@
+[
+  {
+    "id": "comment-001",
+    "service": "youtube",
+    "name": "viewer_oc_01",
+    "user_id": "OC_USER_01",
+    "comment": "眠そうでかわいい",
+    "timestamp": 1711627250000,
+    "has_gift": false,
+    "is_first": false,
+    "is_mod": false,
+    "is_owner": false,
+    "is_member": true,
+    "badges": [
+      {
+        "url": "https://example.com/member.png",
+        "label": "Member"
+      }
+    ]
+  }
+]

@@ -1,0 +1,33 @@
+{
+  "schema": "m1_unified_output.v0.1",
+  "speech": {
+    "text": "そろそろ眠くて限界かも……今日はここまでにするね。",
+    "style": "normal",
+    "emotion_hint": "sleepy"
+  },
+  "events": [
+    {
+      "type": "event",
+      "event_id": "evt_end_001",
+      "t_ms": 120000,
+      "duration_ms": 0,
+      "event_mode": "end_stream",
+      "trigger_source": "admin_comment"
+    }
+  ],
+  "obs_actions": [
+    {
+      "action": "screen_effect",
+      "params": {
+        "effect_id": "darken_overlay",
+        "duration_ms": 5000
+      }
+    },
+    {
+      "action": "play_sound",
+      "params": {
+        "sound_id": "sleep_end"
+      }
+    }
+  ]
+}

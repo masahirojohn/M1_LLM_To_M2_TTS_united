@@ -1,0 +1,47 @@
+# emo_id -> expression mapping
+# SSOT:
+# - sleepy expression は現状使わない
+# - 9_1 / 9_2 は expression としては sad に落とす
+# - blink は expr builder 側の auto_blink で生成する
+
+"0_0": "normal"
+
+"1_0": "normal"
+"1_1": "normal"
+"1_2": "smile"
+
+"2_0": "normal"
+"2_1": "angry"
+"2_2": "angry"
+
+"3_0": "normal"
+"3_1": "normal"
+"3_2": "sad"
+
+"4_0": "normal"
+"4_1": "normal"
+"4_2": "sad"
+
+"5_0": "normal"
+"5_1": "sad"
+"5_2": "sad"
+
+"6_0": "normal"
+"6_1": "angry"
+"6_2": "angry"
+
+"7_0": "normal"
+"7_1": "smile"
+"7_2": "smile"
+
+"8_0": "normal"
+"8_1": "normal"
+"8_2": "normal"
+
+"9_0": "normal"
+"9_1": "sad"
+"9_2": "sad"
+
+"10_0": "normal"
+"10_1": "angry"
+"10_2": "angry"

@@ -1,0 +1,16 @@
+[
+  {
+    "service": "youtube",
+    "name": "viewer_a",
+    "user_id": "USER_A",
+    "comment": "こんばんは",
+    "timestamp": 1711627200000
+  },
+  {
+    "service": "youtube",
+    "name": "viewer_b",
+    "user_id": "USER_B",
+    "comment": "眠そうでかわいい",
+    "timestamp": 1711627250000
+  }
+]

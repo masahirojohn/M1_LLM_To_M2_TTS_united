@@ -1,0 +1,25 @@
+[
+  {
+    "service": "youtube",
+    "name": "田中太郎",
+    "user_id": "user_001",
+    "comment": "こんにちは！",
+    "timestamp": 1711627200000
+  },
+  {
+    "service": "youtube",
+    "name": "管理者",
+    "user_id": "ADMIN_ID",
+    "comment": "event1発動",
+    "timestamp": 1711627210000
+  },
+  {
+    "service": "youtube",
+    "name": "ギフト太郎",
+    "user_id": "gift_001",
+    "comment": "応援してます！",
+    "timestamp": 1711627220000,
+    "has_gift": true,
+    "gift_value": 5000
+  }
+]

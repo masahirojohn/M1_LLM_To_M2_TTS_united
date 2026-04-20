@@ -46,3 +46,9 @@ session:
   # ★追加：将来の「配信時間制御」用（今はまだ使わなくてOK）
   # 例: 30分配信なら 30 * 60 * 1000 = 1_800_000
   max_total_ms: 1800000
+
+runtime:
+  baseline_comment_rate_per_min: 30.0
+  sleepy_threshold_pct_9_1: 20.0
+  sleepy_threshold_pct_9_2: 10.0
+  auto_end_stream_after_ms: 120000

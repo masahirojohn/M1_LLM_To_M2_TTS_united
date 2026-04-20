@@ -1,0 +1,36 @@
+{
+  "schema": "m1_unified_output.v0.1",
+  "speech": {
+    "text": "ギフトありがとう。ちょっと眠いけど、まだ頑張るよ。",
+    "style": "normal",
+    "emotion_hint": "sleepy"
+  },
+  "events": [
+    {
+      "type": "event",
+      "event_id": "evt_001",
+      "t_ms": 8000,
+      "duration_ms": 1600,
+      "bg_video": "in/05_0111.mp4",
+      "pose_json": "in/pose_timeline_pnp_fixed_05015.json",
+      "event_mode": "bg_only",
+      "trigger_source": "admin_comment"
+    }
+  ],
+  "obs_actions": [
+    {
+      "action": "screen_effect",
+      "params": {
+        "effect_id": "darken_overlay",
+        "duration_ms": 3000
+      }
+    },
+    {
+      "action": "set_energy_level",
+      "params": {
+        "value": 3,
+        "max": 10
+      }
+    }
+  ]
+}

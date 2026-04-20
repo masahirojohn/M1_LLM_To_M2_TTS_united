@@ -55,12 +55,21 @@ class SessionConfig:
 
 
 @dataclass
+class RuntimeConfig:
+    baseline_comment_rate_per_min: float
+    sleepy_threshold_pct_9_1: float
+    sleepy_threshold_pct_9_2: float
+    auto_end_stream_after_ms: int
+
+
+@dataclass
 class AppConfig:
     schema_version: str
     llm: LLMConfig
     tts: TTSConfig
     paths: AppPaths
     session: SessionConfig
+    runtime: RuntimeConfig
     emo_map_path: Path | None = None
 
 
@@ -79,6 +88,7 @@ def load_config(config_path: str | Path) -> AppConfig:
     tts_raw = raw.get("tts", {})
     paths_raw = raw.get("paths", {})
     sess_raw = raw.get("session", {})
+    runtime_raw = raw.get("runtime", {})
 
     # --- LLM ---
     llm = LLMConfig(
@@ -121,6 +131,22 @@ def load_config(config_path: str | Path) -> AppConfig:
         ),
     )
 
+    # --- Runtime ---
+    runtime = RuntimeConfig(
+        baseline_comment_rate_per_min=float(
+            runtime_raw.get("baseline_comment_rate_per_min", 30.0)
+        ),
+        sleepy_threshold_pct_9_1=float(
+            runtime_raw.get("sleepy_threshold_pct_9_1", 20.0)
+        ),
+        sleepy_threshold_pct_9_2=float(
+            runtime_raw.get("sleepy_threshold_pct_9_2", 10.0)
+        ),
+        auto_end_stream_after_ms=int(
+            runtime_raw.get("auto_end_stream_after_ms", 120000)
+        ),
+    )
+
     # --- emo map ---
     emo_map_path = config_path.parent / "emo_tts_map.yaml"
     if not emo_map_path.exists():
@@ -132,5 +158,6 @@ def load_config(config_path: str | Path) -> AppConfig:
         tts=tts,
         paths=paths,
         session=session,
+        runtime=runtime,
         emo_map_path=emo_map_path,
     )

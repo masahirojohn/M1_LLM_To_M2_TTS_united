@@ -1,0 +1,58 @@
+[
+  {
+    "id": "comment-001",
+    "service": "youtube",
+    "name": "視聴者A",
+    "user_id": "user_001",
+    "comment": "こんにちは！",
+    "timestamp": 1711627200000,
+    "has_gift": false,
+    "is_first": false,
+    "is_mod": false,
+    "is_owner": false,
+    "is_member": true,
+    "badges": [
+      {
+        "url": "https://example.com/member.png",
+        "label": "Member"
+      }
+    ]
+  },
+  {
+    "id": "comment-002",
+    "service": "youtube",
+    "name": "モデレーター",
+    "user_id": "mod_001",
+    "comment": "event1発動",
+    "timestamp": 1711627210000,
+    "has_gift": false,
+    "is_first": false,
+    "is_mod": true,
+    "is_owner": false,
+    "is_member": false,
+    "badges": []
+  },
+  {
+    "id": "comment-003",
+    "service": "youtube",
+    "name": "ギフト視聴者",
+    "user_id": "gift_001",
+    "comment": "応援してます！",
+    "timestamp": 1711627220000,
+    "has_gift": true,
+    "gift": {
+      "name": "Super Chat",
+      "price": 5000
+    },
+    "is_first": false,
+    "is_mod": false,
+    "is_owner": false,
+    "is_member": true,
+    "badges": [
+      {
+        "url": "https://example.com/member.png",
+        "label": "Member"
+      }
+    ]
+  }
+]

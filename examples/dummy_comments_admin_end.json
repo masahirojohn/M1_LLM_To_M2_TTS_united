@@ -1,0 +1,10 @@
+[
+  {
+    "service": "youtube",
+    "name": "admin_user",
+    "user_id": "ADMIN_001",
+    "comment": "配信終了してください",
+    "timestamp": 1711627300000,
+    "has_gift": false
+  }
+]
