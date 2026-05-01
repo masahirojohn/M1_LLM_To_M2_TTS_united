@@ -72,9 +72,8 @@ def main() -> int:
     ap.add_argument("--m0_repo_root", default="/workspaces/M0_session_renderer_final_1")
     ap.add_argument("--m35_repo_root", default="/workspaces/M3.5_final")
 
-    ap.add_argument("--input_wav", default=None)
-    ap.add_argument("--input_pcm", default=None)
-    ap.add_argument("--input_sr", type=int, default=16000)
+    # 1. 引数変更（削除と追加）
+    ap.add_argument("--response_trigger", default="短く返答してください。返答前にset_emotionを1回呼んでください")
 
     ap.add_argument(
         "--pose_json",
@@ -95,8 +94,7 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    if not args.input_wav and not args.input_pcm:
-        raise RuntimeError("--input_wav or --input_pcm is required")
+    # 2. inputチェック削除（削除済み）
 
     m1_repo = Path(args.m1_repo_root).resolve()
     m3_repo = Path(args.m3_repo_root).resolve()
@@ -127,7 +125,7 @@ def main() -> int:
         if not p.exists():
             raise FileNotFoundError(f"missing script: {p}")
 
-    # 1. Audio input smoke pipeline
+    # 3. Stage1の呼び出しを変更（cmd1 ブロックを置換）
     cmd1 = [
         python_exe,
         str(script_pipeline),
@@ -147,17 +145,11 @@ def main() -> int:
         str(float(args.duration_s)),
         "--step_ms",
         str(int(args.step_ms)),
+        "--mode",
+        "mic",
+        "--response_trigger",
+        str(args.response_trigger),
     ]
-
-    if args.input_wav:
-        cmd1 += ["--input_wav", str(Path(args.input_wav).resolve())]
-    else:
-        cmd1 += [
-            "--input_pcm",
-            str(Path(args.input_pcm).resolve()),
-            "--input_sr",
-            str(int(args.input_sr)),
-        ]
 
     _run(cmd1, cwd=m1_repo, env=env)
 

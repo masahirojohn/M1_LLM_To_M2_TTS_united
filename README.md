@@ -13,3 +13,20 @@
 
 ```bash
 pip install -r requirements.txt
+
+## Local Windows Smoke
+
+Local Windows validation completed.
+
+Confirmed:
+
+- WAV input E2E
+- microphone input bridge
+- realtime streaming
+- realtime streaming + pipe BG
+- microphone input E2E one-command smoke
+
+See:
+
+```text
+docs/local_migration_smoke.md

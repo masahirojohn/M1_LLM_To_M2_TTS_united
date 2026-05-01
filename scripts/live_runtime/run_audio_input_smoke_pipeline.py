@@ -79,6 +79,10 @@ def main() -> int:
 
     ap.add_argument("--gt_glob", default="data/knn_db/*.f1f2.json")
 
+    # --- 修正点: 引数追加 ---
+    ap.add_argument("--mode", choices=["file", "mic"], default="file")
+    ap.add_argument("--response_trigger", default="")
+
     args = ap.parse_args()
 
     m1_repo = Path(args.m1_repo_root).resolve()
@@ -86,8 +90,9 @@ def main() -> int:
     python_exe = sys.executable
     env = _build_env(m1_repo, m3_repo)
 
-    if not args.input_wav and not args.input_pcm:
-        raise RuntimeError("--input_wav or --input_pcm is required")
+    # --- 修正点: inputチェック変更 ---
+    if args.mode == "file" and not args.input_wav and not args.input_pcm:
+        raise RuntimeError("--input_wav or --input_pcm is required in file mode")
 
     out_root = (
         Path(args.out_root).resolve()
@@ -117,27 +122,31 @@ def main() -> int:
         args.session_id,
         "--out_dir",
         str(bridge_dir),
+        # --- 修正点: bridge cmd の --mode 変更 ---
         "--mode",
-        "file",
+        str(args.mode),
         "--model",
         str(args.model),
         "--api_version",
         str(args.api_version),
         "--duration_s",
         str(float(args.duration_s)),
+        # --- 修正点: response_trigger 変更 ---
         "--response_trigger",
-        "",
+        str(args.response_trigger),
     ]
 
-    if args.input_wav:
-        cmd += ["--input_wav", str(Path(args.input_wav).resolve())]
-    else:
-        cmd += [
-            "--input_pcm",
-            str(Path(args.input_pcm).resolve()),
-            "--input_sr",
-            str(int(args.input_sr)),
-        ]
+    # --- 修正点: input_wav/input_pcm追加部分を条件化 ---
+    if args.mode == "file":
+        if args.input_wav:
+            cmd += ["--input_wav", str(Path(args.input_wav).resolve())]
+        else:
+            cmd += [
+                "--input_pcm",
+                str(Path(args.input_pcm).resolve()),
+                "--input_sr",
+                str(int(args.input_sr)),
+            ]
 
     _run(cmd, cwd=m1_repo, env=env)
 
