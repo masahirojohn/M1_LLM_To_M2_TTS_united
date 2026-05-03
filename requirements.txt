@@ -4,3 +4,4 @@ openai
 PyYAML
 simplejson
 sounddevice
+pyvirtualcam
