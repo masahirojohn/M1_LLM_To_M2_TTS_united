@@ -160,6 +160,15 @@ def main() -> int:
             copied += 1
 
         total_copied += copied
+
+        print(
+            f"[m0] chunk done idx={cid} "
+            f"frames={copied} "
+            f"global_range=[{frame0},{frame1}) "
+            f"global_fg_dir={global_fg_dir}",
+            flush=True,
+        )
+
         chunk_results.append(
             {
                 "chunk_id": cid,

@@ -90,6 +90,8 @@ def main() -> int:
     ap.add_argument("--fps", type=int, default=25)
 
     ap.add_argument("--out_root", default=None)
+    # ① 引数追加
+    ap.add_argument("--m0_out_dir", default=None)
     ap.add_argument("--clean", action="store_true")
 
     args = ap.parse_args()
@@ -113,7 +115,14 @@ def main() -> int:
 
     pipeline_dir = out_root / "01_audio_input_smoke_pipeline"
     chunks_dir = out_root / "02_audio_input_to_chunks"
-    m0_dir = out_root / "03_m0_all_chunks"
+    
+    # ② m0_dir の置換
+    m0_dir = (
+        Path(args.m0_out_dir).resolve()
+        if args.m0_out_dir
+        else out_root / "03_m0_all_chunks"
+    )
+    
     m35_dir = out_root / "04_m35_compose"
 
     script_pipeline = m1_repo / "scripts" / "live_runtime" / "run_audio_input_smoke_pipeline.py"
@@ -182,6 +191,7 @@ def main() -> int:
     chunks_summary = chunks_dir / "run_audio_input_to_chunks_smoke.summary.json"
 
     # 3. chunk JSON -> M0 global FG
+    # ③ 重要確認: --out_dir が m0_dir を使っていることを確認
     cmd3 = [
         python_exe,
         str(script_m0),
@@ -205,6 +215,7 @@ def main() -> int:
 
     _run(cmd3, cwd=m1_repo, env=env)
 
+    # 概要ファイルパスも m0_dir を使用
     m0_summary = m0_dir / "run_audio_input_m0_all_chunks_smoke.summary.json"
 
     # 4. M3.5 compose
