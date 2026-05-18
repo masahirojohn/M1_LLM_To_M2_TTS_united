@@ -165,6 +165,13 @@ def _extract_emo_id_from_transcription(text: str) -> str | None:
     return m.group(1)
 
 
+def _extract_emo_ids_from_transcription(text: str) -> list[str]:
+    return [
+        m.group(1)
+        for m in re.finditer(r"\[emo:([0-9]+_[0-9]+)\]", str(text))
+    ]
+
+
 def _extract_tool_calls(msg: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     tool_call = _safe_getattr(msg, "tool_call", None)
@@ -470,14 +477,54 @@ async def _receive_loop(
                         flush=True,
                     )
 
-                    live_emo_id = _extract_emo_id_from_transcription(str(transcription_text))
+                    # output_transcription は分割で届くことがあるため、
+                    # turn内で累積して複数 [emo:ID] を検出する。
+                    accum = str(turn_state.get("transcription_accum") or "")
+                    accum += str(transcription_text)
+                    turn_state["transcription_accum"] = accum
 
-                    if live_emo_id:
+                    seen_tags = list(turn_state.get("live_emo_seen_tags") or [])
+                    emo_ids = _extract_emo_ids_from_transcription(accum)
+
+                    for live_emo_id in emo_ids:
+                        if live_emo_id in seen_tags:
+                            continue
+
+                        seen_tags.append(live_emo_id)
                         turn_state["live_emo_id"] = live_emo_id
+
+                        t_ms = 0
+                        if turn_state.get("turn_start_perf") is not None:
+                            t_ms = int(
+                                round(
+                                    (
+                                        time.perf_counter()
+                                        - float(turn_state["turn_start_perf"])
+                                    )
+                                    * 1000.0
+                                )
+                            )
+
+                        events = list(turn_state.get("live_emo_events") or [])
+                        events.append(
+                            {
+                                "t_ms": t_ms,
+                                "emo_id": live_emo_id,
+                                "source": "output_transcription",
+                            }
+                        )
+                        turn_state["live_emo_events"] = events
+
                         print(
-                            f"[transcription][emo_id] active_turn={turn_state.get('active_turn')} emo_id={live_emo_id}",
+                            f"[transcription][emo_id] "
+                            f"active_turn={turn_state.get('active_turn')} "
+                            f"emo_id={live_emo_id} "
+                            f"t_ms={t_ms} "
+                            f"n={len(events)}",
                             flush=True,
                         )
+
+                    turn_state["live_emo_seen_tags"] = seen_tags
 
                 if debug_receive:
                     print(
@@ -821,6 +868,11 @@ async def _run(args: argparse.Namespace) -> int:
                         if bool(args.inline_emo_tag_mode)
                         else None
                     ),
+                    live_emo_events_getter=(
+                        (lambda: list(turn_state.get("live_emo_events") or []))
+                        if bool(args.inline_emo_tag_mode)
+                        else None
+                    ),
                     m0_worker_proc=None,
                     m0_worker_host=str(args.m0_worker_host),
                     m0_worker_port=int(args.m0_worker_port),
@@ -963,6 +1015,9 @@ async def _run(args: argparse.Namespace) -> int:
                     turn_state["last_audio_perf"] = None
                     turn_state["audio_chunk_idx_log"] = 0
                     turn_state["live_emo_id"] = None
+                    turn_state["live_emo_seen_tags"] = []
+                    turn_state["live_emo_events"] = []
+                    turn_state["transcription_accum"] = ""
                     turn_state["debug_receive_raw_count"] = 0
 
                     sent_bytes = await _send_mic_once(

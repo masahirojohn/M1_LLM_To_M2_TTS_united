@@ -465,6 +465,17 @@ def _slice_shift_timeline(raw: Any, t0_ms: int, t1_ms: int) -> Any:
     return _wrap_like(raw, out)
 
 
+def _inline_emo_id_to_expression(emo_id: str | None) -> str:
+    mapping = {
+        "1_1": "happy",
+        "1_2": "happy",
+        "2_0": "surprised",
+        "9_1": "sad",
+        "9_2": "sad",
+    }
+    return mapping.get(str(emo_id or "1_1"), "happy")
+
+
 def _default_expr_chunk(
     *,
     session_id: str,
@@ -501,6 +512,77 @@ def _default_expr_chunk(
     }
 
 
+def _expr_chunk_from_live_emo_events(
+    *,
+    session_id: str,
+    step_ms: int,
+    fallback_emo_id: str | None,
+    chunk_start_ms: int,
+    chunk_end_ms: int,
+    live_emo_events: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    events = list(live_emo_events or [])
+
+    effective_emo_id = fallback_emo_id
+
+    # chunk開始時点で最後に有効だったemo_idを引き継ぐ
+    for ev in events:
+        try:
+            ev_t = int(ev.get("t_ms", 0))
+        except Exception:
+            continue
+
+        if ev_t <= int(chunk_start_ms):
+            effective_emo_id = str(ev.get("emo_id") or effective_emo_id)
+
+    timeline = [
+        {
+            "t_ms": 0,
+            "expression": _inline_emo_id_to_expression(effective_emo_id),
+            "source": "live_emo_events" if events else "inline_emo_tag_mode",
+            "emo_id": str(effective_emo_id or "1_1"),
+        }
+    ]
+
+    # chunk内で新しく来たemo_idを相対t_msで追加
+    for ev in events:
+        try:
+            ev_t = int(ev.get("t_ms", 0))
+        except Exception:
+            continue
+
+        if int(chunk_start_ms) <= ev_t < int(chunk_end_ms):
+            emo_id = str(ev.get("emo_id") or effective_emo_id)
+            rel_t = max(0, ev_t - int(chunk_start_ms))
+
+            if rel_t == 0 and timeline and timeline[0].get("emo_id") == emo_id:
+                continue
+
+            timeline.append(
+                {
+                    "t_ms": rel_t,
+                    "expression": _inline_emo_id_to_expression(emo_id),
+                    "source": "live_emo_events",
+                    "emo_id": emo_id,
+                }
+            )
+
+    timeline = sorted(timeline, key=lambda x: int(x.get("t_ms", 0)))
+
+    return {
+        "schema_version": "session_expression_timeline_v0.1",
+        "session_id": str(session_id),
+        "step_ms": int(step_ms),
+        "timeline": timeline,
+        "meta": {
+            "source": "live_emo_events",
+            "auto_blink": False,
+            "chunk_start_ms": int(chunk_start_ms),
+            "chunk_end_ms": int(chunk_end_ms),
+        },
+    }
+
+
 def _watch_stream_mouth_and_render_m0(
     *,
     py: Path,
@@ -528,6 +610,7 @@ def _watch_stream_mouth_and_render_m0(
     mouth_updated_event: Event | None = None,
     inline_emo_id: str | None = None,
     live_emo_id_getter: Callable[[], str | None] | None = None,
+    live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None = None,
 ) -> dict[str, Any]:
     pose_obj = _load_json(pose_json)
 
@@ -645,11 +728,34 @@ def _watch_stream_mouth_and_render_m0(
                         flush=True,
                     )
 
-        expr_chunk = _default_expr_chunk(
-            session_id=session_id,
-            step_ms=step_ms,
-            inline_emo_id=effective_emo_id,
-        )
+        live_emo_events = None
+
+        if live_emo_events_getter is not None:
+            try:
+                live_emo_events = live_emo_events_getter()
+            except Exception:
+                live_emo_events = None
+
+        if live_emo_events:
+            expr_chunk = _expr_chunk_from_live_emo_events(
+                session_id=session_id,
+                step_ms=step_ms,
+                fallback_emo_id=effective_emo_id,
+                chunk_start_ms=t0_ms,
+                chunk_end_ms=t1_ms,
+                live_emo_events=live_emo_events,
+            )
+            print(
+                f"[stream_mouth_m0][live_emo_events] "
+                f"chunk={cid} events={len(live_emo_events)}",
+                flush=True,
+            )
+        else:
+            expr_chunk = _default_expr_chunk(
+                session_id=session_id,
+                step_ms=step_ms,
+                inline_emo_id=effective_emo_id,
+            )
 
         pose_chunk_json.write_text(json.dumps(pose_chunk, ensure_ascii=False, indent=2), encoding="utf-8")
         mouth_chunk_json.write_text(json.dumps(mouth_chunk, ensure_ascii=False, indent=2), encoding="utf-8")
