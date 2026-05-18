@@ -74,6 +74,7 @@ def main() -> int:
     idx = 0
     sent = 0
     last_rgb = None
+    last_fg = None
 
     print("[virtualcam_persistent][START]", flush=True)
     print(f"  fg_dir  : {fg_dir}", flush=True)
@@ -115,7 +116,42 @@ def main() -> int:
                     raise RuntimeError("failed to read bg frame")
 
             bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
-            fg = _read_bgra_png(fg_path)
+
+            fg = None
+            last_err = None
+
+            for _ in range(5):
+                try:
+                    fg = _read_bgra_png(fg_path)
+                    break
+                except RuntimeError as e:
+                    last_err = e
+                    time.sleep(0.02)
+
+            if fg is None:
+                if last_fg is not None:
+                    fg = last_fg
+                    print(
+                        f"[virtualcam_persistent][WARN] failed to read fg, using last_fg: {fg_path} err={last_err}",
+                        flush=True,
+                    )
+                elif last_rgb is not None:
+                    cam.send(last_rgb)
+                    cam.sleep_until_next_frame()
+                    print(
+                        f"[virtualcam_persistent][WARN] failed to read fg, using last_rgb: {fg_path} err={last_err}",
+                        flush=True,
+                    )
+                    continue
+                else:
+                    print(
+                        f"[virtualcam_persistent][WARN] failed to read fg, skip frame: {fg_path} err={last_err}",
+                        flush=True,
+                    )
+                    time.sleep(float(args.poll_s))
+                    continue
+            else:
+                last_fg = fg
 
             comp_bgr = _overlay(bg, fg)
             comp_rgb = cv2.cvtColor(comp_bgr, cv2.COLOR_BGR2RGB)
