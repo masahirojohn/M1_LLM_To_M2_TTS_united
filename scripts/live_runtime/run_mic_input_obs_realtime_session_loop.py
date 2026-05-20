@@ -158,6 +158,33 @@ def _load_inline_emo_queue_jsonl(path: Path) -> dict[int, str]:
     return result
 
 
+def _parse_dev_live_emo_events_csv(s: str | None) -> list[dict[str, Any]]:
+    """
+    例:
+      1_1@600,2_0@1000,9_1@1400
+    """
+    out: list[dict[str, Any]] = []
+
+    if not s:
+        return out
+
+    for item in str(s).split(","):
+        item = item.strip()
+        if not item:
+            continue
+
+        emo_id, t = item.split("@", 1)
+        out.append(
+            {
+                "t_ms": int(t),
+                "emo_id": str(emo_id),
+                "source": "dev_live_emo_events_csv",
+            }
+        )
+
+    return out
+
+
 def _extract_emo_id_from_transcription(text: str) -> str | None:
     m = re.search(r"\[emo:([0-9]+_[0-9]+)\]", str(text))
     if not m:
@@ -365,8 +392,17 @@ async def _send_mic_once(
         blocksize=block_samples,
         callback=callback,
     ):
-        for _ in range(total_blocks):
-            chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+        for i in range(total_blocks):
+            try:
+                chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                print(
+                    f"[session_loop][WARN] mic chunk timeout "
+                    f"i={i} total_blocks={total_blocks}; stop sending mic audio",
+                    flush=True,
+                )
+                break
+
             await session.send_realtime_input(
                 audio=types.Blob(
                     data=chunk,
@@ -486,31 +522,45 @@ async def _receive_loop(
                     seen_tags = list(turn_state.get("live_emo_seen_tags") or [])
                     emo_ids = _extract_emo_ids_from_transcription(accum)
 
+                    new_emo_ids: list[str] = []
+
                     for live_emo_id in emo_ids:
                         if live_emo_id in seen_tags:
                             continue
 
                         seen_tags.append(live_emo_id)
+                        new_emo_ids.append(live_emo_id)
+
+                    base_t_ms = 0
+                    if turn_state.get("turn_start_perf") is not None:
+                        base_t_ms = int(
+                            round(
+                                (
+                                    time.perf_counter()
+                                    - float(turn_state["turn_start_perf"])
+                                )
+                                * 1000.0
+                            )
+                        )
+
+                    # 同一 transcription chunk 内に複数 [emo:ID] が来た場合、
+                    # 全部同じ t_ms になると expression timeline 上で同時刻イベントになる。
+                    # そのため暫定的に 400ms 間隔の仮想 offset を付ける。
+                    virtual_emo_interval_ms = 400
+
+                    for local_i, live_emo_id in enumerate(new_emo_ids):
                         turn_state["live_emo_id"] = live_emo_id
 
-                        t_ms = 0
-                        if turn_state.get("turn_start_perf") is not None:
-                            t_ms = int(
-                                round(
-                                    (
-                                        time.perf_counter()
-                                        - float(turn_state["turn_start_perf"])
-                                    )
-                                    * 1000.0
-                                )
-                            )
+                        t_ms = int(base_t_ms + local_i * virtual_emo_interval_ms)
 
                         events = list(turn_state.get("live_emo_events") or [])
                         events.append(
                             {
                                 "t_ms": t_ms,
                                 "emo_id": live_emo_id,
-                                "source": "output_transcription",
+                                "source": "output_transcription_virtual_offset",
+                                "base_t_ms": int(base_t_ms),
+                                "virtual_offset_ms": int(local_i * virtual_emo_interval_ms),
                             }
                         )
                         turn_state["live_emo_events"] = events
@@ -520,6 +570,8 @@ async def _receive_loop(
                             f"active_turn={turn_state.get('active_turn')} "
                             f"emo_id={live_emo_id} "
                             f"t_ms={t_ms} "
+                            f"base_t_ms={base_t_ms} "
+                            f"virtual_offset_ms={local_i * virtual_emo_interval_ms} "
                             f"n={len(events)}",
                             flush=True,
                         )
@@ -823,6 +875,7 @@ async def _run(args: argparse.Namespace) -> int:
         turn_start_perf_current: float | None = None
         frame_offset_current = 0
         next_frame_offset = 0
+        inline_emo_id_current: str | None = None
 
         inline_emo_queue: dict[int, str] = {}
 
@@ -859,7 +912,7 @@ async def _run(args: argparse.Namespace) -> int:
                     producer_done_event=producer_done_event,
                     mouth_updated_event=mouth_updated_event,
                     inline_emo_id=(
-                        str(inline_emo_id_for_turn)
+                        str(inline_emo_id_current)
                         if bool(args.inline_emo_tag_mode)
                         else None
                     ),
@@ -939,265 +992,349 @@ async def _run(args: argparse.Namespace) -> int:
         turn_state: dict[str, Any] = {}
         recv_stop = asyncio.Event()
 
-        print(f"[session_loop] connect model={args.model}", flush=True)
+        async def _run_one_turn(
+            *,
+            session: Any,
+            i: int,
+        ) -> bool:
+            nonlocal next_frame_offset
+            nonlocal m0_thread
+            nonlocal audio_thread
+            nonlocal m0_stop_event
+            nonlocal producer_done_event
+            nonlocal mouth_updated_event
+            nonlocal m0_stream_dir_current
+            nonlocal mouth_json_current
+            nonlocal turn_start_perf_current
+            nonlocal frame_offset_current
+            nonlocal inline_emo_id_current
 
-        async with client.aio.live.connect(model=args.model, config=config) as session:
+            turn_no = i + 1
+            print(f"[session_loop] turn={turn_no}", flush=True)
+
+            inline_emo_id_for_turn = str(args.inline_emo_id)
+
+            # Priority:
+            # 1. JSONL queue/probe input
+            # 2. comma-separated --inline_emo_ids
+            # 3. single --inline_emo_id
+            if int(turn_no) in inline_emo_queue:
+                inline_emo_id_for_turn = str(inline_emo_queue[int(turn_no)])
+            elif args.inline_emo_ids:
+                inline_emo_ids = [
+                    x.strip()
+                    for x in str(args.inline_emo_ids).split(",")
+                    if x.strip()
+                ]
+
+                if inline_emo_ids:
+                    idx = min(i, len(inline_emo_ids) - 1)
+                    inline_emo_id_for_turn = inline_emo_ids[idx]
+
+            print(
+                f"[session_loop][inline_emo] turn={turn_no} emo_id={inline_emo_id_for_turn}",
+                flush=True,
+            )
+
+            inline_emo_id_current = str(inline_emo_id_for_turn)
+
+            turn_dir = out_root / f"turn_{turn_no:03d}"
+            bridge_dir = turn_dir / "01_audio_stream_bridge"
+            stream_mouth_dir = bridge_dir / "stream_mouth"
+            pcm_stream_chunks_dir = bridge_dir / "pcm_stream_chunks"
+            m0_stream_dir = turn_dir / "03_stream_mouth_m0"
+
+            bridge_dir.mkdir(parents=True, exist_ok=True)
+            stream_mouth_dir.mkdir(parents=True, exist_ok=True)
+            pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
+
+            mouth_streamer_json = stream_mouth_dir / "mouth_streamer.json"
+            mouth_raw_json = stream_mouth_dir / "mouth_timeline.formant.raw.json"
+            mouth_json = stream_mouth_dir / "mouth.json"
+            audio_response_pcm = bridge_dir / "audio_response.pcm"
+
+            mouth_streamer = MouthStreamerOC(
+                out_json=str(mouth_streamer_json),
+                session_id=f"{args.session_id}_turn{turn_no:03d}",
+                cfg=MouthOCConfig(
+                    step_ms=int(args.step_ms),
+                    window_ms=int(args.mouth_window_ms),
+                    analysis_sr=int(args.mouth_analysis_sr),
+                    input_sr_default=24000,
+                    rms_thr=float(args.mouth_rms_thr),
+                    vad_energy_thr=float(args.mouth_vad_energy_thr),
+                    vad_min_speech_ms=int(args.mouth_vad_min_speech_ms),
+                    vad_min_silence_ms=int(args.mouth_vad_min_silence_ms),
+                    open_id=int(args.mouth_open_id),
+                    close_id=int(args.mouth_close_id),
+                    flush_every_frames=int(args.mouth_flush_every_frames),
+                    max_buffer_s=float(args.mouth_max_buffer_s),
+                    vowel_mode=str(args.mouth_vowel_mode),
+                    formant_window_ms=int(args.mouth_formant_window_ms),
+                    formant_max_hz=int(args.mouth_formant_max_hz),
+                ),
+            )
+
+            turn_state.clear()
+            turn_state["active_turn"] = None
+            turn_state["first_audio_sec"] = None
+            turn_state["first_mouth_json_logged"] = False
+            turn_state["last_audio_perf"] = None
+            turn_state["audio_chunk_idx_log"] = 0
+            turn_state["live_emo_id"] = None
+            turn_state["live_emo_seen_tags"] = []
+            turn_state["live_emo_events"] = []
+            turn_state["transcription_accum"] = ""
+            turn_state["debug_receive_raw_count"] = 0
+
+            dev_live_emo_events = _parse_dev_live_emo_events_csv(
+                getattr(args, "dev_live_emo_events_csv", None)
+            )
+
+            if dev_live_emo_events:
+                turn_state["live_emo_events"] = list(dev_live_emo_events)
+                turn_state["live_emo_id"] = str(dev_live_emo_events[-1].get("emo_id"))
+
+                # dev注入テスト時は、transcription由来の同一emoを重複appendしない。
+                turn_state["live_emo_seen_tags"] = [
+                    str(ev.get("emo_id"))
+                    for ev in dev_live_emo_events
+                    if ev.get("emo_id") is not None
+                ]
+
+                print(
+                    f"[session_loop][dev_live_emo_events] "
+                    f"turn={turn_no} events={dev_live_emo_events}",
+                    flush=True,
+                )
+
+            sent_bytes = await _send_mic_once(
+                session=session,
+                duration_s=float(args.mic_send_max_s),
+                input_sr=int(args.input_sr),
+                chunk_ms=int(args.step_ms),
+            )
+
+            if args.audio_stream_end_per_turn:
+                await session.send_realtime_input(audio_stream_end=True)
+                print(
+                    f"[session_loop][audio_stream_end_sent] turn={turn_no}",
+                    flush=True,
+                )
+
+            # mic送信完了後、response_trigger直前からこのturnのfirst_audio計測を開始する
+            turn_state["active_turn"] = turn_no
+            turn_state["turn_start_perf"] = time.perf_counter()
+            turn_state["first_audio_sec"] = None
+
+            # このturn用に M0 watcher を起動
+            m0_stop_event = Event()
+            producer_done_event = Event()
+            mouth_updated_event = Event()
+            m0_stream_dir_current = m0_stream_dir
+            mouth_json_current = mouth_json
+            turn_start_perf_current = float(turn_state["turn_start_perf"])
+            frame_offset_current = int(next_frame_offset)
+
+            m0_thread = Thread(target=_m0_target, daemon=True)
+            m0_thread.start()
+
+            # active_turn 設定後に audio watcher を起動
+            turn_audio_stop_event = Event()
+            audio_thread = _watch_stream_pcm_chunks(
+                audio_player_proc=audio_player_proc,
+                pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                audio_device=str(args.audio_device),
+                stop_event=turn_audio_stop_event,
+            )
+
+            # active_turn 設定後に receiver を起動
+            recv_stop = asyncio.Event()
+            recv_task = asyncio.create_task(
+                _receive_loop(
+                    session=session,
+                    stop_event=recv_stop,
+                    pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                    audio_response_pcm=audio_response_pcm,
+                    mouth_streamer=mouth_streamer,
+                    mouth_streamer_json=mouth_streamer_json,
+                    mouth_raw_json=mouth_raw_json,
+                    mouth_json=mouth_json,
+                    knn_script=knn_script,
+                    gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                    step_ms=int(args.step_ms),
+                    turn_state=turn_state,
+                    mouth_updated_event=mouth_updated_event,
+                    drop_initial_audio_ms=(
+                        int(args.drop_initial_audio_ms)
+                        if bool(args.inline_emo_tag_mode)
+                        else 0
+                    ),
+                    debug_receive=bool(args.debug_receive),
+                    debug_receive_raw=bool(args.debug_receive_raw),
+                )
+            )
+
+            response_trigger = str(args.response_trigger)
+
+            if args.response_triggers:
+                trigger_list = [
+                    x.strip()
+                    for x in str(args.response_triggers).split("|")
+                    if x.strip()
+                ]
+
+                if trigger_list:
+                    idx_trigger = min(i, len(trigger_list) - 1)
+                    response_trigger = trigger_list[idx_trigger]
+
+            if bool(args.skip_response_trigger):
+                print(
+                    f"[session_loop][response_trigger][SKIP] turn={turn_no}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[session_loop][response_trigger] "
+                    f"turn={turn_no} text={response_trigger}",
+                    flush=True,
+                )
+
+                await session.send_realtime_input(text=response_trigger)
+
+            input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / int(args.input_sr)))
+            print(
+                f"[session_loop][turn_sent] turn={turn_no} input_audio_ms={input_audio_ms}",
+                flush=True,
+            )
+
+            # first_audio 到着待ち
+            wait_t0 = time.perf_counter()
+            turn_audio_ok = False
+
+            while True:
+                if turn_state.get("first_audio_sec") is not None:
+                    turn_audio_ok = True
+                    print(
+                        f"[session_loop][turn_first_audio_detected] turn={turn_no}",
+                        flush=True,
+                    )
+                    break
+
+                wait_sec = time.perf_counter() - wait_t0
+
+                if wait_sec >= float(args.turn_first_audio_timeout_s):
+                    print(
+                        f"[session_loop][WARN] first_audio timeout turn={turn_no}",
+                        flush=True,
+                    )
+                    break
+
+                await asyncio.sleep(0.02)
+
+            # このturnの応答音声が止まるまで待つ
+            drain_t0 = time.perf_counter()
+
+            while True:
+                latest_audio_perf = turn_state.get("last_audio_perf")
+
+                # まだ1回も音声が来ていない場合も、短時間は待つ
+                if latest_audio_perf is None:
+                    if time.perf_counter() - drain_t0 >= float(args.turn_idle_wait_s):
+                        break
+                    await asyncio.sleep(0.05)
+                    continue
+
+                idle_sec = time.perf_counter() - float(latest_audio_perf)
+                if idle_sec >= float(args.turn_idle_wait_s):
+                    break
+
+                # 安全上限
+                if time.perf_counter() - drain_t0 >= 3.0:
+                    break
+
+                await asyncio.sleep(0.05)
+
+            recv_stop.set()
+            recv_task.cancel()
             try:
-                for i in range(int(args.turns)):
-                    turn_no = i + 1
-                    print(f"[session_loop] turn={turn_no}", flush=True)
+                await recv_task
+            except asyncio.CancelledError:
+                pass
+            except BaseException:
+                pass
 
-                    inline_emo_id_for_turn = str(args.inline_emo_id)
+            # このturn用 audio watcher を停止
+            turn_audio_stop_event.set()
+            if audio_thread is not None:
+                audio_thread.join(timeout=2.0)
+                audio_thread = None
 
-                    # Priority:
-                    # 1. JSONL queue/probe input
-                    # 2. comma-separated --inline_emo_ids
-                    # 3. single --inline_emo_id
-                    if int(turn_no) in inline_emo_queue:
-                        inline_emo_id_for_turn = str(inline_emo_queue[int(turn_no)])
-                    elif args.inline_emo_ids:
-                        inline_emo_ids = [
-                            x.strip()
-                            for x in str(args.inline_emo_ids).split(",")
-                            if x.strip()
-                        ]
+            # このturn用 M0 watcher を停止
+            if producer_done_event is not None:
+                producer_done_event.set()
 
-                        if inline_emo_ids:
-                            idx = min(i, len(inline_emo_ids) - 1)
-                            inline_emo_id_for_turn = inline_emo_ids[idx]
+            if m0_thread is not None:
+                m0_thread.join(timeout=8.0)
 
+                if m0_thread.is_alive():
                     print(
-                        f"[session_loop][inline_emo] turn={turn_no} emo_id={inline_emo_id_for_turn}",
+                        "[session_loop][WARN] m0 watcher did not stop after producer_done; force stop",
                         flush=True,
                     )
 
-                    turn_dir = out_root / f"turn_{turn_no:03d}"
-                    bridge_dir = turn_dir / "01_audio_stream_bridge"
-                    stream_mouth_dir = bridge_dir / "stream_mouth"
-                    pcm_stream_chunks_dir = bridge_dir / "pcm_stream_chunks"
-                    m0_stream_dir = turn_dir / "03_stream_mouth_m0"
-
-                    bridge_dir.mkdir(parents=True, exist_ok=True)
-                    stream_mouth_dir.mkdir(parents=True, exist_ok=True)
-                    pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
-
-                    mouth_streamer_json = stream_mouth_dir / "mouth_streamer.json"
-                    mouth_raw_json = stream_mouth_dir / "mouth_timeline.formant.raw.json"
-                    mouth_json = stream_mouth_dir / "mouth.json"
-                    audio_response_pcm = bridge_dir / "audio_response.pcm"
-
-                    mouth_streamer = MouthStreamerOC(
-                        out_json=str(mouth_streamer_json),
-                        session_id=f"{args.session_id}_turn{turn_no:03d}",
-                        cfg=MouthOCConfig(
-                            step_ms=int(args.step_ms),
-                            window_ms=int(args.mouth_window_ms),
-                            analysis_sr=int(args.mouth_analysis_sr),
-                            input_sr_default=24000,
-                            rms_thr=float(args.mouth_rms_thr),
-                            vad_energy_thr=float(args.mouth_vad_energy_thr),
-                            vad_min_speech_ms=int(args.mouth_vad_min_speech_ms),
-                            vad_min_silence_ms=int(args.mouth_vad_min_silence_ms),
-                            open_id=int(args.mouth_open_id),
-                            close_id=int(args.mouth_close_id),
-                            flush_every_frames=int(args.mouth_flush_every_frames),
-                            max_buffer_s=float(args.mouth_max_buffer_s),
-                            vowel_mode=str(args.mouth_vowel_mode),
-                            formant_window_ms=int(args.mouth_formant_window_ms),
-                            formant_max_hz=int(args.mouth_formant_max_hz),
-                        ),
-                    )
-
-                    turn_state.clear()
-                    turn_state["active_turn"] = None
-                    turn_state["first_audio_sec"] = None
-                    turn_state["first_mouth_json_logged"] = False
-                    turn_state["last_audio_perf"] = None
-                    turn_state["audio_chunk_idx_log"] = 0
-                    turn_state["live_emo_id"] = None
-                    turn_state["live_emo_seen_tags"] = []
-                    turn_state["live_emo_events"] = []
-                    turn_state["transcription_accum"] = ""
-                    turn_state["debug_receive_raw_count"] = 0
-
-                    sent_bytes = await _send_mic_once(
-                        session=session,
-                        duration_s=float(args.mic_send_max_s),
-                        input_sr=int(args.input_sr),
-                        chunk_ms=int(args.step_ms),
-                    )
-
-                    if args.audio_stream_end_per_turn:
-                        await session.send_realtime_input(audio_stream_end=True)
-                        print(
-                            f"[session_loop][audio_stream_end_sent] turn={turn_no}",
-                            flush=True,
-                        )
-
-                    # mic送信完了後、response_trigger直前からこのturnのfirst_audio計測を開始する
-                    turn_state["active_turn"] = turn_no
-                    turn_state["turn_start_perf"] = time.perf_counter()
-                    turn_state["first_audio_sec"] = None
-
-                    # このturn用に M0 watcher を起動
-                    m0_stop_event = Event()
-                    producer_done_event = Event()
-                    mouth_updated_event = Event()
-                    m0_stream_dir_current = m0_stream_dir
-                    mouth_json_current = mouth_json
-                    turn_start_perf_current = float(turn_state["turn_start_perf"])
-                    frame_offset_current = int(next_frame_offset)
-
-                    m0_thread = Thread(target=_m0_target, daemon=True)
-                    m0_thread.start()
-
-                    # active_turn 設定後に audio watcher を起動
-                    turn_audio_stop_event = Event()
-                    audio_thread = _watch_stream_pcm_chunks(
-                        audio_player_proc=audio_player_proc,
-                        pcm_stream_chunks_dir=pcm_stream_chunks_dir,
-                        audio_device=str(args.audio_device),
-                        stop_event=turn_audio_stop_event,
-                    )
-
-                    # active_turn 設定後に receiver を起動
-                    recv_stop = asyncio.Event()
-                    recv_task = asyncio.create_task(
-                        _receive_loop(
-                            session=session,
-                            stop_event=recv_stop,
-                            pcm_stream_chunks_dir=pcm_stream_chunks_dir,
-                            audio_response_pcm=audio_response_pcm,
-                            mouth_streamer=mouth_streamer,
-                            mouth_streamer_json=mouth_streamer_json,
-                            mouth_raw_json=mouth_raw_json,
-                            mouth_json=mouth_json,
-                            knn_script=knn_script,
-                            gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
-                            step_ms=int(args.step_ms),
-                            turn_state=turn_state,
-                            mouth_updated_event=mouth_updated_event,
-                            drop_initial_audio_ms=(
-                                int(args.drop_initial_audio_ms)
-                                if bool(args.inline_emo_tag_mode)
-                                else 0
-                            ),
-                            debug_receive=bool(args.debug_receive),
-                            debug_receive_raw=bool(args.debug_receive_raw),
-                        )
-                    )
-
-                    response_trigger = str(args.response_trigger)
-
-                    if args.response_triggers:
-                        trigger_list = [
-                            x.strip()
-                            for x in str(args.response_triggers).split("|")
-                            if x.strip()
-                        ]
-
-                        if trigger_list:
-                            idx_trigger = min(i, len(trigger_list) - 1)
-                            response_trigger = trigger_list[idx_trigger]
-
-                    print(
-                        f"[session_loop][response_trigger] "
-                        f"turn={turn_no} text={response_trigger}",
-                        flush=True,
-                    )
-
-                    await session.send_realtime_input(text=response_trigger)
-
-                    input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / int(args.input_sr)))
-                    print(
-                        f"[session_loop][turn_sent] turn={turn_no} input_audio_ms={input_audio_ms}",
-                        flush=True,
-                    )
-
-                    # first_audio 到着待ち
-                    wait_t0 = time.perf_counter()
-
-                    while True:
-                        if turn_state.get("first_audio_sec") is not None:
-                            print(
-                                f"[session_loop][turn_first_audio_detected] turn={turn_no}",
-                                flush=True,
-                            )
-                            break
-
-                        wait_sec = time.perf_counter() - wait_t0
-
-                        if wait_sec >= float(args.turn_first_audio_timeout_s):
-                            print(
-                                f"[session_loop][WARN] first_audio timeout turn={turn_no}",
-                                flush=True,
-                            )
-                            break
-
-                        await asyncio.sleep(0.02)
-
-                    # このturnの応答音声が止まるまで待つ
-                    drain_t0 = time.perf_counter()
-                    last_seen_audio_perf = turn_state.get("last_audio_perf")
-
-                    while True:
-                        latest_audio_perf = turn_state.get("last_audio_perf")
-
-                        # まだ1回も音声が来ていない場合も、短時間は待つ
-                        if latest_audio_perf is None:
-                            if time.perf_counter() - drain_t0 >= float(args.turn_idle_wait_s):
-                                break
-                            await asyncio.sleep(0.05)
-                            continue
-
-                        idle_sec = time.perf_counter() - float(latest_audio_perf)
-                        if idle_sec >= float(args.turn_idle_wait_s):
-                            break
-
-                        # 安全上限
-                        if time.perf_counter() - drain_t0 >= 3.0:
-                            break
-
-                        await asyncio.sleep(0.05)
-
-                    recv_stop.set()
-                    recv_task.cancel()
-                    try:
-                        await recv_task
-                    except asyncio.CancelledError:
-                        pass
-                    except BaseException:
-                        pass
-
-                    # このturn用 audio watcher を停止
-                    turn_audio_stop_event.set()
-                    if audio_thread is not None:
-                        audio_thread.join(timeout=2.0)
-                        audio_thread = None
-
-                    # このturn用 M0 watcher を停止
-                    if producer_done_event is not None:
-                        producer_done_event.set()
                     if m0_stop_event is not None:
                         m0_stop_event.set()
-                    if m0_thread is not None:
-                        m0_thread.join(timeout=5)
-                        m0_thread = None
 
-                    # 次turnのFGファイル名が 00000000.png に戻らないように、
-                    # turnごとのM0出力フレーム数を累積する。
-                    turn_m0_result = m0_result_box.get("result")
-                    if isinstance(turn_m0_result, dict):
-                        next_frame_offset += int(turn_m0_result.get("total_frames", 0) or 0)
-                        print(
-                            f"[session_loop][frame_offset] next_frame_offset={next_frame_offset}",
-                            flush=True,
-                        )
+                    m0_thread.join(timeout=3.0)
 
-                    m0_result_box.clear()
+                m0_thread = None
 
-            finally:
-                pass
+            # 次turnのFGファイル名が 00000000.png に戻らないように、
+            # turnごとのM0出力フレーム数を累積する。
+            turn_m0_result = m0_result_box.get("result")
+            if isinstance(turn_m0_result, dict):
+                next_frame_offset += int(turn_m0_result.get("total_frames", 0) or 0)
+                print(
+                    f"[session_loop][frame_offset] next_frame_offset={next_frame_offset}",
+                    flush=True,
+                )
+
+            m0_result_box.clear()
+
+            return bool(turn_audio_ok)
+
+        if bool(args.reconnect_per_turn):
+            for i in range(int(args.turns)):
+                max_attempts = max(1, int(args.turn_audio_retry_n) + 1)
+                ok = False
+
+                for attempt in range(max_attempts):
+                    print(
+                        f"[session_loop] connect model={args.model} "
+                        f"reconnect_turn={i + 1} attempt={attempt + 1}/{max_attempts}",
+                        flush=True,
+                    )
+
+                    async with client.aio.live.connect(model=args.model, config=config) as session:
+                        ok = await _run_one_turn(session=session, i=i)
+
+                    if ok:
+                        break
+
+                    print(
+                        f"[session_loop][WARN] retry turn={i + 1} "
+                        f"because first_audio timeout",
+                        flush=True,
+                    )
+
+                    await asyncio.sleep(1.0)
+        else:
+            print(f"[session_loop] connect model={args.model}", flush=True)
+
+            async with client.aio.live.connect(model=args.model, config=config) as session:
+                for i in range(int(args.turns)):
+                    await _run_one_turn(session=session, i=i)
 
         if m0_error_box:
             raise m0_error_box[0]
@@ -1262,6 +1399,8 @@ def main() -> int:
     ap.add_argument("--debug_receive", action="store_true")
     ap.add_argument("--debug_receive_raw", action="store_true")
     ap.add_argument("--output_audio_transcription", action="store_true")
+    ap.add_argument("--reconnect_per_turn", action="store_true")
+    ap.add_argument("--turn_audio_retry_n", type=int, default=0)
     ap.add_argument("--mic_send_max_s", type=float, default=0.6)
 
     ap.add_argument("--audio_device", default="15")
@@ -1272,6 +1411,7 @@ def main() -> int:
     ap.add_argument("--api_key_env", default="GEMINI_API_KEY")
 
     ap.add_argument("--response_trigger", default="短く返答してください。返答前にset_emotionを1回呼んでください。")
+    ap.add_argument("--skip_response_trigger", action="store_true")
     ap.add_argument(
         "--response_triggers",
         default=None,
@@ -1291,6 +1431,11 @@ def main() -> int:
         "--inline_emo_queue_jsonl",
         default=None,
         help="JSONL fallback/probe input. Each line: {\"turn\":1,\"emo_id\":\"9_1\"}",
+    )
+    ap.add_argument(
+        "--dev_live_emo_events_csv",
+        default=None,
+        help="Dev only. Example: 1_1@600,2_0@1000,9_1@1400",
     )
     ap.add_argument("--drop_initial_audio_ms", type=int, default=120)
     ap.add_argument("--audio_stream_end_per_turn", action="store_true")
@@ -1326,8 +1471,8 @@ def main() -> int:
 
     args = ap.parse_args()
 
-    if int(args.stream_mouth_m0_chunk_len_ms) not in (120, 200, 400):
-        raise ValueError("stream_mouth_m0_chunk_len_ms must be 120, 200, or 400")
+    if int(args.stream_mouth_m0_chunk_len_ms) not in (80, 120, 200, 400):
+        raise ValueError("stream_mouth_m0_chunk_len_ms must be 80, 120, 200, or 400")
 
     return asyncio.run(_run(args))
 

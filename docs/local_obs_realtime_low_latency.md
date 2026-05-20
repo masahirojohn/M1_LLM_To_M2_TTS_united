@@ -785,3 +785,101 @@ Migration to inline transcription solved the architectural issue.
 
 
 ---
+
+
+#追記
+## Realtime inline emo expression streaming
+
+確認済み:
+
+- output_transcription から inline [emo:ID] を取得
+- live_emo_events として turn_state に蓄積
+- expr.chunk.json を chunkごとに生成
+- 1chunk内で expression timeline 複数eventを保持可能
+- mouth終了後に live_emo_events が残っている場合、mouth最終frameをholdしてexpression描画を延長
+- OBS上で happy -> surprised -> sad の切替を確認
+
+成功ログ例:
+
+```text
+[perf][turn1_first_response_audio_chunk_sec] 0.647
+[perf][stream_first_m0_done_from_turn_start_sec] 0.956
+[stream_mouth_m0][live_emo_events] chunk=8 ... expr_timeline_n=2 ... 1_1 -> 2_0
+[stream_mouth_m0][live_emo_events] chunk=11 ... expr_timeline_n=2 ... 2_0 -> 9_1
+[stream_mouth_m0][live_emo_events] chunk=12 ... expr_timeline_n=1 ... 9_1
+
+成功コマンド:
+
+C:\dev\M1_LLM_To_M2_TTS_united\.venv\Scripts\python.exe `
+  scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py `
+  --session_id sess_live_session_loop_dev_emo_events_001 `
+  --m1_repo_root C:\dev\M1_LLM_To_M2_TTS_united `
+  --m3_repo_root C:\dev\M3_Live_API_1_united `
+  --m0_repo_root C:\dev\M0_session_renderer_final_1 `
+  --m35_repo_root C:\dev\M3.5_final `
+  --pose_json C:\dev\M0_session_renderer_final_1\timelines\pose\pose_timeline_final_with1_4.json `
+  --bg_video C:\dev\M3.5_final\in\with1.mp4 `
+  --turns 1 `
+  --gap_s 1.5 `
+  --turn_idle_wait_s 1.2 `
+  --turn_first_audio_timeout_s 6.0 `
+  --mic_send_max_s 0.6 `
+  --audio_device 15 `
+  --stream_mouth_m0_chunk_len_ms 120 `
+  --inline_emo_tag_mode `
+  --inline_emo_queue_jsonl C:\dev\M1_LLM_To_M2_TTS_united\in\inline_emo_queue_probe.jsonl `
+  --dev_live_emo_events_csv "1_1@600,2_0@1000,9_1@1400" `
+  --drop_initial_audio_ms 40 `
+  --output_audio_transcription `
+  --response_trigger "短く返答してください。" `
+  --clean `
+  --clean_fg
+
+## commit対象
+
+```text
+scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py
+scripts/live_runtime/run_mic_input_obs_realtime_step1.py
+docs/local_obs_realtime_low_latency.md
+
+
+##追加
+## Stable production baseline (2026-05)
+
+Current recommended realtime settings:
+
+- stream_mouth_m0_chunk_len_ms = 120
+- Live API session reuse = ON
+- reconnect_per_turn = OFF
+- output_audio_transcription = ON
+
+Reason:
+
+80ms mode can achieve lower initial latency,
+but Live API audio streaming becomes unstable across multi-turn sessions.
+120ms currently provides stable realtime OBS output.
+
+
+
+##追加
+## Stable realtime baseline (2026-05)
+
+Verified stable settings:
+
+- stream_mouth_m0_chunk_len_ms = 120
+- response_modalities = ["AUDIO"]
+- output_audio_transcription = ON
+- reconnect_per_turn = OFF
+- turn_audio_retry_n = 0
+
+Notes:
+
+- 80ms mode can reduce initial latency,
+  but multi-turn audio streaming becomes unstable.
+
+- reconnect_per_turn and retry logic were tested,
+  but current Gemini Live API behavior was less stable
+  than a persistent single-session approach.
+
+Current recommended production mode:
+120ms + persistent session.
