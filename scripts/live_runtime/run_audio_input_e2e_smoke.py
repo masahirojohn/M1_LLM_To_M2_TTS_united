@@ -91,6 +91,7 @@ def main() -> int:
     ap.add_argument("--fps", type=int, default=25)
 
     ap.add_argument("--out_root", default=None)
+    ap.add_argument("--m0_out_dir", default=None)
     ap.add_argument("--clean", action="store_true")
 
     args = ap.parse_args()
@@ -115,7 +116,12 @@ def main() -> int:
 
     pipeline_dir = out_root / "01_audio_input_smoke_pipeline"
     chunks_dir = out_root / "02_audio_input_to_chunks"
-    m0_dir = out_root / "03_m0_all_chunks"
+    m0_dir = (
+        Path(args.m0_out_dir).resolve()
+        if args.m0_out_dir
+        else out_root / "03_m0_all_chunks"
+    )
+
     m35_dir = out_root / "04_m35_compose"
 
     script_pipeline = m1_repo / "scripts" / "live_runtime" / "run_audio_input_smoke_pipeline.py"

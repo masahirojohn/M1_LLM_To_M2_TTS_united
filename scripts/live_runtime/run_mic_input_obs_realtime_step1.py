@@ -621,6 +621,7 @@ def _watch_stream_mouth_and_render_m0(
     first_mouth_json_seen_logged = False
     first_mouth_frames_ready_logged = False
     first_m0_render_start_logged = False
+    live_emo_extend_done = False
     t0 = time.perf_counter()
 
     chunks_root = work_dir / "stream_chunks"
@@ -665,6 +666,72 @@ def _watch_stream_mouth_and_render_m0(
         mouth_frames = _as_frames(mouth_obj)
 
         needed_frames = (rendered_chunks + 1) * frames_per_chunk
+
+        # live emo event が mouth 終了より後ろにある場合、
+        # expression 切替だけを描画するため、mouth の最終frameを複製して延長する。
+        if (
+            len(mouth_frames) < needed_frames
+            and producer_done_event.is_set()
+            and not live_emo_extend_done
+        ):
+            live_event_max_t_ms = None
+
+            if live_emo_events_getter is not None:
+                try:
+                    live_events_for_extend = live_emo_events_getter() or []
+                except Exception:
+                    live_events_for_extend = []
+
+                for ev in live_events_for_extend:
+                    try:
+                        ev_t = int(ev.get("t_ms", 0))
+                    except Exception:
+                        continue
+
+                    if live_event_max_t_ms is None or ev_t > live_event_max_t_ms:
+                        live_event_max_t_ms = ev_t
+
+            extend_until_ms = None
+            if live_event_max_t_ms is not None:
+                extend_until_ms = int(live_event_max_t_ms) + int(chunk_len_ms)
+
+            if extend_until_ms is not None:
+                extend_needed_frames = int(extend_until_ms // int(step_ms)) + 1
+                target_frames = min(
+                    max(int(needed_frames), int(extend_needed_frames)),
+                    len(mouth_frames) + int(frames_per_chunk) * 8,
+                )
+
+                if mouth_frames:
+                    last_frame = dict(mouth_frames[-1])
+                    start_n = len(mouth_frames)
+
+                    for i in range(start_n, target_frames):
+                        fr = dict(last_frame)
+                        fr["t_ms"] = int(i * int(step_ms))
+                        fr["src"] = "mouth_hold_for_live_emo_events"
+                        mouth_frames.append(fr)
+
+                    mouth_obj = _wrap_like(mouth_obj, mouth_frames)
+
+                    # 次ループで mouth_json を再読込しても延長済みframesが消えないように保存する。
+                    mouth_json.write_text(
+                        json.dumps(mouth_obj, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+
+                    print(
+                        f"[stream_mouth_m0][extend_for_live_emo] "
+                        f"rendered_chunks={rendered_chunks} "
+                        f"needed_frames={needed_frames} "
+                        f"extended_frames={len(mouth_frames)} "
+                        f"live_event_max_t_ms={live_event_max_t_ms} "
+                        f"extend_until_ms={extend_until_ms}",
+                        flush=True,
+                    )
+
+                    live_emo_extend_done = True
+
         if len(mouth_frames) < needed_frames:
             if producer_done_event.is_set():
                 break
@@ -745,9 +812,16 @@ def _watch_stream_mouth_and_render_m0(
                 chunk_end_ms=t1_ms,
                 live_emo_events=live_emo_events,
             )
+            expr_timeline = expr_chunk.get("timeline", [])
+            expr_tail = expr_timeline[-3:] if isinstance(expr_timeline, list) else []
+
             print(
                 f"[stream_mouth_m0][live_emo_events] "
-                f"chunk={cid} events={len(live_emo_events)}",
+                f"chunk={cid} "
+                f"chunk_ms=[{t0_ms},{t1_ms}) "
+                f"events_total={len(live_emo_events)} "
+                f"expr_timeline_n={len(expr_timeline) if isinstance(expr_timeline, list) else -1} "
+                f"expr_tail={expr_tail}",
                 flush=True,
             )
         else:
@@ -930,7 +1004,7 @@ def main() -> int:
         raise ValueError("chunk_len_ms must be 400")
 
     if args.stream_mouth_m0_chunk_len_ms is not None:
-        if int(args.stream_mouth_m0_chunk_len_ms) not in (120, 200, 400):
+        if int(args.stream_mouth_m0_chunk_len_ms) not in (80, 120, 200, 400):
             raise ValueError("stream_mouth_m0_chunk_len_ms must be 120, 200, or 400")
     if int(args.fps) != 25:
         raise ValueError("fps must be 25")

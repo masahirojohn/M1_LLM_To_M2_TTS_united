@@ -23,10 +23,13 @@ import asyncio
 import base64
 import json
 import os
+import subprocess
+import sys
 import time
 import wave
 from pathlib import Path
 from typing import Any
+from m3p.live.mouth_streamer_oc import MouthStreamerOC, MouthOCConfig
 
 from google import genai
 from google.genai import types
@@ -172,6 +175,89 @@ def _extract_tool_calls(msg: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _project_streamer_to_raw(streamer_json_path: Path) -> dict[str, Any]:
+    data = json.loads(streamer_json_path.read_text(encoding="utf-8"))
+    frames_in = data.get("frames", []) if isinstance(data, dict) else []
+
+    frames_out: list[dict[str, Any]] = []
+    for fr in frames_in:
+        if not isinstance(fr, dict):
+            continue
+        frames_out.append(
+            {
+                "t_ms": fr.get("t_ms"),
+                "vad_active": int(fr.get("vad_active", 0) or 0),
+                "f1_hz": fr.get("f1_hz"),
+                "f2_hz": fr.get("f2_hz"),
+                "src": "audio_stream_bridge_stream_mouth",
+            }
+        )
+
+    return {
+        "version": "m3p.mouth.timeline.v1",
+        "step_ms": int(data.get("step_ms", 40)),
+        "frames": frames_out,
+        "meta": data.get("meta", {}),
+    }
+
+
+_KNN_FUNC_CACHE: dict[str, Any] = {}
+
+
+def _run_stream_mouth_knn(
+    *,
+    knn_script: Path,
+    raw_json: Path,
+    out_json: Path,
+    gt_glob: str,
+    step_ms: int,
+) -> float:
+    t0 = time.perf_counter()
+
+    key = str(knn_script.resolve())
+
+    if key not in _KNN_FUNC_CACHE:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location(
+            "knn_from_formant_raw_to_mouth_timeline_runtime",
+            str(knn_script.resolve()),
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"failed to load knn module: {knn_script}")
+
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fn = getattr(mod, "run_knn_from_raw_obj", None)
+        if fn is None:
+            raise RuntimeError(
+                "knn module missing run_knn_from_raw_obj(): "
+                f"{knn_script}"
+            )
+
+        _KNN_FUNC_CACHE[key] = fn
+
+    raw_obj = json.loads(raw_json.read_text(encoding="utf-8"))
+
+    out_obj = _KNN_FUNC_CACHE[key](
+        raw_obj=raw_obj,
+        gt_glob=str(gt_glob),
+        step_ms=int(step_ms),
+        k=5,
+        fallback_id_active=2,
+        min_conf_ratio=1.0,
+    )
+
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(
+        json.dumps(out_obj, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return time.perf_counter() - t0
+
+
 def _build_live_config(system_instruction: str) -> types.LiveConnectConfig:
     set_emotion = types.FunctionDeclaration(
         name="set_emotion",
@@ -244,6 +330,7 @@ async def _send_audio_mic(
     *,
     session: Any,
     duration_s: float,
+    mic_send_max_s: float | None,
     input_sr: int,
     chunk_ms: int,
     audio_input_path: Path,
@@ -260,7 +347,9 @@ async def _send_audio_mic(
     audio_input_path.parent.mkdir(parents=True, exist_ok=True)
 
     block_samples = int(input_sr * chunk_ms / 1000.0)
-    total_blocks = int((duration_s * 1000.0) / chunk_ms)
+    send_limit_s = float(mic_send_max_s) if mic_send_max_s is not None else float(duration_s)
+    send_limit_s = max(0.04, min(float(duration_s), send_limit_s))
+    total_blocks = int((send_limit_s * 1000.0) / chunk_ms)
     sent_bytes = 0
 
     q: asyncio.Queue[bytes] = asyncio.Queue()
@@ -283,8 +372,17 @@ async def _send_audio_mic(
             blocksize=block_samples,
             callback=callback,
         ):
+            t_mic_start = time.perf_counter()
+
             for i in range(total_blocks):
-                chunk = await q.get()
+                remain_s = float(duration_s) - (time.perf_counter() - t_mic_start)
+                if remain_s <= 0:
+                    break
+
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=min(1.0, max(0.05, remain_s)))
+                except asyncio.TimeoutError:
+                    break
 
                 await session.send_realtime_input(
                     audio=types.Blob(
@@ -329,6 +427,39 @@ async def _send_response_trigger(
         },
     )
 
+
+async def _send_response_trigger_later(
+    *,
+    session: Any,
+    prompt: str,
+    delay_s: float,
+    events_jsonl: Path,
+    t0_ms: int,
+    sent_flag: dict[str, bool],
+) -> None:
+    await asyncio.sleep(float(delay_s))
+
+    if sent_flag.get("sent", False):
+        return
+
+    await _send_response_trigger(
+        session=session,
+        prompt=prompt,
+        events_jsonl=events_jsonl,
+        t0_ms=t0_ms,
+    )
+
+    sent_flag["sent"] = True
+
+    _append_jsonl(
+        events_jsonl,
+        {
+            "t_ms": _now_ms() - t0_ms,
+            "type": "early_response_trigger_sent",
+            "delay_s": float(delay_s),
+        },
+    )
+
 async def _send_audio_stream_end(
     *,
     session: Any,
@@ -354,6 +485,17 @@ async def _receive_loop(
     text_chunks_json: Path,
     tool_calls_json: Path,
     events_jsonl: Path,
+    pcm_stream_chunks_dir: Path | None,
+    stream_mouth: bool,
+    stream_mouth_dir: Path | None,
+    mouth_streamer: MouthStreamerOC | None,
+    mouth_streamer_json: Path | None,
+    mouth_raw_json: Path | None,
+    stream_mouth_knn: bool,
+    stream_mouth_knn_script: Path | None,
+    stream_mouth_gt_glob: str,
+    stream_mouth_mouth_json: Path | None,
+    stream_mouth_knn_min_interval_s: float,
     t0_ms: int,
 ) -> dict[str, Any]:
     audio_response_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,6 +507,14 @@ async def _receive_loop(
     total_audio_chunks = 0
     total_text_chunks = 0
     total_tool_calls = 0
+    streamed_pcm_chunks = 0
+
+    stream_mouth_state = {
+        "first_knn_logged": False,
+        "first_mouth_json_written_logged": False,
+        "last_knn_perf": None,
+        "skipped_knn_by_interval": 0,
+    }
 
     recv_iter = session.receive().__aiter__()
     recv_task: asyncio.Task | None = None
@@ -410,18 +560,177 @@ async def _receive_loop(
             # --- 修正点2 ここまで ---
 
             audio = _extract_audio_bytes(msg)
+            
             if audio:
                 audio_f.write(audio)
+
+                if pcm_stream_chunks_dir is not None:
+                    pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
+
+                    chunk_path = (
+                        pcm_stream_chunks_dir
+                        / f"chunk_{streamed_pcm_chunks:06d}.pcm"
+                    )
+
+                    chunk_path.write_bytes(audio)
+
+                if stream_mouth and mouth_streamer is not None:
+                    t_mouth0 = time.perf_counter()
+
+                    emitted = mouth_streamer.push_pcm16_mono(
+                        audio,
+                        input_sr=24000,
+                    )
+                    mouth_streamer.flush()
+
+                    if mouth_streamer_json is not None and mouth_raw_json is not None:
+                        raw_obj = _project_streamer_to_raw(mouth_streamer_json)
+                        _write_json(mouth_raw_json, raw_obj)
+
+                    if (
+                        stream_mouth_knn
+                        and emitted > 0
+                        and stream_mouth_knn_script is not None
+                        and mouth_raw_json is not None
+                        and stream_mouth_mouth_json is not None
+                    ):
+                        now_perf = time.perf_counter()
+                        last_knn_perf = stream_mouth_state.get("last_knn_perf")
+
+                        should_run_knn = (
+                            last_knn_perf is None
+                            or (now_perf - float(last_knn_perf)) >= float(stream_mouth_knn_min_interval_s)
+                        )
+
+                        if should_run_knn:
+                            t_knn0 = time.perf_counter()
+                            knn_sec = _run_stream_mouth_knn(
+                                knn_script=stream_mouth_knn_script,
+                                raw_json=mouth_raw_json,
+                                out_json=stream_mouth_mouth_json,
+                                gt_glob=stream_mouth_gt_glob,
+                                step_ms=40,
+                            )
+                            stream_mouth_state["last_knn_perf"] = time.perf_counter()
+
+                            if (
+                                not stream_mouth_state.get("first_mouth_json_written_logged", False)
+                                and stream_mouth_mouth_json is not None
+                                and stream_mouth_mouth_json.exists()
+                            ):
+                                first_written_sec = (_now_ms() - t0_ms) / 1000.0
+
+                                print(
+                                    f"[perf][first_stream_mouth_json_written_from_turn_start_sec] "
+                                    f"{first_written_sec:.3f}",
+                                    flush=True,
+                                )
+
+                                _append_jsonl(
+                                    events_jsonl,
+                                    {
+                                        "t_ms": _now_ms() - t0_ms,
+                                        "type": "first_stream_mouth_json_written",
+                                        "sec": first_written_sec,
+                                    },
+                                )
+
+                                stream_mouth_state["first_mouth_json_written_logged"] = True
+
+                            if not stream_mouth_state.get("first_knn_logged", False):
+                                first_knn_sec = (_now_ms() - t0_ms) / 1000.0
+
+                                print(
+                                    f"[perf][first_stream_mouth_knn_from_turn_start_sec] "
+                                    f"{first_knn_sec:.3f}",
+                                    flush=True,
+                                )
+
+                                _append_jsonl(
+                                    events_jsonl,
+                                    {
+                                        "t_ms": _now_ms() - t0_ms,
+                                        "type": "first_stream_mouth_knn",
+                                        "sec": first_knn_sec,
+                                    },
+                                )
+
+                                stream_mouth_state["first_knn_logged"] = True
+
+                            _append_jsonl(
+                                events_jsonl,
+                                {
+                                    "t_ms": _now_ms() - t0_ms,
+                                    "type": "stream_mouth_knn",
+                                    "stream_chunk_index": streamed_pcm_chunks,
+                                    "elapsed_sec": round(knn_sec, 6),
+                                    "min_interval_s": float(stream_mouth_knn_min_interval_s),
+                                },
+                            )
+                        else:
+                            stream_mouth_state["skipped_knn_by_interval"] = (
+                                int(stream_mouth_state.get("skipped_knn_by_interval", 0)) + 1
+                            )
+                            _append_jsonl(
+                                events_jsonl,
+                                {
+                                    "t_ms": _now_ms() - t0_ms,
+                                    "type": "stream_mouth_knn_skipped_by_interval",
+                                    "stream_chunk_index": streamed_pcm_chunks,
+                                    "min_interval_s": float(stream_mouth_knn_min_interval_s),
+                                    "skipped_n": int(stream_mouth_state["skipped_knn_by_interval"]),
+                                },
+                            )
+
+                    _append_jsonl(
+                        events_jsonl,
+                        {
+                            "t_ms": _now_ms() - t0_ms,
+                            "type": "stream_mouth_flush",
+                            "stream_chunk_index": streamed_pcm_chunks,
+                            "emitted_frames": int(emitted),
+                            "elapsed_sec": round(time.perf_counter() - t_mouth0, 6),
+                        },
+                    )
+
+
+
+                if total_audio_chunks == 0:
+                    first_response_audio_chunk_sec = (_now_ms() - t0_ms) / 1000.0
+
+                    print(
+                        f"[perf][first_response_audio_chunk_from_turn_start_sec] "
+                        f"{first_response_audio_chunk_sec:.3f}",
+                        flush=True,
+                    )
+
+                    _append_jsonl(
+                        events_jsonl,
+                        {
+                            "t_ms": _now_ms() - t0_ms,
+                            "type": "first_response_audio_chunk",
+                            "sec": first_response_audio_chunk_sec,
+                        },
+                    )
+
                 total_audio_bytes += len(audio)
                 total_audio_chunks += 1
+
                 _append_jsonl(
                     events_jsonl,
                     {
                         "t_ms": _now_ms() - t0_ms,
                         "type": "response_audio_chunk",
                         "bytes": len(audio),
+                        "stream_chunk_index": streamed_pcm_chunks,
                     },
                 )
+
+                streamed_pcm_chunks += 1
+
+
+
+
 
             text = _extract_text(msg)
             if text:
@@ -475,6 +784,7 @@ async def _receive_loop(
         "response_audio_chunks": total_audio_chunks,
         "text_chunks": total_text_chunks,
         "tool_calls": total_tool_calls,
+        "streamed_pcm_chunks": streamed_pcm_chunks,
     }
 
 
@@ -490,12 +800,44 @@ async def _run(args: argparse.Namespace) -> int:
 
     audio_input_path = out_dir / "audio_input.pcm"
     audio_response_path = out_dir / "audio_response.pcm"
+    pcm_stream_chunks_dir = out_dir / "pcm_stream_chunks"
     text_chunks_json = out_dir / "live_text_chunks.json"
     tool_calls_json = out_dir / "live_tool_calls.json"
     events_jsonl = out_dir / "audio_stream_bridge.events.jsonl"
     summary_json = out_dir / "audio_stream_bridge.summary.json"
+    stream_mouth_dir = out_dir / "stream_mouth"
+    mouth_streamer_json = stream_mouth_dir / "mouth_streamer.json"
+    mouth_raw_json = stream_mouth_dir / "mouth_timeline.formant.raw.json"
+    stream_mouth_mouth_json = stream_mouth_dir / "mouth.json"
 
     t0_ms = _now_ms()
+    mouth_streamer: MouthStreamerOC | None = None
+
+    if args.stream_mouth:
+        stream_mouth_dir.mkdir(parents=True, exist_ok=True)
+
+        mouth_streamer = MouthStreamerOC(
+            out_json=str(mouth_streamer_json),
+            session_id=session_id,
+            cfg=MouthOCConfig(
+                step_ms=int(args.mouth_step_ms),
+                window_ms=int(args.mouth_window_ms),
+                analysis_sr=int(args.mouth_analysis_sr),
+                input_sr_default=24000,
+                rms_thr=float(args.mouth_rms_thr),
+                vad_energy_thr=float(args.mouth_vad_energy_thr),
+                vad_min_speech_ms=int(args.mouth_vad_min_speech_ms),
+                vad_min_silence_ms=int(args.mouth_vad_min_silence_ms),
+                open_id=int(args.mouth_open_id),
+                close_id=int(args.mouth_close_id),
+                flush_every_frames=int(args.mouth_flush_every_frames),
+                max_buffer_s=float(args.mouth_max_buffer_s),
+                vowel_mode=str(args.mouth_vowel_mode),
+                formant_window_ms=int(args.mouth_formant_window_ms),
+                formant_max_hz=int(args.mouth_formant_max_hz),
+            ),
+        )
+
 
     system_instruction = str(args.system_instruction) if args.system_instruction else (
         "あなたは感情豊かな猫キャラです。"
@@ -555,14 +897,49 @@ async def _run(args: argparse.Namespace) -> int:
                 text_chunks_json=text_chunks_json,
                 tool_calls_json=tool_calls_json,
                 events_jsonl=events_jsonl,
+                pcm_stream_chunks_dir=pcm_stream_chunks_dir,
                 t0_ms=t0_ms,
+                stream_mouth=bool(args.stream_mouth),
+                stream_mouth_dir=stream_mouth_dir if args.stream_mouth else None,
+                mouth_streamer=mouth_streamer,
+                mouth_streamer_json=mouth_streamer_json if args.stream_mouth else None,
+                mouth_raw_json=mouth_raw_json if args.stream_mouth else None,
+                stream_mouth_knn=bool(args.stream_mouth_knn),
+                stream_mouth_knn_script=(
+                    Path(args.stream_mouth_knn_script).resolve()
+                    if args.stream_mouth_knn_script
+                    else None
+                ),
+                stream_mouth_gt_glob=str(args.stream_mouth_gt_glob),
+                stream_mouth_mouth_json=stream_mouth_mouth_json if args.stream_mouth else None,
+                stream_mouth_knn_min_interval_s=float(args.stream_mouth_knn_min_interval_s),
             )
         )
+
+        response_trigger_sent = {"sent": False}
+        early_response_task: asyncio.Task | None = None
+
+        if (
+            args.response_trigger
+            and args.early_response_trigger_s is not None
+            and float(args.early_response_trigger_s) >= 0
+        ):
+            early_response_task = asyncio.create_task(
+                _send_response_trigger_later(
+                    session=session,
+                    prompt=str(args.response_trigger),
+                    delay_s=float(args.early_response_trigger_s),
+                    events_jsonl=events_jsonl,
+                    t0_ms=t0_ms,
+                    sent_flag=response_trigger_sent,
+                )
+            )
 
         if args.mode == "mic":
             sent_bytes = await _send_audio_mic(
                 session=session,
                 duration_s=float(args.duration_s),
+                mic_send_max_s=args.mic_send_max_s,
                 input_sr=input_sr,
                 chunk_ms=int(args.chunk_ms),
                 audio_input_path=audio_input_path,
@@ -599,15 +976,39 @@ async def _run(args: argparse.Namespace) -> int:
         )
 
         # --- 修正点4: 追加 ---
-        if args.response_trigger:
+        if args.response_trigger and not response_trigger_sent.get("sent", False):
             await _send_response_trigger(
                 session=session,
                 prompt=str(args.response_trigger),
                 events_jsonl=events_jsonl,
                 t0_ms=t0_ms,
             )
+            response_trigger_sent["sent"] = True
+
+        if early_response_task is not None and not early_response_task.done():
+            early_response_task.cancel()
+            try:
+                await early_response_task
+            except asyncio.CancelledError:
+                pass
 
         recv_summary = await recv_task
+        if args.stream_mouth and mouth_streamer is not None:
+            mouth_streamer.finalize()
+            raw_obj = _project_streamer_to_raw(mouth_streamer_json)
+            _write_json(mouth_raw_json, raw_obj)
+
+            if args.stream_mouth_knn:
+                if not args.stream_mouth_knn_script:
+                    raise RuntimeError("--stream_mouth_knn requires --stream_mouth_knn_script")
+
+                _run_stream_mouth_knn(
+                    knn_script=Path(args.stream_mouth_knn_script).resolve(),
+                    raw_json=mouth_raw_json,
+                    out_json=stream_mouth_mouth_json,
+                    gt_glob=str(args.stream_mouth_gt_glob),
+                    step_ms=int(args.mouth_step_ms),
+                )
 
     input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / input_sr))
 
@@ -630,6 +1031,11 @@ async def _run(args: argparse.Namespace) -> int:
             "live_text_chunks_json": str(text_chunks_json),
             "live_tool_calls_json": str(tool_calls_json),
             "events_jsonl": str(events_jsonl),
+            "pcm_stream_chunks_dir": str(pcm_stream_chunks_dir),
+            "stream_mouth_dir": str(stream_mouth_dir) if args.stream_mouth else None,
+            "stream_mouth_streamer_json": str(mouth_streamer_json) if args.stream_mouth else None,
+            "stream_mouth_raw_json": str(mouth_raw_json) if args.stream_mouth else None,
+            "stream_mouth_mouth_json": str(stream_mouth_mouth_json) if args.stream_mouth else None,
         },
     }
 
@@ -662,6 +1068,7 @@ def main() -> int:
     ap.add_argument("--input_sr", type=int, default=16000)
 
     ap.add_argument("--duration_s", type=float, default=10.0)
+    ap.add_argument("--mic_send_max_s", type=float, default=None)
     ap.add_argument("--receive_timeout_s", type=float, default=5.0)
     ap.add_argument("--chunk_ms", type=int, default=40)
     ap.add_argument("--no_realtime_sleep", action="store_true")
@@ -673,6 +1080,33 @@ def main() -> int:
         "--response_trigger",
         default="今の音声に短く日本語で返答してください。返答の直前に set_emotion を1回呼んでください。",
     )
+    ap.add_argument("--early_response_trigger_s", type=float, default=None)
+
+    ap.add_argument("--stream_mouth", action="store_true")
+    ap.add_argument("--stream_mouth_knn", action="store_true")
+    ap.add_argument("--stream_mouth_knn_script", default=None)
+    ap.add_argument("--stream_mouth_gt_glob", default="data/knn_db/*.f1f2.json")
+    ap.add_argument("--stream_mouth_knn_min_interval_s", type=float, default=0.2)
+
+    ap.add_argument("--mouth_step_ms", type=int, default=40)
+    ap.add_argument("--mouth_analysis_sr", type=int, default=16000)
+    ap.add_argument("--mouth_window_ms", type=int, default=240)
+
+    ap.add_argument("--mouth_rms_thr", type=float, default=0.015)
+    ap.add_argument("--mouth_vad_energy_thr", type=float, default=0.0004)
+    ap.add_argument("--mouth_vad_min_speech_ms", type=int, default=80)
+    ap.add_argument("--mouth_vad_min_silence_ms", type=int, default=120)
+
+    ap.add_argument("--mouth_open_id", type=int, default=1)
+    ap.add_argument("--mouth_close_id", type=int, default=0)
+
+    ap.add_argument("--mouth_flush_every_frames", type=int, default=1)
+    ap.add_argument("--mouth_max_buffer_s", type=float, default=10.0)
+
+    ap.add_argument("--mouth_vowel_mode", choices=["formant", "simple"], default="formant")
+    ap.add_argument("--mouth_formant_window_ms", type=int, default=200)
+    ap.add_argument("--mouth_formant_max_hz", type=int, default=5500)
+
 
     args = ap.parse_args()
     return asyncio.run(_run(args))

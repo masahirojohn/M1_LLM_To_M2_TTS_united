@@ -40,6 +40,7 @@ def main() -> int:
     ap.add_argument("--bg_video", required=True)
 
     ap.add_argument("--duration_s", type=float, default=5.0)
+    ap.add_argument("--mic_send_max_s", type=float, default=None)
     ap.add_argument("--audio_device", default="15")
 
     ap.add_argument("--turns", type=int, default=3)
@@ -48,6 +49,15 @@ def main() -> int:
     ap.add_argument("--clean_each", action="store_true")
     ap.add_argument("--persistent_cam", action="store_true")
     ap.add_argument("--watch_fg_dir", default=None)
+    ap.add_argument("--use_m0_persistent", action="store_true")
+    ap.add_argument("--m0_worker_port", type=int, default=39390)
+    ap.add_argument("--stream_mouth_m0", action="store_true")
+    ap.add_argument("--stream_mouth_m0_chunk_len_ms", type=int, default=None)
+    ap.add_argument("--stream_mouth_knn_min_interval_s", type=float, default=0.2)
+    ap.add_argument("--early_response_trigger_s", type=float, default=None)
+    ap.add_argument("--api_version", default="v1alpha")
+    ap.add_argument("--model", default="gemini-3.1-flash-live-preview")
+    ap.add_argument("--stream_mouth", action="store_true")
 
     args = ap.parse_args()
 
@@ -69,6 +79,7 @@ def main() -> int:
     )
 
     cam_proc = None
+    m0_worker_proc = None
 
     if args.persistent_cam:
         print("[realtime_step1_loop] clean persistent watch dir:", watch_fg_dir, flush=True)
@@ -93,6 +104,25 @@ def main() -> int:
                 "--loop_bg",
             ],
             cwd=str(m1),
+        )
+
+        time.sleep(1.0)
+
+    if args.use_m0_persistent:
+        worker_script = Path(args.m0_repo_root).resolve() / "src" / "m0_persistent_worker.py"
+
+        print("[realtime_step1_loop] start shared m0 tcp worker", flush=True)
+        m0_worker_proc = subprocess.Popen(
+            [
+                str(py),
+                str(worker_script),
+                "--tcp",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(int(args.m0_worker_port)),
+            ],
+            cwd=str(Path(args.m0_repo_root).resolve()),
         )
 
         time.sleep(1.0)
@@ -133,12 +163,60 @@ def main() -> int:
                 str(int(frame_offset)),
             ]
 
+            if args.mic_send_max_s is not None:
+                cmd += [
+                    "--mic_send_max_s",
+                    str(float(args.mic_send_max_s)),
+                ]
+
             if args.persistent_cam:
                 cmd += [
                     "--external_virtualcam",
                     "--watch_fg_dir",
                     str(watch_fg_dir),
                 ]
+
+            if args.use_m0_persistent:
+                cmd += [
+                    "--use_m0_persistent",
+                    "--m0_worker_host",
+                    "127.0.0.1",
+                    "--m0_worker_port",
+                    str(int(args.m0_worker_port)),
+                ]
+
+            if args.stream_mouth_m0:
+                cmd.append("--stream_mouth_m0")
+
+            if args.stream_mouth_m0_chunk_len_ms is not None:
+                cmd += [
+                    "--stream_mouth_m0_chunk_len_ms",
+                    str(int(args.stream_mouth_m0_chunk_len_ms)),
+                ]
+
+            cmd += [
+                "--stream_mouth_knn_min_interval_s",
+                str(float(args.stream_mouth_knn_min_interval_s)),
+            ]
+
+            if args.early_response_trigger_s is not None:
+                cmd += [
+                    "--early_response_trigger_s",
+                    str(float(args.early_response_trigger_s)),
+                ]
+
+            cmd += [
+                "--api_version",
+                str(args.api_version),
+            ]
+
+            cmd += [
+                "--model",
+                str(args.model),
+            ]
+
+            if args.stream_mouth:
+                cmd.append("--stream_mouth")
 
             if args.clean_each and not args.persistent_cam:
                 cmd.append("--clean")
@@ -170,6 +248,15 @@ def main() -> int:
         time.sleep(2.0)
 
     finally:
+        if m0_worker_proc is not None and m0_worker_proc.poll() is None:
+            try:
+                import socket, json
+                with socket.create_connection(("127.0.0.1", int(args.m0_worker_port)), timeout=3.0) as sock:
+                    sock.sendall((json.dumps({"cmd": "quit"}) + "\n").encode("utf-8"))
+                m0_worker_proc.wait(timeout=5)
+            except Exception:
+                m0_worker_proc.kill()
+
         if cam_proc is not None and cam_proc.poll() is None:
             print("[realtime_step1_loop] terminate persistent virtualcam", flush=True)
             cam_proc.terminate()

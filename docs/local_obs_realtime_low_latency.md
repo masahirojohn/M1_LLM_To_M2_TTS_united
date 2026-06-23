@@ -883,3 +883,554 @@ Notes:
 
 Current recommended production mode:
 120ms + persistent session.
+
+
+
+
+##追加最終20260520
+## Stable realtime baseline
+
+Recommended production settings:
+
+- `stream_mouth_m0_chunk_len_ms = 120`
+- persistent Live API session
+- `response_modalities = ["AUDIO"]`
+- `output_audio_transcription = ON`
+- `reconnect_per_turn = OFF`
+- `turn_audio_retry_n = 0`
+- `skip_response_trigger = OFF`
+
+Verified:
+
+- 3 turns stable
+- OBS video/audio output works
+- `happy -> surprised -> sad` expression switching works
+- `next_frame_offset` increments across turns
+- first M0 completion is around 1 second
+
+Stable command:
+
+```powershell
+C:\dev\M1_LLM_To_M2_TTS_united\.venv\Scripts\python.exe `
+  scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py `
+  --session_id sess_live_session_loop_120ms_3turn_baseline_001 `
+  --m1_repo_root C:\dev\M1_LLM_To_M2_TTS_united `
+  --m3_repo_root C:\dev\M3_Live_API_1_united `
+  --m0_repo_root C:\dev\M0_session_renderer_final_1 `
+  --m35_repo_root C:\dev\M3.5_final `
+  --pose_json C:\dev\M0_session_renderer_final_1\timelines\pose\pose_timeline_final_with1_4.json `
+  --bg_video C:\dev\M3.5_final\in\with1.mp4 `
+  --turns 3 `
+  --gap_s 2.0 `
+  --turn_idle_wait_s 1.2 `
+  --turn_first_audio_timeout_s 6.0 `
+  --mic_send_max_s 0.6 `
+  --audio_device 15 `
+  --stream_mouth_m0_chunk_len_ms 120 `
+  --inline_emo_tag_mode `
+  --inline_emo_queue_jsonl C:\dev\M1_LLM_To_M2_TTS_united\in\inline_emo_queue_probe.jsonl `
+  --dev_live_emo_events_csv "1_1@600,2_0@1000,9_1@1400" `
+  --drop_initial_audio_ms 40 `
+  --output_audio_transcription `
+  --response_trigger "短く返答してください。" `
+  --clean `
+  --clean_fg
+
+Dev-only / not recommended for production:
+
+--stream_mouth_m0_chunk_len_ms 80
+--reconnect_per_turn
+--turn_audio_retry_n
+--skip_response_trigger
+response_modalities = ["TEXT", "AUDIO"]
+
+Notes:
+
+80ms can reduce first M0 completion slightly, but multi-turn audio is unstable.
+reconnect_per_turn was tested as a recovery path, but current behavior is less stable than persistent session reuse.
+skip_response_trigger did not reliably trigger audio response.
+TEXT + AUDIO modality should not be used for the current Live API path.
+
+
+
+
+
+
+##追記割り込み
+Battle Interrupt Runtime Smoke
+概要
+
+Gemini Live API persistent session 上で、
+Battle Runtime 用の「割り込み発話（interrupt speech）」を
+リアルタイム挿入する最小MVP。
+
+特徴：
+
+persistent Live API session
+OBS realtime output
+M0 persistent worker
+virtualcam persistent
+queue-file based interrupt injection
+turn_sent 後同期 interrupt send
+実現できたこと
+
+以下を実ログで確認済。
+
+queue file から複数 interrupt line 読み込み
+Battle interrupt send 成功
+interrupt transcription 成功
+audio chunk 継続
+M0 chunk render 継続
+OBS映像・音声反応あり
+turn_sent 後同期方式で安定化
+
+確認ログ例：
+
+[battle_interrupt][after_turn_sent_queued]
+[battle_interrupt][sent]
+[perf][session_audio_chunk]
+[realtime_step1][m0_chunk_done]
+[virtualcam_persistent] sent=
+__AUDIO_PLAYER_RESPONSE__
+queue file 例
+今すぐ割り込んで短くツッコんで
+もう一回、さらに強く煽って
+実行コマンド
+C:\dev\M1_LLM_To_M2_TTS_united\.venv\Scripts\python.exe `
+  scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py `
+  --session_id sess_battle_interrupt_cli_120ms_3turn_001 `
+  --m1_repo_root C:\dev\M1_LLM_To_M2_TTS_united `
+  --m3_repo_root C:\dev\M3_Live_API_1_united `
+  --m0_repo_root C:\dev\M0_session_renderer_final_1 `
+  --m35_repo_root C:\dev\M3.5_final `
+  --pose_json C:\dev\M0_session_renderer_final_1\timelines\pose\pose_timeline_final_with1_4.json `
+  --bg_video C:\dev\M3.5_final\in\with1.mp4 `
+  --turns 3 `
+  --gap_s 2.0 `
+  --turn_idle_wait_s 1.2 `
+  --turn_first_audio_timeout_s 6.0 `
+  --mic_send_max_s 0.6 `
+  --audio_device 15 `
+  --stream_mouth_m0_chunk_len_ms 120 `
+  --inline_emo_tag_mode `
+  --inline_emo_queue_jsonl C:\dev\M1_LLM_To_M2_TTS_united\in\inline_emo_queue_probe.jsonl `
+  --dev_live_emo_events_csv "1_1@600,2_0@1000,9_1@1400" `
+  --drop_initial_audio_ms 40 `
+  --output_audio_transcription `
+  --response_trigger "短く返答してください。" `
+  --battle_interrupt_queue_file C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_queue.txt `
+  --battle_interrupt_queue_interval_s 1.8 `
+  --clean `
+  --clean_fg
+現状の制限
+
+未実装：
+
+audio routing 分離
+self voice loopback防止
+Zoom/TikTok相手音声 routing
+mic gate
+AI self-echo prevention
+
+Battle Runtime本番化では、
+audio routing layer の追加が必要。
+
+注意:
+Live API初回応答は不安定な場合がある。
+成功判定は以下:
+- after_turn_sent_queued
+- sent
+- transcription output
+- session_audio_chunk
+- m0_chunk_done
+- AUDIO_PLAYER_RESPONSE
+- OBS映像/音声反応
+
+1回失敗した場合は同一コマンドを再実行する。
+
+
+
+
+#追記=マイクスピーカー混線対策
+Battle audio routing baseline:
+AI audio output device = 15
+OBS AI_CAT_AUDIO = CABLE Output
+Desktop Audio = Disabled
+Mic/Aux = Disabled
+Headphone monitoring = OFF
+1回目無反応の場合あり。2回目で成功確認。
+成功条件:
+- AI_CAT_AUDIO反応
+- virtualcam_persistent sent
+- AUDIO_PLAYER_RESPONSE device=15
+- m0_chunk_done
+
+
+
+
+追記セクション
+
+# Battle Runtime Phase2
+## File Polling Interrupt (2026-06)
+保存版（Phase2 Battle Interrupt File Polling）
+メイン実行コマンド
+C:\dev\M1_LLM_To_M2_TTS_united\.venv\Scripts\python.exe `
+  scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py `
+  --session_id sess_battle_file_polling_prod_001 `
+  --m1_repo_root C:\dev\M1_LLM_To_M2_TTS_united `
+  --m3_repo_root C:\dev\M3_Live_API_1_united `
+  --m0_repo_root C:\dev\M0_session_renderer_final_1 `
+  --m35_repo_root C:\dev\M3.5_final `
+  --pose_json C:\dev\M0_session_renderer_final_1\timelines\pose\pose_timeline_final_with1_4.json `
+  --bg_video C:\dev\M3.5_final\in\with1.mp4 `
+  --turns 1 `
+  --gap_s 2.0 `
+  --mic_send_max_s 0.6 `
+  --ai_audio_output_device 15 `
+  --stream_mouth_m0_chunk_len_ms 120 `
+  --reconnect_per_turn `
+  --bootstrap_audio_required `
+  --bootstrap_retry_n 10 `
+  --bootstrap_timeout_s 3.0 `
+  --bootstrap_response_trigger "短く返答してください。" `
+  --inline_emo_tag_mode `
+  --inline_emo_queue_jsonl C:\dev\M1_LLM_To_M2_TTS_united\in\inline_emo_queue_probe.jsonl `
+  --dev_live_emo_events_csv "1_1@600,2_0@1000,9_1@1400" `
+  --drop_initial_audio_ms 40 `
+  --output_audio_transcription `
+  --response_trigger "短く返答してください。" `
+  --battle_interrupt_file C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_live.txt `
+  --battle_interrupt_file_poll_s 0.05 `
+  --clean `
+  --clean_fg
+実運用 writer コマンド
+
+実行前に空にする：
+
+Set-Content `
+  -Path C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_live.txt `
+  -Value "" `
+  -Encoding utf8
+
+割り込み：
+
+Set-Content `
+  -Path C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_live.txt `
+  -Value '{"type":"interrupt","text":"今すぐ短くツッコんで"}' `
+  -Encoding utf8
+
+煽り：
+
+Set-Content `
+  -Path C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_live.txt `
+  -Value '{"type":"interrupt","text":"相手を軽く煽って"}' `
+  -Encoding utf8
+
+強め：
+
+Set-Content `
+  -Path C:\dev\M1_LLM_To_M2_TTS_united\in\battle_interrupt_live.txt `
+  -Value '{"type":"interrupt","text":"もっと強めに返して"}' `
+  -Encoding utf8
+Phase2 合格判定ログ
+
+今回実際に通ったログです。
+
+[battle_interrupt][file_pending]
+
+[battle_interrupt][file_apply_as_control]
+
+[transcription][output]
+(内容が割り込み内容へ変化)
+
+[perf][turn1_first_response_audio_chunk_sec]
+
+[realtime_step1][m0_chunk_done]
+
+__AUDIO_PLAYER_RESPONSE__
+
+[battle_interrupt][file_consume_confirmed]
+
+
+Phase3 Step1:
+File Polling overwrite 実装済み。
+未消費pendingがある状態で新指示が来た場合、最新指示のみ残す。
+音声なしattemptではconsumeしない。
+音声ありattempt成功後のみ file_consume_confirmed で消費。
+
+
+
+
+
+docs/local_obs_realtime_low_latency.md 追記案
+Battle Runtime Phase3 進捗
+Phase3 Step1 : overwrite
+
+実装済。
+
+目的：
+
+最新指示のみ採用
+
+例：
+
+煽れ
+↓
+優しく返せ
+
+↓
+
+優しく返せ
+
+のみ保持。
+
+Phase3 Step2 : priority metadata
+
+実装済。
+
+対応：
+
+normal
+battle
+critical
+
+未指定時：
+
+normal
+
+扱い。
+
+例：
+
+{
+  "type":"interrupt",
+  "priority":"battle",
+  "text":"軽くツッコんで"
+}
+Phase3 Step3 : expire
+
+実装済。
+
+例：
+
+{
+  "type":"interrupt",
+  "priority":"battle",
+  "text":"軽くツッコんで",
+  "expire_sec":30
+}
+
+期限切れ時：
+
+[file_expired]
+
+出力。
+
+Phase3 Step4 : priority compare
+
+実装済。
+
+ルール：
+
+critical > battle > normal
+
+例：
+
+battle pending
+↓
+normal投入
+
+↓
+
+battle維持
+
+ログ：
+
+[file_pending_keep_higher_priority]
+現在のBattle Control JSON
+{
+  "type":"interrupt",
+  "priority":"battle",
+  "text":"軽くツッコんで",
+  "expire_sec":30
+}
+
+
+
+
+Phase4 Step1 battle_control File Polling 化 完了
+
+battle_control_live.txt を追加。
+JSON:
+{"type":"control","text":"軽くツッコむ口調で返して"}
+
+仕様:
+battle_control は apply 時点で consume する。
+音声成功まで保持しない。
+理由:
+保持すると同じ control が retry attempt ごとに再注入され、audio_chunks=0 を固定化しやすい。
+
+battle_interrupt との違い:
+battle_interrupt = 音声成功まで保持
+battle_control  = apply時consume
+
+
+
+
+# Battle Runtime Phase4 進捗
+
+## Phase4 Step1 : battle_control File Polling 化
+
+実装済。
+
+追加ファイル：
+
+```text
+in/battle_control_live.txt
+```
+
+形式：
+
+```json
+{
+  "type":"control",
+  "text":"軽くツッコむ口調で返して"
+}
+```
+
+実装：
+
+```text
+battle_control_live.txt
+↓
+50ms polling
+↓
+battle_control_lines
+↓
+response_trigger 注入
+```
+
+---
+
+## battle_control の仕様
+
+battle_interrupt と異なり、
+
+```text
+apply時 consume
+```
+
+を採用。
+
+理由：
+
+```text
+音声成功まで保持
+```
+
+にすると、
+
+同じ control が retry attempt ごとに再注入され、
+
+```text
+audio_chunks=0
+```
+
+を固定化しやすいため。
+
+---
+
+## battle_interrupt の仕様
+
+従来通り。
+
+```text
+音声成功時のみ consume
+```
+
+採用。
+
+```text
+file_consume_confirmed
+```
+
+まで保持。
+
+---
+
+## Phase4 Step2 : control + interrupt 同時投入
+
+実装確認済。
+
+同時投入：
+
+```json
+{"type":"control","text":"軽くツッコむ口調で返して"}
+```
+
+*
+
+```json
+{
+  "type":"interrupt",
+  "priority":"battle",
+  "text":"今すぐ短くツッコんで",
+  "expire_sec":60
+}
+```
+
+結果：
+
+```text
+OBS映像・音声出力成功
+```
+
+---
+
+## Phase4 Step3 : arbitration
+
+実装済。
+
+優先順位：
+
+```text
+interrupt > control > response_trigger
+```
+
+ログ：
+
+```text
+[battle_arbitration]
+interrupt=True
+control=True
+winner=interrupt
+```
+
+---
+
+## prompt順序
+
+現在：
+
+```text
+【管理者制御】
+...
+【管理者割り込み予約】
+...
+```
+
+固定。
+
+control を土台、
+
+interrupt を最終上書き指示として扱う。
+
+
+
+Phase4 Step3-2 rollback確認 合格。
+安定仕様:
+battle_control = text only / apply時consume
+battle_interrupt = priority + expire / 音声成功時consume
+arbitration = interrupt > control
+prompt順序 = control → interrupt
+Step4 battle_control priority metadata は凍結。

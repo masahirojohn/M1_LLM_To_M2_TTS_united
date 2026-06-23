@@ -1,0 +1,17 @@
+{
+  "evt_001": {
+    "event_mode": "bg_only",
+    "bg_video": "in/evt_001.mp4",
+    "pose_json": "in/pose_timeline_evt_001.json",
+    "duration_s": 3.0,
+    "audio": false
+  },
+  "evt_voice_001": {
+    "event_mode": "bg_only",
+    "bg_video": "in/evt_voice_001.mp4",
+    "pose_json": "in/pose_timeline_evt_voice_001.json",
+    "audio": true,
+    "audio_source": "mp4",
+    "post_control": "イベント後も激怒状態を維持して、強めに短く返して。"
+  }
+}
