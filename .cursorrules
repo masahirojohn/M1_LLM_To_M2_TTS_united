@@ -1,0 +1,128 @@
+# 開発の絶対原則（設計思想）- チャンク内同期・チャンク間並列パイプライン版
+
+本リポジトリの realtime / lip-sync / streaming 作業では、以下を最優先で守ること。
+
+## 1. ジッターバッファーの死守
+
+本システムは、M0 の画像生成・読込遅延を吸収するために音声・映像のジッターバッファーを設けている。
+同期計算式を勝手に変更したり、M0 の生成ループを「停止する」ようなコード提案は **絶対禁止**。
+
+ジッターバッファーは **API→処理の遅延吸収**用であり、**player が M0/mouth より先に進むためのものではない**。
+
+### タイムアウト・バッファー値の区別（混同禁止）
+
+以下は **別パラメータ** として扱う。互いに代用しない。
+
+| 概念 | 役割 | 初期値の目安 | 調整方針 |
+| --- | --- | --- | --- |
+| **初期ジッターバッファー** | 再生開始前に溜める M0 PNG 相当の音声データ量 | 300–500ms（CLI 可変） | 計測ログを見て最適化。固定値前提にしない |
+| **再生開始フォールバック** | 目標蓄積量に達しないときの強制再生開始 | 例: 1000ms | 無限ブロック防止のみ。通常パスでは使わない |
+| **M0 ハング救済** | 異常ハング時の `mouth_closed` 付与 → enqueue | 例: 500ms 超（CLI 可変） | 正常 M0（~250ms/chunk）を短タイムアウトで打ち切らない |
+
+- 初期ジッターバッファーに 3000ms 等の大値を使う設計は **採用しない**。
+- `--audio_player_initial_buffer_ms` / `--audio_player_rebuffer_target_ms` 等の既存 CLI フラグを尊重し、Pass 前に無根拠で変更しない。
+
+## 2. 到着順並列パイプライン（図A設計の厳守）
+
+本プロジェクトの処理は、**「1 チャンク（PCM）内では完全同期一本道（KNN→M0→enqueue）、チャンク間では到着順に非同期タスクとして独立並列（図A）」** である。
+
+### 【構造図：到着順パイプライン（図A）】
+
+```text
+[Live API 受信ループ (_receive_loop)]
+       │
+       ├─► (音声 PCM チャンク到着)
+       │         │
+       │         ▼ 【非同期フォーク】 `_process_pipeline_chunk_task`（チャンクごと）
+       │         │
+       │         ▼ 【チャンク内は同期一本道】
+       │         KNN（同期）→ M0 描画（同期・完了待ち）→ player enqueue
+       │         │
+       │         ▼
+       │     [pipeline_enqueue_queue]
+       │         │
+       │         ▼ `_pipeline_enqueue_dispatcher_loop`
+       │     [_enqueue_playback_audio_sync] → player
+       │
+       │     ※ 次チャンクは上記完了を待たず、別タスクとして並列開始
+       │
+       └─► [Virtual Cam / OBS 送信ループ]（再生 audio_ms に同期して描画）
+```
+
+### チャンク内（厳守）
+
+- 処理順序: `PCM 到着 → KNN → M0 描画（PNG 生成完了待ち）→ player enqueue`
+- **player enqueue は KNN/M0 の後**にのみ行う。enqueue 時点で対応 chunk の mouth + M0 PNG が存在すること。
+- M0 描画完了前の音声 enqueue は **設計違反バグ**（supply_gap 累積は仕様ではない）。
+
+### チャンク間（並列性）
+
+- 1 チャンクが M0 描画待ちでも、**後続 PCM チャンクの受信・処理をブロックしない**。
+- `_receive_loop` 自体は asyncio 非同期でよいが、**PCM 1 chunk あたりの処理順序**は上記一本道を崩さない。
+- fast_worker / slow_worker による旧非同期分離は **禁止**（新設・復活しない）。
+
+### スタック対策（M0 ハング救済のみ）
+
+- **正常時**: M0 描画は完了まで同期待ち（~250ms/chunk は正常コスト）。遅延は enqueue 前に発生し、**初期ジッターバッファー**が吸収する。
+- **異常時（M0 ハングのみ）**: M0 ハング救済タイムアウト超過で `mouth_closed` ダミー付与 → enqueue（音声途切れ防止）。
+- **40ms 等の短タイムアウトで正常 M0 を打ち切って enqueue してはならない**。
+
+### その他禁止
+
+- `generation_complete` による clear_queue / 内部ループ停止（入力終了マーカーのみ）
+- 固定 `sleep` / ポーリング待ち / player 先行 enqueue で症状を隠す提案
+- `player_buffering` 連動で M0 供給を止めるゲートの復活
+
+## 3. ローカル VAD（方式2）
+
+- `LiveConnectConfig` で `automatic_activity_detection=False`
+- クライアント VAD に合わせ `activity_start=True` / `activity_end=True` を送信
+- server VAD 混在残骸（`drop_initial_audio_ms`、テキストレスポンストリガー、server VAD 前提分岐）を新規追加・復活させない
+
+## 4. tail の保護と割り込み例外
+
+- 原則: 音声がジッターバッファーから **完全に吐き出され鳴り終わるまで** `clear_queue` 禁止
+- **唯一の例外**: ユーザー割り込み発話時のみ、player および描画キューの即時 clear を許可
+- `generation_complete` 前後を理由に tail 前 clear は禁止
+
+## 5. 共通 ID（Sync SSOT）
+
+音声の再生位置（`played_samples` → `player_local_ms` / `audio_ms`）が唯一の時刻 ID。
+mouth.json・M0 描画・virtualcam 表示は、すべてこの ID で「今どの瞬間か」を決め、メタデータ照合する。
+
+```text
+player.played_samples
+  → player_local_ms / audio_ms
+  → mouth.json frame（t_ms ≒ playback_origin_ms + audio_ms）
+  → M0 PNG（同一 audio_ms 範囲）
+  → virtualcam 表示 frame = 今鳴っている audio_ms
+```
+
+## 6. インメモリ化の現状運用（Phase 5b）
+
+- インメモリ化（`--fast_inmemory`）および `skip_archive_pcm` の分岐は **破壊・消去しない**
+- テスト未 Pass のため、実運用テストは `--no-fast_inmemory`（OFF）を優先
+- Phase 5（VirtualCam SSOT）Pass 後に ON Pass を行う
+
+## 7. 可観測性（メトリクス）の維持
+
+- `queue_wait_ms` / `total_ms` / `knn_ms` / `m0_ms` / `enqueue_ms` の計測ログ
+- `[sync][pipeline_chunk]` ログ（chunk_idx, timeout_used 等）
+- player へデリバリーされた絶対システム時刻（ms）の出力
+
+## 実装・レビュー時の禁止事項（要約）
+
+- fast/slow 非同期分離の新設・復活
+- M0/KNN より前の player enqueue
+- チャンク内 M0 待ちによる **後続チャンク全体のブロック**（並列性喪失）
+- `generation_complete` による clear_queue / ループ停止
+- tail drain 前の clear_queue（割り込み例外を除く）
+- audio_ms と無関係な sequential frame 消費
+- supply_gap / fallback を許容仕様として扱うこと
+- ジッターバッファーと M0 ハング救済タイムアウトの混同
+
+## 関連ドキュメント
+
+- `docs/PROGRESS.md` — フェーズ進捗・Pass 基準
+- `docs/streaming_design_notes.md` §5 Sync SSOT
+- `docs/handoff_phase5_streaming.md`
