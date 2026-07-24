@@ -123,6 +123,7 @@ player.played_samples
 
 ## 関連ドキュメント
 
+- `docs/ARCHITECTURE.md` — パイプライン構造・ファイル役割・データフロー
 - `docs/PROGRESS.md` — フェーズ進捗・Pass 基準
 - `docs/streaming_design_notes.md` §5 Sync SSOT
 - `docs/handoff_phase5_streaming.md`

@@ -10,7 +10,7 @@
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | `run_mic_input_obs_realtime_step1.py`, `dev_audio_chunk_player_persistent.py`, `run_virtualcam_persistent.py` |
-| 設計 SSOT | リポジトリ直下 `.cursorrules` |
+| 設計 SSOT | `.cursorrules`（原則）+ `docs/ARCHITECTURE.md`（構造） |
 
 ## フェーズ一覧
 
@@ -165,3 +165,4 @@
 | 日付 | 内容 |
 | --- | --- |
 | 2026-07-24 | 初版作成（Phase 0–6 定義、Phase 4 talkover マッピング含む） |
+| 2026-07-24 | `docs/ARCHITECTURE.md` 追加に伴い SSOT 参照を更新 |
