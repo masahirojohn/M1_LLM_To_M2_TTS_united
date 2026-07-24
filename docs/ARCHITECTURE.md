@@ -106,11 +106,14 @@ _receive_loop()                         ← session_loop 内
           run_virtualcam_persistent.py → OBS
 ```
 
-### Phase10 の入力制御（ローカル VAD）
+### Phase10 の入力制御（現状ベースライン／監査結果）
 
-- mic 送信: `_send_mic_once()` 内の RMS ベース VAD（`mic_vad_*` 引数）
-- ターン終了: VAD 無音検知 → mic 停止 → `audio_stream_end=True`（または `--audio_stream_end_per_turn`）
-- **目標（Phase 1）:** `activity_start/end` 方式2 へ置換。`drop_initial_audio_ms` / テキストレスポンストリガー撤去
+- mic 送信: `_send_mic_once()` は **固定長 `mic_send_max_s`（default 0.6s）**。本番 4 ファイルに RMS `mic_vad_*` **なし**（参考は `docs/gemini*.md` のみ）
+- ターン起動: テキスト `response_trigger` が主経路（`--skip_response_trigger` あり）
+- ターン終了: `--audio_stream_end_per_turn` 時に `audio_stream_end=True`（talkover cut-in も同 API）
+- 未明示: `automatic_activity_detection`（SDK デフォルトの server VAD が残存しうる）。`activity_start` / `activity_end` **未使用**
+- 残骸: `drop_initial_audio_ms`（default 120、`inline_emo_tag_mode` 時の playback 冒頭 drop）
+- **目標（Phase 1）:** 方式2（`automatic_activity_detection=False` + クライアント VAD + `activity_start/end`）。テキストトリガー / `drop_initial_audio_ms` / `audio_stream_end_per_turn` を撤去または `activity_end` 置換。mic VAD は **新規配線**
 
 ---
 
@@ -222,3 +225,4 @@ Phase10 → 新設計マッピングの詳細は `docs/PROGRESS.md` Phase 4 を�
 | 日付 | 内容 |
 | --- | --- |
 | 2026-07-24 | 初版（Phase10 ベースライン + 図A 目標設計を統合） |
+| 2026-07-24 | Phase 0 監査反映: 入力制御は固定長 mic + テキストトリガーが現状。mic_vad は Phase1 新規配線 |

@@ -7,17 +7,19 @@
 | 項目 | 値 |
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
+| 起点 tag | `phase10-local-vad-baseline` |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
-| 未 commit 3 ファイル | `run_mic_input_obs_realtime_step1.py`, `dev_audio_chunk_player_persistent.py`, `run_virtualcam_persistent.py` |
+| 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
 | 設計 SSOT | `.cursorrules`（原則）+ `docs/ARCHITECTURE.md`（構造） |
+| 子セルフ検証 | 各 Phase 完了前に子が検証コマンド実行。親はサマリーのみ確認（diff/ログ全文は読まない） |
 
 ## フェーズ一覧
 
 | Phase | 名称 | 状態 | Pass 日 |
 | --- | --- | --- | --- |
-| 0 | ベースライン監査・計画 | `pending` | — |
-| 1 | ローカル VAD 完全化 | `pending` | — |
+| 0 | ベースライン監査・計画 | `pass` | 2026-07-24 |
+| 1 | ローカル VAD 完全化 | `pass` | 2026-07-24 |
 | 2 | 一本道並列（session_loop + step1） | `pending` | — |
 | 3 | データ量 jitter（audio_player） | `pending` | — |
 | 4 | 割り込み・talkover 整合 | `pending` | — |
@@ -34,12 +36,17 @@
 **目的:** ロールバック後コードの現状把握。コード変更なし。
 
 **Pass 基準:**
-- [ ] 現行 vs `e4c1204` の差分表（4 ファイル）
-- [ ] 旧 VAD 混在箇所リスト（`automatic_activity_detection`, `drop_initial_audio_ms`, テキストトリガー等）
-- [ ] 3 ファイルのボトルネック候補リスト
-- [ ] Phase 1 着手 Go/No-Go 判断
+- [x] 現行 vs `e4c1204` の差分表（4 ファイル）
+- [x] 旧 VAD 混在箇所リスト（`automatic_activity_detection`, `drop_initial_audio_ms`, テキストトリガー等）
+- [x] 3 ファイルのボトルネック候補リスト
+- [x] Phase 1 着手 Go/No-Go 判断
 
-**子チャット報告:** （ここにサマリーを貼る）
+**子チャット報告:**
+- 対象 4 ファイルは `e4c1204` と blob 完全一致。working tree clean（「未 commit 3 ファイル」は解消済み）。
+- 旧経路: `automatic_activity_detection` 未明示（SDK server VAD 残存しうる）、`activity_start/end` 未使用、`drop_initial_audio_ms`（default 120）、テキスト `response_trigger` 主経路、`audio_stream_end_per_turn`。
+- 欠落: 本番にクライアント RMS `mic_vad` なし（固定 `mic_send_max_s`）。ARCHITECTURE の「mic_vad」記述と実装乖離 → Phase1 は残骸撤去＋方式2 新規配線。
+- ボトルネックは Phase2–5 領域（ファイル監視 / 即再生 / sequential frame）。Phase1 阻害なし。
+- **Go → Phase 1**
 
 ---
 
@@ -47,16 +54,26 @@
 
 **目的:** server VAD 混在を解消し、方式2（クライアント VAD）に一本化。
 
+**設計決定:**
+- `activity_start` / `activity_end` は **新規配線**（残すだけ禁止）。server VAD 旧分岐は無効化または削除。
+- Pass は **1 ターン AI 音声返答 + activity ログ** 中心。リップシンク品質は要求しない。
+
 **Pass 基準:**
-- [ ] `automatic_activity_detection=False`
-- [ ] `activity_start=True` / `activity_end=True` でターン完結
-- [ ] `drop_initial_audio_ms` / テキストレスポンストリガー撤去または無効化
-- [ ] `audio_stream_end_per_turn` を `activity_end` ベースに置換（通常ターン）
-- [ ] 1 ターン E2E：ユーザー発話 → AI 音声返答
+- [x] `automatic_activity_detection=False`
+- [x] `activity_start=True` / `activity_end=True` でターン完結（ログで確認）
+- [x] `drop_initial_audio_ms` / テキストレスポンストリガー撤去または無効化
+- [x] `audio_stream_end_per_turn` を `activity_end` ベースに置換（通常ターン）
+- [x] 1 ターン E2E：ユーザー発話 → AI 音声返答（リップシンク品質は不問）
 
 **主な対象:** `run_mic_input_obs_realtime_session_loop.py`
 
-**子チャット報告:** （ここにサマリーを貼る）
+**子チャット報告:**
+- AAD `disabled=True` + RMS `mic_vad_*` 新規配線 + `ActivityStart`/`ActivityEnd` でターン完結。
+- 通常ターン: `response_trigger` default SKIP、`drop_initial_audio_ms` 強制 0、`audio_stream_end` 非送信。
+- E2E 1ターン Pass（`logs/sess_phase1_client_vad_20260724_202421.log`）。セルフ検証すべてクリア。`clear_queue` 増加なし。
+- 懸念（Pass 外）: 短無音で VAD 早め切れ／battle text interrupt は旧 trigger 依存 → Phase 4。
+- 付随: `tools/phase1_play_synth_speech_to_cable.py`（任意ヘルパ）。
+- **Pass → Phase 2**
 
 ---
 
@@ -64,12 +81,18 @@
 
 **目的:** チャンク内 KNN→M0→enqueue、チャンク間非ブロック並列。
 
+**設計決定:**
+- **supply_gap なし** = enqueue 時点で M0 PNG 存在（音声先行 enqueue 0 件）に限定。再生時 supply_gap / アンダーラン / 主観リップシンクは Phase 3 以降。
+- チャンク間は並列開始可だが、**player への enqueue 順序は chunk_idx 到着順を厳守**（後続が先に M0 完了しても先行 chunk の enqueue 完了を待つ順序保証が必須）。
+- テストは短い PCM ストリーム + ログベース Pass を主とする。`scripts/tools/verify_pipeline_logs.py` 最小版はこの Phase で作成後から義務化可。
+
 **Pass 基準:**
-- [ ] `_process_pipeline_chunk_task`（または同等）がチャンクごとに非同期起動
+- [ ] チャンクごとに非同期起動されるパイプライン処理がある
 - [ ] チャンク内: KNN → M0 完了 → enqueue の順序ログ確認
 - [ ] チャンク N の M0 待ち中もチャンク N+1 が処理開始されること
 - [ ] `[sync][pipeline_chunk]` ログ出力（chunk_idx, knn_ms, m0_ms, enqueue_ms）
-- [ ] supply_gap なし（enqueue 時 M0 PNG 存在）
+- [ ] enqueue 時点 M0 PNG 存在（音声先行 enqueue 0 件）。再生時 gap は本 Phase 対象外
+- [ ] enqueue 順序 = chunk_idx 到着順
 
 **主な対象:** `run_mic_input_obs_realtime_session_loop.py`, `run_mic_input_obs_realtime_step1.py`
 
@@ -166,3 +189,6 @@
 | --- | --- |
 | 2026-07-24 | 初版作成（Phase 0–6 定義、Phase 4 talkover マッピング含む） |
 | 2026-07-24 | `docs/ARCHITECTURE.md` 追加に伴い SSOT 参照を更新 |
+| 2026-07-24 | Phase 0 Pass。4 ファイル=e4c1204 一致。方式2 は新規配線必要。Phase 1 Go |
+| 2026-07-24 | 子セルフ検証運用・tag `phase10-local-vad-baseline`・Phase1/2 設計決定を SSOT 反映 |
+| 2026-07-24 | Phase 1 Pass。方式2 VAD + activity_start/end。Phase 2 Go |

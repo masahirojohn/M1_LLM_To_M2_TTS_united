@@ -13,8 +13,9 @@ import socket
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import Any
 
 import yaml
@@ -44,8 +45,16 @@ for _p in _M3_PATH_CANDIDATES:
 from m3p.live.mouth_streamer_oc import MouthStreamerOC, MouthOCConfig
 
 from run_mic_input_obs_realtime_step1 import (
+    _M0_PIPELINE_HANG_TIMEOUT_MS,
+    _create_m0_pipeline_ref,
+    _make_audio_playback_state_ref,
+    _m0_pipeline_advance_sync,
+    _m0_pipeline_enqueue_timeline_end_ms,
+    _m0_pipeline_rendered_end_ms,
+    _m0_pipeline_verify_pngs_exist,
     _start_audio_player,
     _stop_audio_player,
+    _send_audio_chunk,
     _watch_stream_pcm_chunks,
     _watch_stream_mouth_and_render_m0,
 )
@@ -390,6 +399,13 @@ def _build_live_config(
     if output_audio_transcription:
         extra_kwargs["output_audio_transcription"] = {}
 
+    # Phase 1 / 方式2: server VAD を明示 OFF。クライアントが activity_start/end を送る。
+    extra_kwargs["realtime_input_config"] = types.RealtimeInputConfig(
+        automatic_activity_detection=types.AutomaticActivityDetection(
+            disabled=True,
+        ),
+    )
+
     if not enable_tools:
         return types.LiveConnectConfig(
             system_instruction=system_instruction,
@@ -498,7 +514,22 @@ async def _send_mic_once(
     device: int | str | None = None,
     stop_event: asyncio.Event | None = None,
     mic_gate_ref: dict[str, str] | None = None,
+    # --- Phase 1: client / local RMS VAD（口形用 mouth_vad_* とは別）---
+    mic_vad_end_enabled: bool = True,
+    mic_vad_rms_threshold: float = 0.015,
+    mic_vad_end_rms_threshold: float | None = None,
+    mic_vad_min_voice_ms: int = 200,
+    mic_vad_silence_ms: int = 700,
+    mic_vad_min_listen_ms: int = 800,
+    mic_vad_debug: bool = False,
+    send_activity_signals: bool = True,
 ) -> int:
+    """
+    Mic PCM を Live API へ送信する。
+
+    automatic_activity_detection=disabled 時は、クライアント VAD に合わせて
+    activity_start / activity_end を送る（audio_stream_end は使わない）。
+    """
     try:
         import numpy as np
         import sounddevice as sd
@@ -507,6 +538,51 @@ async def _send_mic_once(
 
     block_samples = int(input_sr * chunk_ms / 1000.0)
     total_blocks = max(1, int((duration_s * 1000.0) / chunk_ms))
+
+    actual_chunk_ms = (
+        block_samples / float(input_sr) * 1000.0
+        if input_sr > 0
+        else float(chunk_ms)
+    )
+    min_voice_blocks = max(
+        1,
+        int(round(float(mic_vad_min_voice_ms) / actual_chunk_ms)),
+    )
+    silence_blocks_limit = max(
+        1,
+        int(round(float(mic_vad_silence_ms) / actual_chunk_ms)),
+    )
+    min_listen_blocks = max(
+        1,
+        int(round(float(mic_vad_min_listen_ms) / actual_chunk_ms)),
+    )
+
+    voice_blocks = 0
+    silence_blocks = 0
+    has_spoken = False
+    activity_started = False
+    vad_ended = False
+
+    vad_start_threshold = float(mic_vad_rms_threshold)
+    vad_end_threshold = (
+        float(mic_vad_end_rms_threshold)
+        if mic_vad_end_rms_threshold is not None
+        else vad_start_threshold
+    )
+
+    if mic_vad_debug or mic_vad_end_enabled:
+        print(
+            "[mic_vad][INIT]",
+            f"enabled={bool(mic_vad_end_enabled)}",
+            f"chunk_ms={actual_chunk_ms:.2f}",
+            f"voice_blocks={min_voice_blocks}",
+            f"silence_blocks={silence_blocks_limit}",
+            f"min_listen_blocks={min_listen_blocks}",
+            f"start_threshold={vad_start_threshold:.5f}",
+            f"end_threshold={vad_end_threshold:.5f}",
+            f"send_activity_signals={bool(send_activity_signals)}",
+            flush=True,
+        )
 
     q: asyncio.Queue[bytes] = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -535,78 +611,196 @@ async def _send_mic_once(
         except (TypeError, ValueError):
             input_device = str(input_device)
 
-    with sd.InputStream(
-        samplerate=int(input_sr),
-        channels=1,
-        dtype="float32",
-        blocksize=block_samples,
-        callback=callback,
-        device=input_device,
-    ):
-        for i in range(total_blocks):
-            if stop_event is not None and stop_event.is_set():
-                print(
-                    "[mic_send][CUT_IN_STOP]",
-                    f"i={i}",
-                    f"elapsed_s={time.perf_counter() - t0:.3f}",
-                    flush=True,
-                )
-                break
+    async def _emit_activity_start(i: int) -> None:
+        nonlocal activity_started
+        if activity_started or not send_activity_signals:
+            return
+        await session.send_realtime_input(activity_start=types.ActivityStart())
+        activity_started = True
+        print(
+            "[mic_vad][ACTIVITY_START]",
+            f"i={i}",
+            f"elapsed_s={time.perf_counter() - t0:.3f}",
+            flush=True,
+        )
 
-            try:
-                chunk = await asyncio.wait_for(q.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                print(
-                    f"[session_loop][WARN] mic chunk timeout "
-                    f"i={i} total_blocks={total_blocks}; stop sending mic audio",
-                    flush=True,
-                )
-                break
+    async def _emit_activity_end(reason: str) -> None:
+        if not activity_started or not send_activity_signals:
+            return
+        await session.send_realtime_input(activity_end=types.ActivityEnd())
+        print(
+            "[mic_vad][ACTIVITY_END]",
+            f"reason={reason}",
+            f"elapsed_s={time.perf_counter() - t0:.3f}",
+            flush=True,
+        )
 
-            if stop_event is not None and stop_event.is_set():
-                print(
-                    "[mic_send][CUT_IN_STOP_BEFORE_SEND]",
-                    f"i={i}",
-                    f"elapsed_s={time.perf_counter() - t0:.3f}",
-                    flush=True,
-                )
-                break
+    # VAD OFF（固定長）でも AAD disabled のため、先頭で activity_start が必要。
+    if send_activity_signals and not mic_vad_end_enabled:
+        await _emit_activity_start(0)
 
-            mic_gate_state = (
-                str(mic_gate_ref.get("value", "open")).strip().lower()
-                if mic_gate_ref is not None
-                else "open"
-            )
-
-            if mic_gate_state == "mute":
-                if i == 0:
+    try:
+        with sd.InputStream(
+            samplerate=int(input_sr),
+            channels=1,
+            dtype="float32",
+            blocksize=block_samples,
+            callback=callback,
+            device=input_device,
+        ):
+            for i in range(total_blocks):
+                if stop_event is not None and stop_event.is_set():
                     print(
-                        "[battle_mic_gate][MUTED]",
+                        "[mic_send][CUT_IN_STOP]",
                         f"i={i}",
+                        f"elapsed_s={time.perf_counter() - t0:.3f}",
                         flush=True,
                     )
-                continue
+                    break
 
-            await session.send_realtime_input(
-                audio=types.Blob(
-                    data=chunk,
-                    mime_type=f"audio/pcm;rate={int(input_sr)}",
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    print(
+                        f"[session_loop][WARN] mic chunk timeout "
+                        f"i={i} total_blocks={total_blocks}; stop sending mic audio",
+                        flush=True,
+                    )
+                    break
+
+                if stop_event is not None and stop_event.is_set():
+                    print(
+                        "[mic_send][CUT_IN_STOP_BEFORE_SEND]",
+                        f"i={i}",
+                        f"elapsed_s={time.perf_counter() - t0:.3f}",
+                        flush=True,
+                    )
+                    break
+
+                # --- client RMS VAD（発話開始 / 無音終了）---
+                if mic_vad_end_enabled:
+                    samples = np.frombuffer(chunk, dtype=np.int16)
+                    if samples.size > 0:
+                        rms = float(
+                            np.sqrt(
+                                np.mean(
+                                    (samples.astype(np.float32) / 32768.0) ** 2
+                                )
+                            )
+                        )
+                    else:
+                        rms = 0.0
+
+                    if not has_spoken:
+                        if rms >= vad_start_threshold:
+                            voice_blocks += 1
+                            if voice_blocks >= min_voice_blocks:
+                                has_spoken = True
+                                silence_blocks = 0
+                                if mic_vad_debug:
+                                    print(
+                                        "[mic_vad][VOICE_START]",
+                                        f"i={i}",
+                                        f"rms={rms:.5f}",
+                                        f"start_threshold={vad_start_threshold:.5f}",
+                                        flush=True,
+                                    )
+                                await _emit_activity_start(i)
+                        else:
+                            voice_blocks = 0
+                    else:
+                        if rms >= vad_end_threshold:
+                            if mic_vad_debug and silence_blocks > 0:
+                                print(
+                                    "[mic_vad][SILENCE_RESET]",
+                                    f"i={i}",
+                                    f"rms={rms:.5f}",
+                                    f"silence_blocks={silence_blocks}/{silence_blocks_limit}",
+                                    flush=True,
+                                )
+                            silence_blocks = 0
+                        else:
+                            silence_blocks += 1
+                            if mic_vad_debug and (
+                                silence_blocks == 1
+                                or silence_blocks % 5 == 0
+                                or silence_blocks >= silence_blocks_limit
+                            ):
+                                print(
+                                    "[mic_vad][SILENCE]",
+                                    f"i={i}",
+                                    f"rms={rms:.5f}",
+                                    f"silence_blocks={silence_blocks}/{silence_blocks_limit}",
+                                    f"min_listen_ok={i >= min_listen_blocks}",
+                                    flush=True,
+                                )
+
+                        if (
+                            i >= min_listen_blocks
+                            and silence_blocks >= silence_blocks_limit
+                        ):
+                            vad_ended = True
+                            if mic_vad_debug:
+                                print(
+                                    "[mic_vad][END]",
+                                    f"i={i}",
+                                    f"rms={rms:.5f}",
+                                    flush=True,
+                                )
+                            # 終端チャンクは送らず、activity_end でターン完結
+                            break
+
+                mic_gate_state = (
+                    str(mic_gate_ref.get("value", "open")).strip().lower()
+                    if mic_gate_ref is not None
+                    else "open"
                 )
-            )
-            sent_bytes += len(chunk)
 
-            print(
-                "[mic_send][CHUNK]",
-                f"i={i}",
-                f"bytes={len(chunk)}",
-                f"elapsed_s={time.perf_counter() - t0:.3f}",
-                flush=True,
-            )
+                if mic_gate_state == "mute":
+                    if i == 0:
+                        print(
+                            "[battle_mic_gate][MUTED]",
+                            f"i={i}",
+                            flush=True,
+                        )
+                    continue
+
+                # VAD ON で未発話の間は PCM を送らない（activity_start 前の先行送信を防ぐ）
+                if mic_vad_end_enabled and not has_spoken:
+                    continue
+
+                await session.send_realtime_input(
+                    audio=types.Blob(
+                        data=chunk,
+                        mime_type=f"audio/pcm;rate={int(input_sr)}",
+                    )
+                )
+                sent_bytes += len(chunk)
+
+                print(
+                    "[mic_send][CHUNK]",
+                    f"i={i}",
+                    f"bytes={len(chunk)}",
+                    f"elapsed_s={time.perf_counter() - t0:.3f}",
+                    flush=True,
+                )
+    finally:
+        if stop_event is not None and stop_event.is_set():
+            end_reason = "cut_in"
+        elif vad_ended:
+            end_reason = "vad_silence"
+        elif mic_vad_end_enabled and not has_spoken:
+            end_reason = "no_speech"
+        else:
+            end_reason = "max_duration"
+        await _emit_activity_end(end_reason)
 
     print(
         "[mic_send][DONE]",
         f"sent_bytes={sent_bytes}",
         f"elapsed_s={time.perf_counter() - t0:.3f}",
+        f"activity_started={activity_started}",
+        f"has_spoken={has_spoken}",
         flush=True,
     )
 
@@ -1902,6 +2096,692 @@ def _start_battle_interrupt_queue_file_thread(
     return th
 
 
+_PIPELINE_MAX_INFLIGHT = 6
+_AUDIO_PLAYBACK_EPOCH_GAP = -1
+
+
+@dataclass
+class _AudioPipelineJob:
+    ctx_id: str | None
+    playback_chunk_idx: int
+    playback_epoch: int
+    audio: bytes
+    playback_audio: bytes
+    pcm_stream_chunks_dir: Path
+    audio_response_pcm: Path
+    mouth_streamer: MouthStreamerOC
+    mouth_streamer_json: Path
+    mouth_raw_json: Path
+    mouth_json: Path
+    knn_script: Path
+    gt_glob: str
+    step_ms: int
+    knn_inmemory: bool
+    m0_inmemory: bool
+    mouth_obj_ref: dict[str, Any] | None
+    fast_inmemory: bool
+    skip_archive_pcm: bool
+
+
+@dataclass
+class _PipelineEnqueueItem:
+    pipeline_seq: int
+    job: _AudioPipelineJob
+    effective_playback: bytes
+    enqueue_blocked: bool
+    enqueue_timeline_end_ms: int
+    emitted: int
+    knn_ms: float
+    m0_ms: float
+    m0_chunks: int
+    hang_used: bool
+    png_verified: bool
+    frames_n: int
+    m0_last_cid: int
+    m0_last_global: int
+    t_pipeline0: float
+    stage_knn_done_ms: float
+    stage_m0_done_ms: float
+
+
+def _pipeline_inflight_inc(turn_state: dict[str, Any]) -> int:
+    n = int(turn_state.get("pipeline_inflight", 0)) + 1
+    turn_state["pipeline_inflight"] = n
+    return n
+
+
+def _pipeline_inflight_dec(turn_state: dict[str, Any]) -> int:
+    n = max(0, int(turn_state.get("pipeline_inflight", 0)) - 1)
+    turn_state["pipeline_inflight"] = n
+    return n
+
+
+def _ensure_pipeline_enqueue_order(turn_state: dict[str, Any]) -> dict[str, Any]:
+    order = turn_state.get("pipeline_enqueue_order")
+    if order is None:
+        order = {
+            "expected_push_seq": 0,
+            "expected_seq": 0,
+            "lock": asyncio.Lock(),
+        }
+        turn_state["pipeline_enqueue_order"] = order
+    else:
+        order.setdefault("expected_push_seq", 0)
+        order.setdefault("expected_seq", 0)
+        order.setdefault("lock", asyncio.Lock())
+    return order
+
+
+async def _await_pipeline_push_turn(
+    turn_state: dict[str, Any],
+    pipeline_seq: int,
+) -> None:
+    order = _ensure_pipeline_enqueue_order(turn_state)
+    while int(order["expected_push_seq"]) != int(pipeline_seq):
+        await asyncio.sleep(0.01)
+
+
+async def _advance_pipeline_push_turn(
+    turn_state: dict[str, Any],
+    pipeline_seq: int,
+) -> None:
+    order = _ensure_pipeline_enqueue_order(turn_state)
+    async with order["lock"]:
+        if int(order["expected_push_seq"]) == int(pipeline_seq):
+            order["expected_push_seq"] = int(pipeline_seq) + 1
+
+
+def _ensure_pipeline_audio_file(
+    *,
+    job: _AudioPipelineJob,
+    pipeline_io_ref: dict[str, Any],
+) -> Any | None:
+    if bool(job.skip_archive_pcm):
+        return None
+
+    if job.ctx_id != pipeline_io_ref.get("ctx_id"):
+        audio_f = pipeline_io_ref.get("audio_f")
+        if audio_f is not None:
+            try:
+                audio_f.close()
+            except Exception:
+                pass
+            pipeline_io_ref["audio_f"] = None
+
+        pipeline_io_ref["ctx_id"] = job.ctx_id
+        job.pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
+        job.audio_response_pcm.parent.mkdir(parents=True, exist_ok=True)
+        pipeline_io_ref["audio_f"] = job.audio_response_pcm.open("ab")
+
+    audio_f = pipeline_io_ref.get("audio_f")
+    if audio_f is None and not bool(job.skip_archive_pcm):
+        job.audio_response_pcm.parent.mkdir(parents=True, exist_ok=True)
+        pipeline_io_ref["audio_f"] = job.audio_response_pcm.open("ab")
+        audio_f = pipeline_io_ref["audio_f"]
+
+    return audio_f
+
+
+def _process_audio_chunk_knn_sync(
+    *,
+    raw_obj: dict[str, Any],
+    job: _AudioPipelineJob,
+    turn_state: dict[str, Any],
+) -> int:
+    if not bool(job.knn_inmemory):
+        job.mouth_raw_json.write_text(
+            json.dumps(raw_obj, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    if not turn_state.get("first_mouth_json_logged", False):
+        active_turn = turn_state.get("active_turn")
+        if active_turn is not None and turn_state.get("turn_start_perf") is not None:
+            dt = time.perf_counter() - float(turn_state["turn_start_perf"])
+            print(
+                "[perf][session_first_stream_mouth_json_written_from_turn_start_sec] "
+                f"{dt:.3f}",
+                flush=True,
+            )
+        turn_state["first_mouth_json_logged"] = True
+
+    frames_n = 0
+    if bool(job.knn_inmemory):
+        # Phase 5b path reserved; Phase 2 default is disk KNN.
+        if job.mouth_obj_ref is None:
+            raise RuntimeError("knn_inmemory requires mouth_obj_ref")
+        _run_knn_in_process(
+            knn_script=job.knn_script,
+            raw_json=job.mouth_raw_json,
+            out_json=job.mouth_json,
+            gt_glob=job.gt_glob,
+            step_ms=job.step_ms,
+        )
+        mouth_obj = json.loads(job.mouth_json.read_text(encoding="utf-8"))
+        job.mouth_obj_ref["obj"] = mouth_obj
+        frames_n = len(mouth_obj.get("frames") or mouth_obj.get("timeline") or [])
+    else:
+        _run_knn_in_process(
+            knn_script=job.knn_script,
+            raw_json=job.mouth_raw_json,
+            out_json=job.mouth_json,
+            gt_glob=job.gt_glob,
+            step_ms=job.step_ms,
+        )
+        try:
+            mouth_obj = json.loads(job.mouth_json.read_text(encoding="utf-8"))
+            frames_n = len(mouth_obj.get("frames") or mouth_obj.get("timeline") or [])
+        except Exception:
+            frames_n = 0
+
+        if job.mouth_obj_ref is not None:
+            try:
+                job.mouth_obj_ref["obj"] = json.loads(
+                    job.mouth_json.read_text(encoding="utf-8")
+                )
+            except Exception:
+                pass
+
+    return int(frames_n)
+
+
+def _process_audio_chunk_push_knn_sync(
+    *,
+    job: _AudioPipelineJob,
+    turn_state: dict[str, Any],
+    pipeline_io_ref: dict[str, Any],
+) -> dict[str, Any]:
+    t_knn0 = time.perf_counter()
+    frames_n = 0
+    emitted = 0
+    knn_ms = 0.0
+    effective_playback = job.playback_audio
+    enqueue_timeline_end_ms = 0
+
+    io_lock = pipeline_io_ref.get("file_io_lock")
+    if io_lock is not None:
+        with io_lock:
+            audio_f = _ensure_pipeline_audio_file(job=job, pipeline_io_ref=pipeline_io_ref)
+            if audio_f is not None and not bool(job.skip_archive_pcm):
+                audio_f.write(job.audio)
+                audio_f.flush()
+            if effective_playback and not bool(job.skip_archive_pcm):
+                chunk_path = (
+                    job.pcm_stream_chunks_dir
+                    / f"chunk_{job.playback_chunk_idx:06d}.pcm"
+                )
+                chunk_path.write_bytes(effective_playback)
+    else:
+        audio_f = _ensure_pipeline_audio_file(job=job, pipeline_io_ref=pipeline_io_ref)
+        if audio_f is not None and not bool(job.skip_archive_pcm):
+            audio_f.write(job.audio)
+            audio_f.flush()
+        if effective_playback and not bool(job.skip_archive_pcm):
+            chunk_path = (
+                job.pcm_stream_chunks_dir
+                / f"chunk_{job.playback_chunk_idx:06d}.pcm"
+            )
+            chunk_path.write_bytes(effective_playback)
+
+    emitted = job.mouth_streamer.push_pcm16_mono(job.audio, input_sr=24000)
+    if not bool(job.fast_inmemory):
+        job.mouth_streamer.flush()
+
+    if int(emitted) > 0:
+        if bool(job.fast_inmemory):
+            raw_obj = _project_streamer_to_raw(job.mouth_streamer_json)
+        else:
+            raw_obj = _project_streamer_to_raw(job.mouth_streamer_json)
+
+        frames_n = _process_audio_chunk_knn_sync(
+            raw_obj=raw_obj,
+            job=job,
+            turn_state=turn_state,
+        )
+        knn_ms = (time.perf_counter() - t_knn0) * 1000.0
+
+        mouth_updated_event = turn_state.get("mouth_updated_event")
+        if mouth_updated_event is not None:
+            try:
+                mouth_updated_event.set()
+            except Exception:
+                pass
+        mouth_frames_async_event = turn_state.get("mouth_frames_async_event")
+        if mouth_frames_async_event is not None:
+            try:
+                mouth_frames_async_event.set()
+            except Exception:
+                pass
+
+    playback_ref = turn_state.get("audio_playback_state_ref")
+    if effective_playback:
+        enqueue_timeline_end_ms = int(
+            _m0_pipeline_enqueue_timeline_end_ms(playback_ref, effective_playback)
+        )
+
+    print(
+        "[sync][pipeline_chunk][knn_done]",
+        f"chunk_idx={int(job.playback_chunk_idx)}",
+        f"emitted={int(emitted)}",
+        f"knn_ms={knn_ms:.1f}",
+        f"frames_n={int(frames_n)}",
+        flush=True,
+    )
+
+    return {
+        "emitted": int(emitted),
+        "frames_n": int(frames_n),
+        "knn_ms": float(knn_ms),
+        "effective_playback": effective_playback,
+        "enqueue_timeline_end_ms": int(enqueue_timeline_end_ms),
+    }
+
+
+def _process_audio_chunk_m0_sync(
+    *,
+    job: _AudioPipelineJob,
+    turn_state: dict[str, Any],
+    m0_pipeline_ref: dict[str, Any],
+    effective_playback: bytes,
+    m0_max_chunks: int = 8,
+    until_t1_ms: int | None = None,
+) -> dict[str, Any]:
+    playback_ref = turn_state.get("audio_playback_state_ref")
+    enqueue_timeline_end_ms = int(until_t1_ms or 0)
+    if effective_playback and enqueue_timeline_end_ms <= 0:
+        enqueue_timeline_end_ms = int(
+            _m0_pipeline_enqueue_timeline_end_ms(playback_ref, effective_playback)
+        )
+
+    m0_result = _m0_pipeline_advance_sync(
+        m0_pipeline_ref=m0_pipeline_ref,
+        mouth_obj_ref=job.mouth_obj_ref,
+        audio_playback_state_ref=playback_ref,
+        live_emo_id_getter=turn_state.get("live_emo_id_getter"),
+        live_emo_events_getter=turn_state.get("live_emo_events_getter"),
+        hang_timeout_ms=int(_M0_PIPELINE_HANG_TIMEOUT_MS),
+        max_chunks=int(m0_max_chunks),
+        until_t1_ms=int(enqueue_timeline_end_ms) if enqueue_timeline_end_ms > 0 else None,
+    )
+
+    m0_chunks_rendered = int(m0_result.get("chunks_rendered", 0))
+    png_verified = bool(m0_result.get("png_verified", True))
+    rendered_end = _m0_pipeline_rendered_end_ms(m0_pipeline_ref, playback_ref)
+    covered = int(rendered_end) >= int(enqueue_timeline_end_ms) if enqueue_timeline_end_ms > 0 else True
+    enqueue_blocked = bool(effective_playback and (not png_verified or not covered))
+
+    return {
+        "m0_ms": float(m0_result.get("m0_ms_total", 0.0)),
+        "hang_used": bool(m0_result.get("hang_used", False)),
+        "m0_chunks": int(m0_chunks_rendered),
+        "m0_last_cid": int(m0_result.get("last_cid", -1)),
+        "m0_last_global": int(m0_result.get("last_global_frame1", -1)),
+        "png_verified": bool(png_verified),
+        "enqueue_blocked": bool(enqueue_blocked),
+        "enqueue_timeline_end_ms": int(enqueue_timeline_end_ms),
+        "covered": bool(covered),
+        "rendered_end_ms": int(rendered_end),
+    }
+
+
+def _enqueue_playback_audio_sync(
+    *,
+    job: _AudioPipelineJob,
+    turn_state: dict[str, Any],
+    effective_playback: bytes,
+) -> None:
+    if not effective_playback:
+        return
+
+    audio_player_proc = turn_state.get("audio_player_proc")
+    audio_device = turn_state.get("ai_audio_output_device")
+    if audio_player_proc is None or audio_device is None:
+        return
+
+    playback_ref = turn_state.get("audio_playback_state_ref")
+    chunk_path = job.pcm_stream_chunks_dir / f"chunk_{job.playback_chunk_idx:06d}.pcm"
+    if not chunk_path.exists():
+        chunk_path.write_bytes(effective_playback)
+
+    _send_audio_chunk(
+        audio_player_proc=audio_player_proc,
+        pcm=chunk_path,
+        chunk_id=int(job.playback_chunk_idx),
+        audio_device=str(audio_device),
+        single_chunk=True,
+        audio_playback_state_ref=playback_ref,
+    )
+
+    print(
+        "[sync][pipeline_chunk][enqueue_done]",
+        f"chunk_idx={int(job.playback_chunk_idx)}",
+        f"bytes={len(effective_playback)}",
+        f"delivered_epoch_ms={time.time() * 1000.0:.1f}",
+        flush=True,
+    )
+
+
+def _log_pipeline_chunk_result(
+    *,
+    job: _AudioPipelineJob,
+    pipeline_seq: int,
+    emitted: int,
+    knn_ms: float,
+    m0_ms: float,
+    m0_chunks: int,
+    enqueue_ms: float,
+    total_ms: float,
+    hang_used: bool,
+    png_verified: bool,
+    frames_n: int,
+    enqueue_timeline_end_ms: int,
+    m0_last_cid: int,
+    m0_last_global: int,
+    turn_state: dict[str, Any],
+    queue_wait_ms: float = 0.0,
+    stage_knn_done_ms: float = 0.0,
+    stage_m0_done_ms: float = 0.0,
+) -> None:
+    print(
+        "[sync][pipeline_chunk]",
+        f"pipeline_seq={int(pipeline_seq)}",
+        f"chunk_idx={int(job.playback_chunk_idx)}",
+        f"emitted={int(emitted)}",
+        f"knn_ms={knn_ms:.1f}",
+        f"m0_ms={m0_ms:.1f}",
+        f"m0_chunks={int(m0_chunks)}",
+        f"enqueue_ms={enqueue_ms:.1f}",
+        f"queue_wait_ms={queue_wait_ms:.1f}",
+        f"total_ms={total_ms:.1f}",
+        f"stage_knn_done_ms={stage_knn_done_ms:.1f}",
+        f"stage_m0_done_ms={stage_m0_done_ms:.1f}",
+        f"hang_used={bool(hang_used)}",
+        f"png_verified={bool(png_verified)}",
+        f"mouth_frames_n={int(frames_n)}",
+        f"enqueue_timeline_end_ms={int(enqueue_timeline_end_ms)}",
+        f"m0_last_cid={int(m0_last_cid)}",
+        f"m0_last_global_frame1={int(m0_last_global)}",
+        flush=True,
+    )
+
+
+async def _process_pipeline_chunk_task(
+    *,
+    job: _AudioPipelineJob,
+    pipeline_seq: int,
+    m0_pipeline_ref: dict[str, Any] | None,
+    enqueue_queue: asyncio.Queue,
+    turn_state: dict[str, Any],
+    pipeline_io_ref: dict[str, Any],
+    inflight_sem: asyncio.Semaphore,
+    stop_event: asyncio.Event,
+) -> None:
+    """図A: チャンク内は KNN → M0完了 → enqueue 一本道。チャンク間は並列開始可。"""
+    await inflight_sem.acquire()
+    _pipeline_inflight_inc(turn_state)
+    try:
+        t_pipeline0 = time.perf_counter()
+        print(
+            "[sync][pipeline_chunk][start]",
+            f"pipeline_seq={int(pipeline_seq)}",
+            f"chunk_idx={int(job.playback_chunk_idx)}",
+            flush=True,
+        )
+
+        await _await_pipeline_push_turn(turn_state, int(pipeline_seq))
+        try:
+            push_knn_result = await asyncio.to_thread(
+                _process_audio_chunk_push_knn_sync,
+                job=job,
+                turn_state=turn_state,
+                pipeline_io_ref=pipeline_io_ref,
+            )
+        finally:
+            await _advance_pipeline_push_turn(turn_state, int(pipeline_seq))
+
+        stage_knn_done_ms = (time.perf_counter() - t_pipeline0) * 1000.0
+        emitted = int(push_knn_result.get("emitted", 0))
+        frames_n = int(push_knn_result.get("frames_n", 0))
+        knn_ms = float(push_knn_result.get("knn_ms", 0.0))
+        effective_playback = push_knn_result.get("effective_playback") or b""
+        enqueue_timeline_end_ms = int(push_knn_result.get("enqueue_timeline_end_ms", 0))
+
+        m0_ms = 0.0
+        hang_used = False
+        m0_chunks = 0
+        m0_last_cid = -1
+        m0_last_global = -1
+        png_verified = True
+        enqueue_blocked = False
+        stage_m0_done_ms = stage_knn_done_ms
+
+        if (
+            effective_playback
+            and m0_pipeline_ref is not None
+            and job.mouth_obj_ref is not None
+        ):
+            t_m0 = time.perf_counter()
+            covered = False
+            while not stop_event.is_set():
+                m0_result = await asyncio.to_thread(
+                    _process_audio_chunk_m0_sync,
+                    job=job,
+                    turn_state=turn_state,
+                    m0_pipeline_ref=m0_pipeline_ref,
+                    effective_playback=effective_playback,
+                    m0_max_chunks=8,
+                    until_t1_ms=int(enqueue_timeline_end_ms),
+                )
+                m0_ms = (time.perf_counter() - t_m0) * 1000.0
+                hang_used = hang_used or bool(m0_result.get("hang_used", False))
+                m0_chunks += int(m0_result.get("m0_chunks", 0))
+                m0_last_cid = int(m0_result.get("m0_last_cid", -1))
+                m0_last_global = int(m0_result.get("m0_last_global", -1))
+                png_verified = bool(m0_result.get("png_verified", True))
+                covered = bool(m0_result.get("covered", False))
+                enqueue_blocked = bool(m0_result.get("enqueue_blocked", False))
+
+                if covered and png_verified:
+                    enqueue_blocked = False
+                    print(
+                        "[sync][pipeline_chunk][m0_done]",
+                        f"chunk_idx={int(job.playback_chunk_idx)}",
+                        f"m0_ms={m0_ms:.1f}",
+                        f"m0_chunks={int(m0_chunks)}",
+                        f"png_verified={bool(png_verified)}",
+                        flush=True,
+                    )
+                    break
+
+                if hang_used and not covered:
+                    enqueue_blocked = True
+                    print(
+                        "[sync][pipeline_chunk][m0_hang_uncovered]",
+                        f"chunk_idx={int(job.playback_chunk_idx)}",
+                        f"until_t1_ms={int(enqueue_timeline_end_ms)}",
+                        flush=True,
+                    )
+                    break
+
+                ev = turn_state.get("mouth_frames_async_event")
+                if isinstance(ev, asyncio.Event):
+                    ev.clear()
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(0.02)
+            stage_m0_done_ms = (time.perf_counter() - t_pipeline0) * 1000.0
+        elif effective_playback and m0_pipeline_ref is None:
+            enqueue_blocked = True
+            png_verified = False
+
+        turn_state["pipeline_continuous_errors"] = 0
+        item = _PipelineEnqueueItem(
+            pipeline_seq=int(pipeline_seq),
+            job=job,
+            effective_playback=effective_playback,
+            enqueue_blocked=bool(enqueue_blocked),
+            enqueue_timeline_end_ms=int(enqueue_timeline_end_ms),
+            emitted=int(emitted),
+            knn_ms=float(knn_ms),
+            m0_ms=float(m0_ms),
+            m0_chunks=int(m0_chunks),
+            hang_used=bool(hang_used),
+            png_verified=bool(png_verified),
+            frames_n=int(frames_n),
+            m0_last_cid=int(m0_last_cid),
+            m0_last_global=int(m0_last_global),
+            t_pipeline0=float(t_pipeline0),
+            stage_knn_done_ms=float(stage_knn_done_ms),
+            stage_m0_done_ms=float(stage_m0_done_ms),
+        )
+        enqueue_queue.put_nowait(item)
+    except BaseException as e:
+        err_cnt = int(turn_state.get("pipeline_continuous_errors", 0)) + 1
+        turn_state["pipeline_continuous_errors"] = err_cnt
+        print(
+            "[sync][pipeline_worker][ERROR]",
+            f"type={type(e).__name__}",
+            f"detail={e}",
+            f"pipeline_seq={int(pipeline_seq)}",
+            f"continuous_errors={err_cnt}",
+            flush=True,
+        )
+        order = turn_state.get("pipeline_enqueue_order")
+        if isinstance(order, dict):
+            try:
+                if int(order.get("expected_push_seq", 0)) == int(pipeline_seq):
+                    await _advance_pipeline_push_turn(turn_state, int(pipeline_seq))
+            except BaseException:
+                pass
+        enqueue_queue.put_nowait(
+            _PipelineEnqueueItem(
+                pipeline_seq=int(pipeline_seq),
+                job=job,
+                effective_playback=b"",
+                enqueue_blocked=True,
+                enqueue_timeline_end_ms=0,
+                emitted=0,
+                knn_ms=0.0,
+                m0_ms=0.0,
+                m0_chunks=0,
+                hang_used=False,
+                png_verified=False,
+                frames_n=0,
+                m0_last_cid=-1,
+                m0_last_global=-1,
+                t_pipeline0=time.perf_counter(),
+                stage_knn_done_ms=0.0,
+                stage_m0_done_ms=0.0,
+            )
+        )
+    finally:
+        _pipeline_inflight_dec(turn_state)
+        inflight_sem.release()
+
+
+async def _pipeline_enqueue_dispatcher_loop(
+    *,
+    enqueue_queue: asyncio.Queue,
+    stop_event: asyncio.Event,
+    turn_state: dict[str, Any],
+) -> None:
+    """pipeline_seq / chunk_idx 到着順で player enqueue。"""
+    while not stop_event.is_set():
+        try:
+            item = await asyncio.wait_for(enqueue_queue.get(), timeout=0.05)
+        except asyncio.TimeoutError:
+            continue
+
+        if item is None:
+            enqueue_queue.task_done()
+            break
+
+        order = _ensure_pipeline_enqueue_order(turn_state)
+        t_wait0 = time.perf_counter()
+        while int(order["expected_seq"]) != int(item.pipeline_seq):
+            await asyncio.sleep(0.01)
+        wait_ms = (time.perf_counter() - t_wait0) * 1000.0
+
+        if wait_ms >= 1.0:
+            print(
+                "[sync][enqueue_order]",
+                f"pipeline_seq={int(item.pipeline_seq)}",
+                f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                f"wait_ms={wait_ms:.1f}",
+                flush=True,
+            )
+
+        t_enqueue0 = time.perf_counter()
+        try:
+            if item.effective_playback and not item.enqueue_blocked:
+                # Final guard: corresponding M0 PNG must exist at enqueue time.
+                m0_ref = turn_state.get("m0_pipeline_ref")
+                playback_ref = turn_state.get("audio_playback_state_ref")
+                if m0_ref is not None:
+                    rendered_end = _m0_pipeline_rendered_end_ms(m0_ref, playback_ref)
+                    if int(rendered_end) < int(item.enqueue_timeline_end_ms):
+                        print(
+                            "[sync][pipeline_chunk][AUDIO_BEFORE_M0]",
+                            f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                            f"rendered_end_ms={int(rendered_end)}",
+                            f"until_t1_ms={int(item.enqueue_timeline_end_ms)}",
+                            flush=True,
+                        )
+                        item.enqueue_blocked = True
+                        item.png_verified = False
+
+                if not item.enqueue_blocked:
+                    await asyncio.to_thread(
+                        _enqueue_playback_audio_sync,
+                        job=item.job,
+                        turn_state=turn_state,
+                        effective_playback=item.effective_playback,
+                    )
+            elif item.effective_playback and item.enqueue_blocked:
+                print(
+                    "[sync][pipeline_chunk][ENQUEUE_BLOCKED]",
+                    f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                    f"pipeline_seq={int(item.pipeline_seq)}",
+                    f"reason=m0_png_missing",
+                    f"enqueue_timeline_end_ms={int(item.enqueue_timeline_end_ms)}",
+                    flush=True,
+                )
+        finally:
+            async with order["lock"]:
+                if int(order["expected_seq"]) == int(item.pipeline_seq):
+                    order["expected_seq"] = int(item.pipeline_seq) + 1
+            enqueue_ms = (time.perf_counter() - t_enqueue0) * 1000.0
+            total_ms = (time.perf_counter() - item.t_pipeline0) * 1000.0
+            queue_wait_ms = max(
+                0.0,
+                total_ms - float(item.knn_ms) - float(item.m0_ms) - enqueue_ms,
+            )
+            _log_pipeline_chunk_result(
+                job=item.job,
+                pipeline_seq=int(item.pipeline_seq),
+                emitted=int(item.emitted),
+                knn_ms=float(item.knn_ms),
+                m0_ms=float(item.m0_ms),
+                m0_chunks=int(item.m0_chunks),
+                enqueue_ms=float(enqueue_ms),
+                total_ms=float(total_ms),
+                hang_used=bool(item.hang_used),
+                png_verified=bool(item.png_verified),
+                frames_n=int(item.frames_n),
+                enqueue_timeline_end_ms=int(item.enqueue_timeline_end_ms),
+                m0_last_cid=int(item.m0_last_cid),
+                m0_last_global=int(item.m0_last_global),
+                turn_state=turn_state,
+                queue_wait_ms=float(queue_wait_ms),
+                stage_knn_done_ms=float(item.stage_knn_done_ms),
+                stage_m0_done_ms=float(item.stage_m0_done_ms),
+            )
+            enqueue_queue.task_done()
+
+
 async def _receive_loop(
     *,
     session: Any,
@@ -1920,6 +2800,12 @@ async def _receive_loop(
     drop_initial_audio_ms: int = 0,
     debug_receive: bool = False,
     debug_receive_raw: bool = False,
+    pipeline_sync: bool = True,
+    mouth_obj_ref: dict[str, Any] | None = None,
+    knn_inmemory: bool = False,
+    m0_inmemory: bool = False,
+    fast_inmemory: bool = False,
+    skip_archive_pcm: bool = False,
 ) -> None:
     audio_response_pcm.parent.mkdir(parents=True, exist_ok=True)
     pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
@@ -1931,7 +2817,47 @@ async def _receive_loop(
         int(round(24000 * 2 * int(drop_initial_audio_ms) / 1000.0)),
     )
 
-    with audio_response_pcm.open("ab") as audio_f:
+    pipeline_io_ref: dict[str, Any] = {
+        "ctx_id": "turn",
+        "audio_f": None,
+        "file_io_lock": Lock(),
+    }
+    pipeline_enqueue_queue: asyncio.Queue | None = None
+    pipeline_enqueue_dispatcher_task: asyncio.Task | None = None
+    pipeline_inflight_sem: asyncio.Semaphore | None = None
+    pipeline_seq = 0
+    pipeline_active_tasks: list[asyncio.Task[None]] = []
+    m0_pipeline_ref = turn_state.get("m0_pipeline_ref")
+
+    if bool(pipeline_sync):
+        turn_state["pipeline_inflight"] = 0
+        turn_state["mouth_updated_event"] = mouth_updated_event
+        turn_state["mouth_frames_async_event"] = asyncio.Event()
+        _ensure_pipeline_enqueue_order(turn_state)
+        pipeline_enqueue_queue = asyncio.Queue()
+        turn_state["pipeline_enqueue_queue_ref"] = pipeline_enqueue_queue
+        pipeline_inflight_sem = asyncio.Semaphore(_PIPELINE_MAX_INFLIGHT)
+        pipeline_enqueue_dispatcher_task = asyncio.create_task(
+            _pipeline_enqueue_dispatcher_loop(
+                enqueue_queue=pipeline_enqueue_queue,
+                stop_event=stop_event,
+                turn_state=turn_state,
+            ),
+            name="pipeline_enqueue_dispatcher",
+        )
+        print(
+            "[sync][pipeline][ENABLED]",
+            f"m0_hang_timeout_ms={int(_M0_PIPELINE_HANG_TIMEOUT_MS)}",
+            f"fast_inmemory={bool(fast_inmemory)}",
+            flush=True,
+        )
+
+    audio_f_legacy = None
+    try:
+        audio_f_legacy = audio_response_pcm.open("ab")
+        if bool(pipeline_sync):
+            pipeline_io_ref["audio_f"] = audio_f_legacy
+
         while not stop_event.is_set():
             got_any = False
 
@@ -1944,7 +2870,6 @@ async def _receive_loop(
 
                     if debug_receive_raw:
                         raw_count = int(turn_state.get("debug_receive_raw_count", 0))
-
                         if raw_count < 5:
                             print(
                                 "[debug][receive_raw]\n"
@@ -1957,19 +2882,14 @@ async def _receive_loop(
                     calls = _extract_tool_calls(msg)
 
                     text_value = None
-
                     try:
                         server_content = getattr(msg, "server_content", None)
-
                         if server_content is not None:
                             model_turn = getattr(server_content, "model_turn", None)
-
                             if model_turn is not None:
                                 parts = getattr(model_turn, "parts", None) or []
-
                                 for p in parts:
                                     t = getattr(p, "text", None)
-
                                     if t:
                                         text_value = str(t)
                                         break
@@ -1980,19 +2900,18 @@ async def _receive_loop(
                         print(f"[debug][text_chunk] {text_value[:120]}", flush=True)
 
                     transcription_text = None
-
                     try:
                         server_content = getattr(msg, "server_content", None)
-
                         if server_content is not None:
                             output_transcription = getattr(
                                 server_content,
                                 "output_transcription",
                                 None,
                             )
-
                             if output_transcription is not None:
-                                transcription_text = getattr(output_transcription, "text", None)
+                                transcription_text = getattr(
+                                    output_transcription, "text", None
+                                )
                     except Exception:
                         pass
 
@@ -2002,8 +2921,6 @@ async def _receive_loop(
                             flush=True,
                         )
 
-                        # output_transcription は分割で届くことがあるため、
-                        # turn内で累積して複数 [emo:ID] を検出する。
                         accum = str(turn_state.get("transcription_accum") or "")
                         accum += str(transcription_text)
                         turn_state["transcription_accum"] = accum
@@ -2012,11 +2929,9 @@ async def _receive_loop(
                         emo_ids = _extract_emo_ids_from_transcription(accum)
 
                         new_emo_ids: list[str] = []
-
                         for live_emo_id in emo_ids:
                             if live_emo_id in seen_tags:
                                 continue
-
                             seen_tags.append(live_emo_id)
                             new_emo_ids.append(live_emo_id)
 
@@ -2032,11 +2947,7 @@ async def _receive_loop(
                                 )
                             )
 
-                        # 同一 transcription chunk 内に複数 [emo:ID] が来た場合、
-                        # 全部同じ t_ms になると expression timeline 上で同時刻イベントになる。
-                        # そのため暫定的に 400ms 間隔の仮想 offset を付ける。
                         virtual_emo_interval_ms = 400
-
                         for local_i, live_emo_id in enumerate(new_emo_ids):
                             live_emo_id = _normalize_emo_id(live_emo_id)
                             turn_state["live_emo_id"] = live_emo_id
@@ -2050,7 +2961,9 @@ async def _receive_loop(
                                     "emo_id": live_emo_id,
                                     "source": "output_transcription_virtual_offset",
                                     "base_t_ms": int(base_t_ms),
-                                    "virtual_offset_ms": int(local_i * virtual_emo_interval_ms),
+                                    "virtual_offset_ms": int(
+                                        local_i * virtual_emo_interval_ms
+                                    ),
                                 }
                             )
                             turn_state["live_emo_events"] = events
@@ -2080,97 +2993,164 @@ async def _receive_loop(
 
                     if audio:
                         now = time.perf_counter()
-
                         turn_state["last_audio_perf"] = now
 
                         active_turn = turn_state.get("active_turn")
-
-                        audio_chunk_idx_log = int(turn_state.get("audio_chunk_idx_log", 0))
+                        audio_chunk_idx_log = int(
+                            turn_state.get("audio_chunk_idx_log", 0)
+                        )
 
                         sec_from_turn = None
                         if turn_state.get("turn_start_perf") is not None:
-                            sec_from_turn = (
-                                now - float(turn_state["turn_start_perf"])
-                            )
+                            sec_from_turn = now - float(turn_state["turn_start_perf"])
 
+                        sec_s = (
+                            f"{sec_from_turn:.3f}"
+                            if sec_from_turn is not None
+                            else "None"
+                        )
                         print(
-                            (
-                                "[perf][session_audio_chunk] "
-                                f"idx={audio_chunk_idx_log} "
-                                f"active_turn={active_turn} "
-                                f"sec_from_turn="
-                                f"{sec_from_turn:.3f}" if sec_from_turn is not None else "None"
-                            ),
+                            "[perf][session_audio_chunk] "
+                            f"idx={audio_chunk_idx_log} "
+                            f"active_turn={active_turn} "
+                            f"sec_from_turn={sec_s}",
                             flush=True,
                         )
 
                         turn_state["audio_chunk_idx_log"] = audio_chunk_idx_log + 1
 
-                        if active_turn is not None and turn_state.get("first_audio_sec") is None:
+                        if (
+                            active_turn is not None
+                            and turn_state.get("first_audio_sec") is None
+                        ):
                             first_audio = now - float(turn_state["turn_start_perf"])
                             turn_state["first_audio_sec"] = first_audio
                             print(
-                                f"[perf][turn{active_turn}_first_response_audio_chunk_sec] {first_audio:.3f}",
+                                f"[perf][turn{active_turn}_first_response_audio_chunk_sec] "
+                                f"{first_audio:.3f}",
                                 flush=True,
                             )
 
-                        audio_f.write(audio)
-                        audio_f.flush()
-
-                        # audio_response_pcm / mouth には full audio を使う。
-                        # audio_player 用の pcm_stream_chunks だけ、冒頭N msをdropする。
                         playback_audio = audio
-
                         if drop_initial_audio_bytes_remaining > 0:
                             if len(playback_audio) <= drop_initial_audio_bytes_remaining:
-                                drop_initial_audio_bytes_remaining -= len(playback_audio)
+                                drop_initial_audio_bytes_remaining -= len(
+                                    playback_audio
+                                )
                                 playback_audio = b""
                             else:
-                                playback_audio = playback_audio[drop_initial_audio_bytes_remaining:]
+                                playback_audio = playback_audio[
+                                    drop_initial_audio_bytes_remaining:
+                                ]
                                 drop_initial_audio_bytes_remaining = 0
 
-                        if playback_audio:
-                            chunk_path = pcm_stream_chunks_dir / f"chunk_{playback_chunk_idx:06d}.pcm"
-                            chunk_path.write_bytes(playback_audio)
-                            playback_chunk_idx += 1
-
-                        audio_chunk_idx += 1
-
-                        emitted = mouth_streamer.push_pcm16_mono(audio, input_sr=24000)
-                        mouth_streamer.flush()
-
-                        raw_obj = _project_streamer_to_raw(mouth_streamer_json)
-                        mouth_raw_json.write_text(
-                            json.dumps(raw_obj, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-
-                        if emitted > 0:
-                            if not turn_state.get("first_mouth_json_logged", False):
-                                active_turn = turn_state.get("active_turn")
-
-                                if active_turn is not None:
-                                    dt = time.perf_counter() - float(turn_state["turn_start_perf"])
-
-                                    print(
-                                        f"[perf][session_first_stream_mouth_json_written_from_turn_start_sec] {dt:.3f}",
-                                        flush=True,
+                        if (
+                            bool(pipeline_sync)
+                            and pipeline_enqueue_queue is not None
+                            and pipeline_inflight_sem is not None
+                        ):
+                            # 図A: PCM到着で非同期フォーク。KNN+M0はタスク内、enqueueはdispatcher。
+                            job = _AudioPipelineJob(
+                                ctx_id="turn",
+                                playback_chunk_idx=int(playback_chunk_idx),
+                                playback_epoch=int(
+                                    turn_state.get(
+                                        "audio_playback_accept_epoch",
+                                        _AUDIO_PLAYBACK_EPOCH_GAP,
                                     )
-
-                                    turn_state["first_mouth_json_logged"] = True
-
-                            _run_knn_in_process(
+                                ),
+                                audio=audio,
+                                playback_audio=playback_audio,
+                                pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                                audio_response_pcm=audio_response_pcm,
+                                mouth_streamer=mouth_streamer,
+                                mouth_streamer_json=mouth_streamer_json,
+                                mouth_raw_json=mouth_raw_json,
+                                mouth_json=mouth_json,
                                 knn_script=knn_script,
-                                raw_json=mouth_raw_json,
-                                out_json=mouth_json,
                                 gt_glob=gt_glob,
-                                step_ms=step_ms,
+                                step_ms=int(step_ms),
+                                knn_inmemory=bool(knn_inmemory),
+                                m0_inmemory=bool(m0_inmemory),
+                                mouth_obj_ref=mouth_obj_ref,
+                                fast_inmemory=bool(fast_inmemory),
+                                skip_archive_pcm=bool(skip_archive_pcm),
                             )
-                            mouth_updated_event.set()
+                            if playback_audio:
+                                playback_chunk_idx += 1
+                            audio_chunk_idx += 1
+                            task = asyncio.create_task(
+                                _process_pipeline_chunk_task(
+                                    job=job,
+                                    pipeline_seq=int(pipeline_seq),
+                                    m0_pipeline_ref=m0_pipeline_ref,
+                                    enqueue_queue=pipeline_enqueue_queue,
+                                    turn_state=turn_state,
+                                    pipeline_io_ref=pipeline_io_ref,
+                                    inflight_sem=pipeline_inflight_sem,
+                                    stop_event=stop_event,
+                                ),
+                                name=f"pipeline_chunk_{pipeline_seq}",
+                            )
+                            pipeline_active_tasks.append(task)
+                            pipeline_active_tasks[:] = [
+                                t for t in pipeline_active_tasks if not t.done()
+                            ]
+                            pipeline_seq += 1
+                        else:
+                            # Legacy Phase10 file-watch path (pipeline_sync=False).
+                            if audio_f_legacy is not None:
+                                audio_f_legacy.write(audio)
+                                audio_f_legacy.flush()
+
+                            if playback_audio:
+                                chunk_path = (
+                                    pcm_stream_chunks_dir
+                                    / f"chunk_{playback_chunk_idx:06d}.pcm"
+                                )
+                                chunk_path.write_bytes(playback_audio)
+                                playback_chunk_idx += 1
+
+                            audio_chunk_idx += 1
+
+                            emitted = mouth_streamer.push_pcm16_mono(
+                                audio, input_sr=24000
+                            )
+                            mouth_streamer.flush()
+
+                            raw_obj = _project_streamer_to_raw(mouth_streamer_json)
+                            mouth_raw_json.write_text(
+                                json.dumps(raw_obj, ensure_ascii=False, indent=2),
+                                encoding="utf-8",
+                            )
+
+                            if emitted > 0:
+                                if not turn_state.get(
+                                    "first_mouth_json_logged", False
+                                ):
+                                    active_turn = turn_state.get("active_turn")
+                                    if active_turn is not None:
+                                        dt = time.perf_counter() - float(
+                                            turn_state["turn_start_perf"]
+                                        )
+                                        print(
+                                            "[perf][session_first_stream_mouth_json_written_from_turn_start_sec] "
+                                            f"{dt:.3f}",
+                                            flush=True,
+                                        )
+                                        turn_state["first_mouth_json_logged"] = True
+
+                                _run_knn_in_process(
+                                    knn_script=knn_script,
+                                    raw_json=mouth_raw_json,
+                                    out_json=mouth_json,
+                                    gt_glob=gt_glob,
+                                    step_ms=step_ms,
+                                )
+                                mouth_updated_event.set()
 
                     for call in calls:
                         print(f"[tool_call] {call}", flush=True)
-
                         try:
                             await _send_tool_response_for_call(
                                 session=session,
@@ -2191,7 +3171,6 @@ async def _receive_loop(
                     f"detail={e}",
                     flush=True,
                 )
-
                 traceback.print_exc()
 
             print(
@@ -2203,11 +3182,57 @@ async def _receive_loop(
                 flush=True,
             )
 
-            print("[session_loop][receive_loop] receive() ended; restart", flush=True)
+            print(
+                "[session_loop][receive_loop] receive() ended; restart",
+                flush=True,
+            )
             await asyncio.sleep(0.05)
 
             if not got_any:
                 await asyncio.sleep(0.1)
+    finally:
+        if bool(pipeline_sync):
+            pending = [t for t in pipeline_active_tasks if not t.done()]
+            if pending:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True),
+                        timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    for t in pending:
+                        t.cancel()
+
+            if pipeline_enqueue_queue is not None:
+                pipeline_enqueue_queue.put_nowait(None)
+            if pipeline_enqueue_dispatcher_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        pipeline_enqueue_dispatcher_task, timeout=10.0
+                    )
+                except asyncio.TimeoutError:
+                    pipeline_enqueue_dispatcher_task.cancel()
+
+            turn_state.pop("pipeline_enqueue_order", None)
+            turn_state.pop("pipeline_enqueue_queue_ref", None)
+            turn_state.pop("mouth_frames_async_event", None)
+
+        # Close archive PCM only after pipeline tasks + dispatcher drain.
+        try:
+            af = pipeline_io_ref.get("audio_f")
+            if af is not None:
+                af.close()
+                pipeline_io_ref["audio_f"] = None
+        except Exception:
+            pass
+        try:
+            if (
+                audio_f_legacy is not None
+                and pipeline_io_ref.get("audio_f") is not audio_f_legacy
+            ):
+                audio_f_legacy.close()
+        except Exception:
+            pass
 
 
 def _start_virtualcam(
@@ -2559,6 +3584,19 @@ async def _run(args: argparse.Namespace) -> int:
             enable_tools=not bool(args.inline_emo_tag_mode),
             output_audio_transcription=bool(args.output_audio_transcription),
         )
+        _aad = getattr(
+            getattr(config, "realtime_input_config", None),
+            "automatic_activity_detection",
+            None,
+        )
+        print(
+            "[session_loop][live_config]",
+            f"automatic_activity_detection.disabled={getattr(_aad, 'disabled', None)}",
+            f"mic_vad_end_enabled={bool(args.mic_vad_end_enabled)}",
+            f"skip_response_trigger={bool(args.skip_response_trigger)}",
+            f"drop_initial_audio_ms_forced=0",
+            flush=True,
+        )
 
         turn_state: dict[str, Any] = {}
         recv_stop = asyncio.Event()
@@ -2644,21 +3682,22 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
             try:
+                # bootstrap は短時間固定長 + activity_start/end（テキストトリガー廃止）
                 sent_bytes = await _send_mic_once(
                     session=session,
                     duration_s=float(args.mic_send_max_s),
                     input_sr=int(args.input_sr),
                     chunk_ms=int(args.step_ms),
                     device=args.mic_input_device,
+                    mic_vad_end_enabled=False,
+                    send_activity_signals=True,
                 )
 
-                trigger = str(args.bootstrap_response_trigger)
                 print(
-                    f"[session_loop][bootstrap][response_trigger] "
-                    f"attempt={attempt} text={trigger}",
+                    f"[session_loop][bootstrap][activity_end_path] "
+                    f"attempt={attempt} (no text response_trigger)",
                     flush=True,
                 )
-                await session.send_realtime_input(text=trigger)
 
                 input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / int(args.input_sr)))
                 print(
@@ -2707,14 +3746,6 @@ async def _run(args: argparse.Namespace) -> int:
                 print(
                     f"[session_loop][warmup] start {turn_no}/{n}",
                     flush=True,
-                )
-
-                sent_bytes = await _send_mic_once(
-                    session=session,
-                    duration_s=float(args.mic_send_max_s),
-                    input_sr=int(args.input_sr),
-                    chunk_ms=int(args.step_ms),
-                    device=args.mic_input_device,
                 )
 
                 turn_state.clear()
@@ -2782,12 +3813,32 @@ async def _run(args: argparse.Namespace) -> int:
                     )
                 )
 
-                trigger = str(args.warmup_response_trigger)
+                # receive 起動後に mic + activity_start/end（テキストトリガー廃止）
+                sent_bytes = await _send_mic_once(
+                    session=session,
+                    duration_s=float(args.mic_send_max_s),
+                    input_sr=int(args.input_sr),
+                    chunk_ms=int(args.step_ms),
+                    device=args.mic_input_device,
+                    mic_vad_end_enabled=bool(args.mic_vad_end_enabled),
+                    mic_vad_rms_threshold=float(args.mic_vad_rms_threshold),
+                    mic_vad_end_rms_threshold=(
+                        float(args.mic_vad_end_rms_threshold)
+                        if args.mic_vad_end_rms_threshold is not None
+                        else None
+                    ),
+                    mic_vad_min_voice_ms=int(args.mic_vad_min_voice_ms),
+                    mic_vad_silence_ms=int(args.mic_vad_silence_ms),
+                    mic_vad_min_listen_ms=int(args.mic_vad_min_listen_ms),
+                    mic_vad_debug=bool(args.mic_vad_debug),
+                    send_activity_signals=True,
+                )
+
                 print(
-                    f"[session_loop][warmup][response_trigger] turn={turn_no} text={trigger}",
+                    f"[session_loop][warmup][activity_end_path] turn={turn_no} "
+                    f"(no text response_trigger)",
                     flush=True,
                 )
-                await session.send_realtime_input(text=trigger)
 
                 input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / int(args.input_sr)))
                 print(
@@ -2948,6 +3999,32 @@ async def _run(args: argparse.Namespace) -> int:
             turn_state["live_emo_events"] = []
             turn_state["transcription_accum"] = ""
             turn_state["debug_receive_raw_count"] = 0
+            turn_state["audio_player_proc"] = audio_player_proc
+            turn_state["ai_audio_output_device"] = str(args.ai_audio_output_device)
+            turn_state["audio_playback_state_ref"] = _make_audio_playback_state_ref()
+            turn_state["fast_inmemory"] = bool(getattr(args, "fast_inmemory", False))
+            turn_state["skip_archive_pcm"] = bool(
+                getattr(args, "fast_inmemory", False)
+                and getattr(args, "skip_archive_pcm", False)
+            )
+
+            mouth_obj_ref: dict[str, Any] = {"obj": None}
+            pipeline_sync = bool(getattr(args, "pipeline_sync", True))
+            knn_inmemory = bool(getattr(args, "knn_inmemory", False))
+            m0_inmemory = bool(getattr(args, "m0_inmemory", False))
+            fast_inmemory = bool(getattr(args, "fast_inmemory", False))
+            skip_archive_pcm = bool(turn_state.get("skip_archive_pcm", False))
+
+            if bool(args.inline_emo_tag_mode):
+                turn_state["live_emo_id_getter"] = (
+                    lambda: turn_state.get("live_emo_id")
+                )
+                turn_state["live_emo_events_getter"] = (
+                    lambda: list(turn_state.get("live_emo_events") or [])
+                )
+            else:
+                turn_state.pop("live_emo_id_getter", None)
+                turn_state.pop("live_emo_events_getter", None)
 
             dev_live_emo_events = _parse_dev_live_emo_events_csv(
                 getattr(args, "dev_live_emo_events_csv", None)
@@ -2970,31 +4047,63 @@ async def _run(args: argparse.Namespace) -> int:
                     flush=True,
                 )
 
-            # --- [ADD] Phase5 Step3-5:
-            # true talk-over観測用。
-            # 通常は mic送信完了後に receiver/M0/audio watcher を起動していた。
-            # その構造だと mic送信中に immediate send しても、AI音声を受け取れない。
-            # このモードでは、mic送信前に受信系を起動する。
+            # --- Phase 1:
+            # client VAD + activity_end では、mic 完了直後にモデルが応答を開始する。
+            # 取りこぼし防止のため、通常ターンも mic 送信前に receive/M0/audio を起動する。
             turn_audio_stop_event = Event()
             recv_stop = asyncio.Event()
             recv_task: asyncio.Task | None = None
 
-            if bool(args.battle_talkover_receive_during_mic):
-                turn_state["active_turn"] = turn_no
-                turn_state["turn_start_perf"] = time.perf_counter()
-                turn_state["first_audio_sec"] = None
+            turn_state["active_turn"] = turn_no
+            turn_state["turn_start_perf"] = time.perf_counter()
+            turn_state["first_audio_sec"] = None
 
-                m0_stop_event = Event()
-                producer_done_event = Event()
-                mouth_updated_event = Event()
-                m0_stream_dir_current = m0_stream_dir
-                mouth_json_current = mouth_json
-                turn_start_perf_current = float(turn_state["turn_start_perf"])
-                frame_offset_current = int(next_frame_offset)
+            m0_stop_event = Event()
+            producer_done_event = Event()
+            mouth_updated_event = Event()
+            m0_stream_dir_current = m0_stream_dir
+            mouth_json_current = mouth_json
+            turn_start_perf_current = float(turn_state["turn_start_perf"])
+            frame_offset_current = int(next_frame_offset)
 
+            m0_pipeline_ref = None
+            if pipeline_sync:
+                m0_pipeline_ref = _create_m0_pipeline_ref(
+                    py=py,
+                    m0_repo=m0_repo,
+                    m1_repo=m1_repo,
+                    m3_repo=m3_repo,
+                    base_cfg=base_cfg,
+                    pose_json=Path(args.pose_json).resolve(),
+                    session_id=str(args.session_id),
+                    work_dir=m0_stream_dir_current,
+                    watch_fg_dir=watch_fg_dir,
+                    env=env,
+                    frame_offset=int(frame_offset_current),
+                    step_ms=int(args.step_ms),
+                    chunk_len_ms=int(args.stream_mouth_m0_chunk_len_ms),
+                    fps=int(args.fps),
+                    m0_worker_proc=None,
+                    m0_worker_host=str(args.m0_worker_host),
+                    m0_worker_port=int(args.m0_worker_port),
+                    inline_emo_id=(
+                        str(inline_emo_id_current)
+                        if bool(args.inline_emo_tag_mode)
+                        else None
+                    ),
+                    close_mouth_id=int(args.mouth_close_id),
+                )
+                turn_state["m0_pipeline_ref"] = m0_pipeline_ref
+            else:
+                turn_state["m0_pipeline_ref"] = None
+
+            m0_thread = None
+            if not pipeline_sync:
                 m0_thread = Thread(target=_m0_target, daemon=True)
                 m0_thread.start()
 
+            audio_thread = None
+            if not pipeline_sync:
                 audio_thread = _watch_stream_pcm_chunks(
                     audio_player_proc=audio_player_proc,
                     pcm_stream_chunks_dir=pcm_stream_chunks_dir,
@@ -3002,36 +4111,38 @@ async def _run(args: argparse.Namespace) -> int:
                     stop_event=turn_audio_stop_event,
                 )
 
-                recv_task = asyncio.create_task(
-                    _receive_loop(
-                        session=session,
-                        stop_event=recv_stop,
-                        pcm_stream_chunks_dir=pcm_stream_chunks_dir,
-                        audio_response_pcm=audio_response_pcm,
-                        mouth_streamer=mouth_streamer,
-                        mouth_streamer_json=mouth_streamer_json,
-                        mouth_raw_json=mouth_raw_json,
-                        mouth_json=mouth_json,
-                        knn_script=knn_script,
-                        gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
-                        step_ms=int(args.step_ms),
-                        turn_state=turn_state,
-                        mouth_updated_event=mouth_updated_event,
-                        drop_initial_audio_ms=(
-                            int(args.drop_initial_audio_ms)
-                            if bool(args.inline_emo_tag_mode)
-                            else 0
-                        ),
-                        debug_receive=bool(args.debug_receive),
-                        debug_receive_raw=bool(args.debug_receive_raw),
-                    )
+            recv_task = asyncio.create_task(
+                _receive_loop(
+                    session=session,
+                    stop_event=recv_stop,
+                    pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                    audio_response_pcm=audio_response_pcm,
+                    mouth_streamer=mouth_streamer,
+                    mouth_streamer_json=mouth_streamer_json,
+                    mouth_raw_json=mouth_raw_json,
+                    mouth_json=mouth_json,
+                    knn_script=knn_script,
+                    gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                    step_ms=int(args.step_ms),
+                    turn_state=turn_state,
+                    mouth_updated_event=mouth_updated_event,
+                    drop_initial_audio_ms=0,
+                    debug_receive=bool(args.debug_receive),
+                    debug_receive_raw=bool(args.debug_receive_raw),
+                    pipeline_sync=bool(pipeline_sync),
+                    mouth_obj_ref=mouth_obj_ref,
+                    knn_inmemory=bool(knn_inmemory),
+                    m0_inmemory=bool(m0_inmemory),
+                    fast_inmemory=bool(fast_inmemory),
+                    skip_archive_pcm=bool(skip_archive_pcm),
                 )
+            )
 
-                print(
-                    "[battle_talkover][receive_during_mic_ready]",
-                    f"turn={turn_no}",
-                    flush=True,
-                )
+            print(
+                "[session_loop][receive_before_mic_ready]",
+                f"turn={turn_no}",
+                flush=True,
+            )
 
             sent_bytes = await _send_mic_once(
                 session=session,
@@ -3045,75 +4156,35 @@ async def _run(args: argparse.Namespace) -> int:
                     else None
                 ),
                 mic_gate_ref=battle_mic_gate_ref,
+                mic_vad_end_enabled=bool(args.mic_vad_end_enabled),
+                mic_vad_rms_threshold=float(args.mic_vad_rms_threshold),
+                mic_vad_end_rms_threshold=(
+                    float(args.mic_vad_end_rms_threshold)
+                    if args.mic_vad_end_rms_threshold is not None
+                    else None
+                ),
+                mic_vad_min_voice_ms=int(args.mic_vad_min_voice_ms),
+                mic_vad_silence_ms=int(args.mic_vad_silence_ms),
+                mic_vad_min_listen_ms=int(args.mic_vad_min_listen_ms),
+                mic_vad_debug=bool(args.mic_vad_debug),
+                send_activity_signals=True,
             )
 
             if (
                 bool(args.battle_talkover_cut_in_on_interrupt)
                 and battle_talkover_cut_in_event.is_set()
             ):
-                await session.send_realtime_input(audio_stream_end=True)
+                # activity_end は _send_mic_once 内で送信済み（audio_stream_end は使わない）
                 print(
-                    "[battle_talkover][audio_stream_end_sent]",
+                    "[battle_talkover][activity_end_path]",
                     f"turn={turn_no}",
                     flush=True,
                 )
-            elif args.audio_stream_end_per_turn:
-                await session.send_realtime_input(audio_stream_end=True)
+            elif bool(args.audio_stream_end_per_turn):
                 print(
-                    f"[session_loop][audio_stream_end_sent] turn={turn_no}",
+                    f"[session_loop][WARN] --audio_stream_end_per_turn is deprecated; "
+                    f"activity_end already sent by client VAD path turn={turn_no}",
                     flush=True,
-                )
-
-            if not bool(args.battle_talkover_receive_during_mic):
-                # mic送信完了後、response_trigger直前からこのturnのfirst_audio計測を開始する
-                turn_state["active_turn"] = turn_no
-                turn_state["turn_start_perf"] = time.perf_counter()
-                turn_state["first_audio_sec"] = None
-
-                # このturn用に M0 watcher を起動
-                m0_stop_event = Event()
-                producer_done_event = Event()
-                mouth_updated_event = Event()
-                m0_stream_dir_current = m0_stream_dir
-                mouth_json_current = mouth_json
-                turn_start_perf_current = float(turn_state["turn_start_perf"])
-                frame_offset_current = int(next_frame_offset)
-
-                m0_thread = Thread(target=_m0_target, daemon=True)
-                m0_thread.start()
-
-                # active_turn 設定後に audio watcher を起動
-                audio_thread = _watch_stream_pcm_chunks(
-                    audio_player_proc=audio_player_proc,
-                    pcm_stream_chunks_dir=pcm_stream_chunks_dir,
-                    audio_device=str(args.ai_audio_output_device),
-                    stop_event=turn_audio_stop_event,
-                )
-
-                # active_turn 設定後に receiver を起動
-                recv_task = asyncio.create_task(
-                    _receive_loop(
-                        session=session,
-                        stop_event=recv_stop,
-                        pcm_stream_chunks_dir=pcm_stream_chunks_dir,
-                        audio_response_pcm=audio_response_pcm,
-                        mouth_streamer=mouth_streamer,
-                        mouth_streamer_json=mouth_streamer_json,
-                        mouth_raw_json=mouth_raw_json,
-                        mouth_json=mouth_json,
-                        knn_script=knn_script,
-                        gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
-                        step_ms=int(args.step_ms),
-                        turn_state=turn_state,
-                        mouth_updated_event=mouth_updated_event,
-                        drop_initial_audio_ms=(
-                            int(args.drop_initial_audio_ms)
-                            if bool(args.inline_emo_tag_mode)
-                            else 0
-                        ),
-                        debug_receive=bool(args.debug_receive),
-                        debug_receive_raw=bool(args.debug_receive_raw),
-                    )
                 )
 
             response_trigger = str(args.response_trigger)
@@ -3276,7 +4347,8 @@ async def _run(args: argparse.Namespace) -> int:
 
             if bool(args.skip_response_trigger):
                 print(
-                    f"[session_loop][response_trigger][SKIP] turn={turn_no}",
+                    f"[session_loop][response_trigger][SKIP] turn={turn_no} "
+                    f"(client VAD / activity_end path)",
                     flush=True,
                 )
             else:
@@ -3448,6 +4520,14 @@ async def _run(args: argparse.Namespace) -> int:
             turn_m0_result = m0_result_box.get("result")
             if isinstance(turn_m0_result, dict):
                 next_frame_offset += int(turn_m0_result.get("total_frames", 0) or 0)
+                print(
+                    f"[session_loop][frame_offset] next_frame_offset={next_frame_offset}",
+                    flush=True,
+                )
+            elif pipeline_sync and isinstance(turn_state.get("m0_pipeline_ref"), dict):
+                next_frame_offset += int(
+                    turn_state["m0_pipeline_ref"].get("total_frames", 0) or 0
+                )
                 print(
                     f"[session_loop][frame_offset] next_frame_offset={next_frame_offset}",
                     flush=True,
@@ -3823,7 +4903,51 @@ def main() -> int:
     ap.add_argument("--output_audio_transcription", action="store_true")
     ap.add_argument("--reconnect_per_turn", action="store_true")
     ap.add_argument("--turn_audio_retry_n", type=int, default=0)
-    ap.add_argument("--mic_send_max_s", type=float, default=0.6)
+    # client VAD の最大聴取窓（無音で早期終了）。旧固定長 0.6s では VAD 不能。
+    ap.add_argument("--mic_send_max_s", type=float, default=10.0)
+
+    # --- Phase 1: client / local RMS mic VAD（mouth_vad_* とは別）---
+    ap.add_argument(
+        "--mic_vad_end_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable client RMS VAD end detection (default: True).",
+    )
+    ap.add_argument(
+        "--mic_vad_rms_threshold",
+        type=float,
+        default=0.015,
+        help="RMS threshold to start user speech (client VAD).",
+    )
+    ap.add_argument(
+        "--mic_vad_end_rms_threshold",
+        type=float,
+        default=None,
+        help="RMS threshold to keep speech active; default=mic_vad_rms_threshold.",
+    )
+    ap.add_argument(
+        "--mic_vad_min_voice_ms",
+        type=int,
+        default=200,
+        help="Min voiced ms before activity_start.",
+    )
+    ap.add_argument(
+        "--mic_vad_silence_ms",
+        type=int,
+        default=700,
+        help="Silence ms after speech before activity_end.",
+    )
+    ap.add_argument(
+        "--mic_vad_min_listen_ms",
+        type=int,
+        default=800,
+        help="Min listen ms before allowing VAD end.",
+    )
+    ap.add_argument(
+        "--mic_vad_debug",
+        action="store_true",
+        help="Verbose client mic VAD logs.",
+    )
 
     # --- [ADD] Live API warmup before production turns ---
     ap.add_argument(
@@ -3892,7 +5016,16 @@ def main() -> int:
         default=None,
         help="Directory for external prompt txt files. Default: <m1_repo_root>/configs/prompts",
     )
-    ap.add_argument("--skip_response_trigger", action="store_true")
+    ap.add_argument(
+        "--skip_response_trigger",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Skip text response_trigger for normal turns (default True). "
+            "Client VAD + activity_end drives the model response. "
+            "Use --no-skip_response_trigger only for debug."
+        ),
+    )
     ap.add_argument(
         "--battle_talkover_receive_during_mic",
         action="store_true",
@@ -3906,7 +5039,7 @@ def main() -> int:
         action="store_true",
         help=(
             "Soft cut-in mode: when battle interrupt is sent, stop mic send early "
-            "and send audio_stream_end so the model can start responding. "
+            "and complete the turn via activity_end (not audio_stream_end). "
             "This is not abort."
         ),
     )
@@ -4061,11 +5194,57 @@ def main() -> int:
         default=None,
         help="Dev only. Example: 1_1@600,2_0@1000,9_1@1400",
     )
-    ap.add_argument("--drop_initial_audio_ms", type=int, default=120)
-    ap.add_argument("--audio_stream_end_per_turn", action="store_true")
+    ap.add_argument(
+        "--drop_initial_audio_ms",
+        type=int,
+        default=0,
+        help=(
+            "DEPRECATED/disabled in Phase 1 client-VAD mode. "
+            "Always treated as 0 (no initial playback drop)."
+        ),
+    )
+    ap.add_argument(
+        "--audio_stream_end_per_turn",
+        action="store_true",
+        help=(
+            "DEPRECATED: ignored. Normal turns complete via client VAD "
+            "activity_end (not audio_stream_end)."
+        ),
+    )
 
     ap.add_argument("--step_ms", type=int, default=40)
     ap.add_argument("--stream_mouth_m0_chunk_len_ms", type=int, default=120)
+
+    ap.add_argument(
+        "--pipeline_sync",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Phase2 arrival-order parallel pipeline (KNN→M0→enqueue). Default ON.",
+    )
+    ap.add_argument(
+        "--fast_inmemory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Phase5b fast in-memory path (keep branch; default OFF).",
+    )
+    ap.add_argument(
+        "--knn_inmemory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="KNN in-memory branch (default OFF for Phase2 disk path).",
+    )
+    ap.add_argument(
+        "--m0_inmemory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="M0 in-memory branch flag (pipeline always uses m0_pipeline_ref).",
+    )
+    ap.add_argument(
+        "--skip_archive_pcm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip PCM archive when combined with --fast_inmemory.",
+    )
 
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--width", type=int, default=720)

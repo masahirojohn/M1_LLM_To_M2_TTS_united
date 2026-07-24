@@ -12,11 +12,14 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
-from threading import Event
+from threading import Event, Lock
 
 import yaml
 
 RESPONSE_PREFIX = "__M0_WORKER_RESPONSE__ "
+
+# Phase 2: abnormal M0 hang only (normal ~250ms/chunk must not be cut short).
+_M0_PIPELINE_HANG_TIMEOUT_MS = 3000
 
 
 def _run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
@@ -332,6 +335,34 @@ def _start_audio_player(
     return proc
 
 
+def _make_audio_playback_state_ref(*, sample_rate: int = 24000) -> dict[str, Any]:
+    return {
+        "lock": Lock(),
+        "playback_origin_ms": 0,
+        "response_playback_base_samples": 0,
+        "played_samples": 0,
+        "pending_ms": 0.0,
+        "sample_rate": int(sample_rate),
+        "pipeline_audio_end_ms": 0,
+    }
+
+
+def _update_audio_playback_state_ref(
+    audio_playback_state_ref: dict[str, Any] | None,
+    res: dict[str, Any] | None,
+) -> None:
+    if audio_playback_state_ref is None or not isinstance(res, dict):
+        return
+    with audio_playback_state_ref["lock"]:
+        if "played_samples" in res:
+            audio_playback_state_ref["played_samples"] = int(res.get("played_samples") or 0)
+        if "pending_ms" in res:
+            try:
+                audio_playback_state_ref["pending_ms"] = float(res.get("pending_ms") or 0.0)
+            except Exception:
+                pass
+
+
 def _send_audio_chunk(
     *,
     audio_player_proc: subprocess.Popen,
@@ -339,6 +370,7 @@ def _send_audio_chunk(
     chunk_id: int,
     audio_device: str,
     single_chunk: bool = False,
+    audio_playback_state_ref: dict[str, Any] | None = None,
 ) -> None:
     if audio_player_proc.stdin is None:
         raise RuntimeError("audio player stdin is not available")
@@ -374,6 +406,7 @@ def _send_audio_chunk(
             res = json.loads(line[len(AUDIO_RESPONSE_PREFIX):])
             if not res.get("ok"):
                 raise RuntimeError(res)
+            _update_audio_playback_state_ref(audio_playback_state_ref, res)
             break
 
 
@@ -581,6 +614,461 @@ def _expr_chunk_from_live_emo_events(
             "chunk_end_ms": int(chunk_end_ms),
         },
     }
+
+
+def _m0_pipeline_global_frame_range(
+    *,
+    m0_pipeline_ref: dict[str, Any],
+    t0_ms: int,
+    t1_ms: int,
+) -> tuple[int, int]:
+    step_ms = int(m0_pipeline_ref["step_ms"])
+    frame_offset = int(m0_pipeline_ref.get("frame_offset", 0))
+    frame0 = int(t0_ms // step_ms)
+    frame1 = int(t1_ms // step_ms)
+    return int(frame_offset + frame0), int(frame_offset + frame1)
+
+
+def _m0_pipeline_verify_pngs_exist(
+    *,
+    m0_pipeline_ref: dict[str, Any],
+    global_frame0: int,
+    global_frame1: int,
+) -> bool:
+    watch_fg_dir = m0_pipeline_ref["watch_fg_dir"]
+    if int(global_frame1) <= int(global_frame0):
+        return False
+    for i in range(int(global_frame1) - int(global_frame0)):
+        p = watch_fg_dir / f"{int(global_frame0) + i:08d}.png"
+        if not p.exists():
+            return False
+    return True
+
+
+def _m0_pipeline_enqueue_timeline_end_ms(
+    audio_playback_state_ref: dict[str, Any] | None,
+    chunk_pcm_bytes: bytes,
+) -> int:
+    """Reserve / compute timeline end ms for this playback chunk at push time."""
+    if not chunk_pcm_bytes:
+        return 0
+
+    chunk_samples = len(chunk_pcm_bytes) // 2
+    sr = 24000
+    if audio_playback_state_ref is None:
+        return int(chunk_samples * 1000.0 / float(sr))
+
+    with audio_playback_state_ref["lock"]:
+        sr = int(audio_playback_state_ref.get("sample_rate", 24000) or 24000)
+        origin_ms = int(audio_playback_state_ref.get("playback_origin_ms", 0) or 0)
+        end_ms = int(audio_playback_state_ref.get("pipeline_audio_end_ms", 0) or 0)
+        if end_ms <= 0 and origin_ms:
+            end_ms = int(origin_ms)
+        chunk_ms = chunk_samples * 1000.0 / float(sr)
+        new_end = int(end_ms + chunk_ms)
+        audio_playback_state_ref["pipeline_audio_end_ms"] = int(new_end)
+        return int(new_end)
+
+
+def _m0_pipeline_rendered_end_ms(
+    m0_pipeline_ref: dict[str, Any],
+    audio_playback_state_ref: dict[str, Any] | None,
+) -> int:
+    origin_ms = 0
+    if audio_playback_state_ref is not None:
+        with audio_playback_state_ref["lock"]:
+            origin_ms = int(audio_playback_state_ref.get("playback_origin_ms", 0) or 0)
+    with m0_pipeline_ref["lock"]:
+        rendered = int(m0_pipeline_ref.get("rendered_chunks", 0) or 0)
+        chunk_len_ms = int(m0_pipeline_ref.get("chunk_len_ms", 120) or 120)
+    return int(origin_ms + rendered * chunk_len_ms)
+
+
+def _attach_mouth_closed_dummy_frames(
+    mouth_obj_ref: dict[str, Any],
+    *,
+    t0_ms: int,
+    t1_ms: int,
+    step_ms: int,
+    close_mouth_id: int = 0,
+) -> int:
+    obj = mouth_obj_ref.get("obj")
+    if not isinstance(obj, dict):
+        return 0
+
+    mouth_frames = list(_as_frames(obj))
+    frame0 = int(t0_ms // int(step_ms))
+    frame1 = int(t1_ms // int(step_ms))
+    added = 0
+
+    for i in range(max(len(mouth_frames), frame0), frame1):
+        mouth_frames.append(
+            {
+                "t_ms": int(i * int(step_ms)),
+                "mouth_id": int(close_mouth_id),
+                "src": "mouth_closed_dummy",
+            }
+        )
+        added += 1
+
+    if added > 0:
+        mouth_obj_ref["obj"] = _wrap_like(obj, mouth_frames)
+
+    return int(added)
+
+
+def _create_m0_pipeline_ref(
+    *,
+    py: Path,
+    m0_repo: Path,
+    m1_repo: Path,
+    m3_repo: Path,
+    base_cfg: dict[str, Any],
+    pose_json: Path,
+    session_id: str,
+    work_dir: Path,
+    watch_fg_dir: Path,
+    env: dict[str, str],
+    frame_offset: int,
+    step_ms: int,
+    chunk_len_ms: int,
+    fps: int,
+    m0_worker_proc: subprocess.Popen | None,
+    m0_worker_host: str,
+    m0_worker_port: int | None,
+    inline_emo_id: str | None = None,
+    close_mouth_id: int = 0,
+) -> dict[str, Any]:
+    chunks_root = work_dir / "stream_chunks"
+    chunks_root.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "lock": threading.Lock(),
+        "rendered_chunks": 0,
+        "total_frames": 0,
+        "py": py,
+        "m0_repo": m0_repo,
+        "m1_repo": m1_repo,
+        "m3_repo": m3_repo,
+        "base_cfg": base_cfg,
+        "pose_obj": _load_json(pose_json),
+        "session_id": str(session_id),
+        "work_dir": work_dir,
+        "watch_fg_dir": watch_fg_dir,
+        "env": env,
+        "frame_offset": int(frame_offset),
+        "step_ms": int(step_ms),
+        "chunk_len_ms": int(chunk_len_ms),
+        "fps": int(fps),
+        "chunks_root": chunks_root,
+        "m0_worker_proc": m0_worker_proc,
+        "m0_worker_host": str(m0_worker_host),
+        "m0_worker_port": m0_worker_port,
+        "inline_emo_id": inline_emo_id,
+        "close_mouth_id": int(close_mouth_id),
+    }
+
+
+def _m0_pipeline_render_one_chunk_sync(
+    *,
+    m0_pipeline_ref: dict[str, Any],
+    mouth_obj: dict[str, Any],
+    cid: int,
+    t0_ms: int,
+    t1_ms: int,
+    live_emo_id_getter: Callable[[], str | None] | None = None,
+    live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None = None,
+) -> int:
+    step_ms = int(m0_pipeline_ref["step_ms"])
+    frame0 = int(t0_ms // step_ms)
+    frame1 = int(t1_ms // step_ms)
+    chunks_root = m0_pipeline_ref["chunks_root"]
+    cdir = chunks_root / f"{int(cid):06d}"
+    cdir.mkdir(parents=True, exist_ok=True)
+
+    pose_chunk_json = cdir / "pose.chunk.json"
+    mouth_chunk_json = cdir / "mouth.chunk.json"
+    expr_chunk_json = cdir / "expr.chunk.json"
+
+    pose_chunk = _slice_shift_timeline(m0_pipeline_ref["pose_obj"], t0_ms, t1_ms)
+    mouth_chunk = _slice_shift_timeline(mouth_obj, t0_ms, t1_ms)
+
+    effective_emo_id = m0_pipeline_ref.get("inline_emo_id")
+    if live_emo_id_getter is not None:
+        try:
+            live_emo_id = live_emo_id_getter()
+        except Exception:
+            live_emo_id = None
+        if live_emo_id:
+            effective_emo_id = str(live_emo_id)
+
+    live_emo_events = None
+    if live_emo_events_getter is not None:
+        try:
+            live_emo_events = live_emo_events_getter()
+        except Exception:
+            live_emo_events = None
+
+    if live_emo_events:
+        expr_chunk = _expr_chunk_from_live_emo_events(
+            session_id=str(m0_pipeline_ref["session_id"]),
+            step_ms=step_ms,
+            fallback_emo_id=effective_emo_id,
+            chunk_start_ms=int(t0_ms),
+            chunk_end_ms=int(t1_ms),
+            live_emo_events=live_emo_events,
+        )
+    else:
+        expr_chunk = _default_expr_chunk(
+            session_id=str(m0_pipeline_ref["session_id"]),
+            step_ms=step_ms,
+            inline_emo_id=effective_emo_id,
+        )
+
+    pose_chunk_json.write_text(
+        json.dumps(pose_chunk, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    mouth_chunk_json.write_text(
+        json.dumps(mouth_chunk, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    expr_chunk_json.write_text(
+        json.dumps(expr_chunk, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    ch = {
+        "chunk_id": int(cid),
+        "t0_ms": int(t0_ms),
+        "t1_ms": int(t1_ms),
+        "frame0": int(frame0),
+        "frame1": int(frame1),
+        "pose_chunk_json": str(pose_chunk_json),
+        "mouth_chunk_json": str(mouth_chunk_json),
+        "expr_chunk_json": str(expr_chunk_json),
+    }
+    chunks_summary = {
+        "fps": int(m0_pipeline_ref["fps"]),
+        "step_ms": int(step_ms),
+        "chunk_len_ms": int(m0_pipeline_ref["chunk_len_ms"]),
+    }
+
+    copied = _run_m0_one_chunk(
+        py=m0_pipeline_ref["py"],
+        m0_repo=m0_pipeline_ref["m0_repo"],
+        m1_repo=m0_pipeline_ref["m1_repo"],
+        m3_repo=m0_pipeline_ref["m3_repo"],
+        base_cfg=m0_pipeline_ref["base_cfg"],
+        chunk=ch,
+        chunks_summary=chunks_summary,
+        work_dir=m0_pipeline_ref["work_dir"] / "m0_stream_work",
+        watch_fg_dir=m0_pipeline_ref["watch_fg_dir"],
+        env=m0_pipeline_ref["env"],
+        frame_offset=int(m0_pipeline_ref["frame_offset"]),
+        m0_worker_proc=m0_pipeline_ref["m0_worker_proc"],
+        m0_worker_host=str(m0_pipeline_ref["m0_worker_host"]),
+        m0_worker_port=m0_pipeline_ref["m0_worker_port"],
+    )
+    return int(copied)
+
+
+def _m0_pipeline_render_with_hang_guard(
+    *,
+    m0_pipeline_ref: dict[str, Any],
+    mouth_obj: dict[str, Any],
+    cid: int,
+    t0_ms: int,
+    t1_ms: int,
+    live_emo_id_getter: Callable[[], str | None] | None,
+    live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None,
+    hang_timeout_ms: int = _M0_PIPELINE_HANG_TIMEOUT_MS,
+) -> tuple[int, bool, float]:
+    """Normal path blocks until M0 completes. Hang guard only on abnormal stall."""
+    if int(hang_timeout_ms) <= 0:
+        t0 = time.perf_counter()
+        copied = _m0_pipeline_render_one_chunk_sync(
+            m0_pipeline_ref=m0_pipeline_ref,
+            mouth_obj=mouth_obj,
+            cid=int(cid),
+            t0_ms=int(t0_ms),
+            t1_ms=int(t1_ms),
+            live_emo_id_getter=live_emo_id_getter,
+            live_emo_events_getter=live_emo_events_getter,
+        )
+        return int(copied), False, (time.perf_counter() - t0) * 1000.0
+
+    render_box: dict[str, Any] = {"copied": 0, "error": None}
+
+    def _target() -> None:
+        try:
+            render_box["copied"] = _m0_pipeline_render_one_chunk_sync(
+                m0_pipeline_ref=m0_pipeline_ref,
+                mouth_obj=mouth_obj,
+                cid=int(cid),
+                t0_ms=int(t0_ms),
+                t1_ms=int(t1_ms),
+                live_emo_id_getter=live_emo_id_getter,
+                live_emo_events_getter=live_emo_events_getter,
+            )
+        except BaseException as e:
+            render_box["error"] = e
+
+    t_start = time.perf_counter()
+    th = threading.Thread(target=_target, daemon=True)
+    th.start()
+    th.join(timeout=max(0.001, float(hang_timeout_ms) / 1000.0))
+    wait_ms = (time.perf_counter() - t_start) * 1000.0
+
+    if th.is_alive():
+        print(
+            "[sync][pipeline_chunk][M0_HANG]",
+            f"cid={int(cid)}",
+            f"t0_ms={int(t0_ms)}",
+            f"t1_ms={int(t1_ms)}",
+            f"wait_ms={wait_ms:.0f}",
+            flush=True,
+        )
+        return 0, True, float(wait_ms)
+
+    if render_box["error"] is not None:
+        raise render_box["error"]
+
+    return int(render_box["copied"]), False, float(wait_ms)
+
+
+def _m0_pipeline_advance_sync(
+    *,
+    m0_pipeline_ref: dict[str, Any],
+    mouth_obj_ref: dict[str, Any],
+    audio_playback_state_ref: dict[str, Any] | None,
+    live_emo_id_getter: Callable[[], str | None] | None = None,
+    live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None = None,
+    hang_timeout_ms: int = _M0_PIPELINE_HANG_TIMEOUT_MS,
+    max_chunks: int = 256,
+    until_t1_ms: int | None = None,
+) -> dict[str, Any]:
+    result = {
+        "chunks_rendered": 0,
+        "m0_ms_total": 0.0,
+        "hang_used": False,
+        "hang_chunks": 0,
+        "last_cid": -1,
+        "last_global_frame1": -1,
+        "png_verified": True,
+    }
+
+    obj = mouth_obj_ref.get("obj")
+    if not isinstance(obj, dict):
+        return result
+
+    origin_ms = 0
+    if audio_playback_state_ref is not None:
+        with audio_playback_state_ref["lock"]:
+            origin_ms = int(audio_playback_state_ref.get("playback_origin_ms", 0) or 0)
+
+    chunk_len_ms = int(m0_pipeline_ref["chunk_len_ms"])
+    step_ms = int(m0_pipeline_ref["step_ms"])
+    close_mouth_id = int(m0_pipeline_ref.get("close_mouth_id", 0))
+
+    with m0_pipeline_ref["lock"]:
+        while int(result["chunks_rendered"]) < int(max_chunks):
+            cid = int(m0_pipeline_ref["rendered_chunks"])
+            t0_ms = int(origin_ms + cid * chunk_len_ms)
+            t1_ms = int(t0_ms + chunk_len_ms)
+
+            if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
+                break
+
+            needed_frames = int(t1_ms // step_ms)
+            mouth_frames = _as_frames(obj)
+
+            if len(mouth_frames) < needed_frames:
+                break
+
+            global_f0, global_f1 = _m0_pipeline_global_frame_range(
+                m0_pipeline_ref=m0_pipeline_ref,
+                t0_ms=int(t0_ms),
+                t1_ms=int(t1_ms),
+            )
+
+            hung = False
+            chunk_ok = True
+            copied = 0
+            m0_ms = 0.0
+            try:
+                copied, hung, m0_ms = _m0_pipeline_render_with_hang_guard(
+                    m0_pipeline_ref=m0_pipeline_ref,
+                    mouth_obj=obj,
+                    cid=int(cid),
+                    t0_ms=int(t0_ms),
+                    t1_ms=int(t1_ms),
+                    live_emo_id_getter=live_emo_id_getter,
+                    live_emo_events_getter=live_emo_events_getter,
+                    hang_timeout_ms=int(hang_timeout_ms),
+                )
+            except BaseException:
+                chunk_ok = False
+                copied = 0
+                m0_ms = 0.0
+
+            result["m0_ms_total"] = float(result["m0_ms_total"]) + float(m0_ms)
+            result["last_cid"] = int(cid)
+            result["last_global_frame1"] = int(global_f1)
+
+            if hung or not chunk_ok:
+                result["hang_used"] = True
+                result["hang_chunks"] = int(result["hang_chunks"]) + 1
+                _attach_mouth_closed_dummy_frames(
+                    mouth_obj_ref,
+                    t0_ms=int(t0_ms),
+                    t1_ms=int(t1_ms),
+                    step_ms=int(step_ms),
+                    close_mouth_id=int(close_mouth_id),
+                )
+                obj = mouth_obj_ref.get("obj")
+                if isinstance(obj, dict):
+                    try:
+                        copied, hung2, dummy_ms = _m0_pipeline_render_with_hang_guard(
+                            m0_pipeline_ref=m0_pipeline_ref,
+                            mouth_obj=obj,
+                            cid=int(cid),
+                            t0_ms=int(t0_ms),
+                            t1_ms=int(t1_ms),
+                            live_emo_id_getter=live_emo_id_getter,
+                            live_emo_events_getter=live_emo_events_getter,
+                            hang_timeout_ms=int(hang_timeout_ms),
+                        )
+                        result["m0_ms_total"] = (
+                            float(result["m0_ms_total"]) + float(dummy_ms)
+                        )
+                        if hung2:
+                            result["hang_chunks"] = int(result["hang_chunks"]) + 1
+                    except BaseException:
+                        copied = 0
+            elif int(copied) > 0:
+                m0_pipeline_ref["total_frames"] = int(
+                    m0_pipeline_ref.get("total_frames", 0)
+                ) + int(copied)
+
+            if not _m0_pipeline_verify_pngs_exist(
+                m0_pipeline_ref=m0_pipeline_ref,
+                global_frame0=int(global_f0),
+                global_frame1=int(global_f1),
+            ):
+                result["png_verified"] = False
+                print(
+                    "[sync][pipeline_chunk][PNG_MISSING]",
+                    f"cid={int(cid)}",
+                    f"global_range=[{int(global_f0)},{int(global_f1)})",
+                    flush=True,
+                )
+
+            m0_pipeline_ref["rendered_chunks"] = int(cid) + 1
+            result["chunks_rendered"] = int(result["chunks_rendered"]) + 1
+            obj = mouth_obj_ref.get("obj")
+
+    return result
 
 
 def _watch_stream_mouth_and_render_m0(
