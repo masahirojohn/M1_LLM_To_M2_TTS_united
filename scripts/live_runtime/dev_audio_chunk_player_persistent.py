@@ -297,9 +297,15 @@ class PersistentPcmPlayer:
             **stats,
         }
 
-    def clear_queue(self) -> dict:
+    def clear_queue(self, *, reason: str = "clear_queue") -> dict:
+        """Clear pending PCM. Intended for user-interrupt exception only.
+
+        After clear, state returns to BUFFERING so the next enqueue path can
+        rebuild the data-amount jitter (initial_buffer / TINY_PCM_DROP intact).
+        """
         cleared_chunks = 0
         cleared_samples = 0
+        reason_s = str(reason or "clear_queue")
 
         with self.lock:
             if self.current is not None:
@@ -327,7 +333,7 @@ class PersistentPcmPlayer:
 
         print(
             "[audio_chunk_player_persistent][BUFFERING]",
-            "reason=clear_queue",
+            f"reason=clear_queue:{reason_s}",
             "pending_samples=0",
             "pending_ms=0.000",
             f"target_ms={self.initial_buffer_ms}",
@@ -339,6 +345,7 @@ class PersistentPcmPlayer:
         return {
             "ok": True,
             "cmd": "clear_queue",
+            "reason": reason_s,
             "cleared_chunks": int(cleared_chunks),
             "cleared_samples": int(cleared_samples),
             "queue_size": int(qsize),
@@ -628,7 +635,11 @@ def main() -> int:
                     return 0
 
                 if cmd == "clear_queue":
-                    _send(player.clear_queue())
+                    _send(
+                        player.clear_queue(
+                            reason=str(req.get("reason", "clear_queue"))
+                        )
+                    )
                     continue
 
                 if cmd == "get_status":

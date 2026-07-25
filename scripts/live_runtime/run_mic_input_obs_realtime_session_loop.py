@@ -837,32 +837,170 @@ def _read_battle_interrupt_queue_file(path: Path) -> list[str]:
     return []
 
 
-def _clear_audio_player_queue(audio_player_proc: subprocess.Popen | None) -> bool:
+def _clear_audio_player_queue(
+    audio_player_proc: subprocess.Popen | None,
+    *,
+    reason: str = "unspecified",
+) -> bool:
+    """Send clear_queue to player.
+
+    Phase 4: normal turn / generation_complete / tail drain must NOT call this.
+    Allowed: user interrupt (talkover cut-in) and event_runtime overlay only.
+    """
     if audio_player_proc is None:
-        print("[audio_player][clear_queue_skip] proc=None", flush=True)
+        print(
+            "[audio_player][clear_queue_skip] proc=None",
+            f"reason={reason}",
+            flush=True,
+        )
         return False
 
     if audio_player_proc.stdin is None:
-        print("[audio_player][clear_queue_skip] stdin=None", flush=True)
+        print(
+            "[audio_player][clear_queue_skip] stdin=None",
+            f"reason={reason}",
+            flush=True,
+        )
         return False
 
     if audio_player_proc.poll() is not None:
-        print("[audio_player][clear_queue_skip] proc_not_running", flush=True)
+        print(
+            "[audio_player][clear_queue_skip] proc_not_running",
+            f"reason={reason}",
+            flush=True,
+        )
         return False
 
     try:
         audio_player_proc.stdin.write(
-            json.dumps({"cmd": "clear_queue"}, ensure_ascii=False) + "\n"
+            json.dumps(
+                {"cmd": "clear_queue", "reason": str(reason)},
+                ensure_ascii=False,
+            )
+            + "\n"
         )
         audio_player_proc.stdin.flush()
-        print("[audio_player][clear_queue_sent]", flush=True)
+        print(
+            "[audio_player][clear_queue_sent]",
+            f"reason={reason}",
+            flush=True,
+        )
         return True
     except Exception as e:
         print(
             f"[audio_player][clear_queue_error] {type(e).__name__}: {e}",
+            f"reason={reason}",
             flush=True,
         )
         return False
+
+
+@dataclass(frozen=True)
+class _PipelineInterruptClear:
+    """Dispatcher marker: drop stale pending and jump expected_seq after interrupt."""
+
+    min_seq: int
+
+
+def _clear_draw_queue_state(turn_state: dict[str, Any]) -> None:
+    """Minimal draw-queue clear for interrupt exception (mouth in-memory only)."""
+    mouth_ref = turn_state.get("mouth_obj_ref")
+    cleared = False
+    if isinstance(mouth_ref, dict):
+        obj = mouth_ref.get("obj")
+        if isinstance(obj, dict):
+            if isinstance(obj.get("frames"), list):
+                obj["frames"] = []
+                cleared = True
+            if isinstance(obj.get("timeline"), list):
+                obj["timeline"] = []
+                cleared = True
+        mouth_ref["obj"] = {"frames": [], "timeline": []} if not isinstance(obj, dict) else obj
+        cleared = True
+    print(
+        "[battle_talkover][draw_queue_cleared]",
+        f"cleared={bool(cleared)}",
+        flush=True,
+    )
+
+
+async def _apply_user_interrupt_clear(
+    *,
+    audio_player_proc: subprocess.Popen | None,
+    turn_state: dict[str, Any],
+    reason: str = "user_interrupt",
+) -> None:
+    """唯一の clear_queue 例外: ユーザー割り込み（talkover cut-in）。
+
+    順序: player clear → 描画キュー clear → 進行中 chunk タスク cancel
+    （mic 停止 / activity_end は呼び出し側で先行済み、または cut_in_event 経由）
+    """
+    if bool(turn_state.get("interrupt_clear_in_progress")):
+        print(
+            "[battle_talkover][interrupt_clear_skip]",
+            "reason=already_in_progress",
+            flush=True,
+        )
+        return
+
+    turn_state["interrupt_clear_in_progress"] = True
+    try:
+        min_seq = int(turn_state.get("pipeline_next_seq", 0) or 0)
+        turn_state["pipeline_interrupt_min_seq"] = min_seq
+
+        print(
+            "[battle_talkover][interrupt_clear_begin]",
+            f"reason={reason}",
+            f"min_seq={min_seq}",
+            flush=True,
+        )
+
+        _clear_audio_player_queue(audio_player_proc, reason=reason)
+        _clear_draw_queue_state(turn_state)
+
+        order = turn_state.get("pipeline_enqueue_order")
+        if isinstance(order, dict):
+            cond = order.get("cond")
+            if isinstance(cond, asyncio.Condition):
+                async with cond:
+                    order["expected_push_seq"] = min_seq
+                    order["expected_seq"] = min_seq
+                    cond.notify_all()
+            else:
+                order["expected_push_seq"] = min_seq
+                order["expected_seq"] = min_seq
+
+        eq = turn_state.get("pipeline_enqueue_queue_ref")
+        if eq is not None:
+            try:
+                eq.put_nowait(_PipelineInterruptClear(min_seq=min_seq))
+            except Exception as e:
+                print(
+                    "[battle_talkover][interrupt_clear_queue_marker_error]",
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+        tasks_ref = turn_state.get("pipeline_active_tasks_ref")
+        cancelled_n = 0
+        if isinstance(tasks_ref, list):
+            pending = [t for t in list(tasks_ref) if t is not None and not t.done()]
+            for t in pending:
+                t.cancel()
+                cancelled_n += 1
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            tasks_ref[:] = [t for t in tasks_ref if t is not None and not t.done()]
+
+        print(
+            "[battle_talkover][interrupt_clear_done]",
+            f"reason={reason}",
+            f"chunk_tasks_cancelled={cancelled_n}",
+            f"min_seq={min_seq}",
+            flush=True,
+        )
+    finally:
+        turn_state["interrupt_clear_in_progress"] = False
 
 
 def _start_battle_interrupt_cli_thread(
@@ -921,10 +1059,16 @@ async def _battle_interrupt_send_loop(
     q: asyncio.Queue[str],
     stop_event: asyncio.Event,
     cut_in_event: asyncio.Event | None = None,
+    audio_player_proc: subprocess.Popen | None = None,
+    turn_state: dict[str, Any] | None = None,
 ) -> None:
     """
     admin CLI queue から受け取った割り込み指示を、
     現在の Live API session へ即時 text send する。
+
+    talkover cut-in 時（cut_in_event あり）:
+      mic 停止シグナル →（mic 側で activity_end）→ 割り込み clear_queue
+      → chunk cancel → text send（新応答開始）
     """
     while not stop_event.is_set():
         try:
@@ -950,6 +1094,14 @@ async def _battle_interrupt_send_loop(
                     f"text={raw_text}",
                     flush=True,
                 )
+                # mic 停止は cut_in_event。activity_end は _send_mic_once finally。
+                # 割り込み例外 clear はここで即時（再生中 AI 音声を止める）。
+                if turn_state is not None:
+                    await _apply_user_interrupt_clear(
+                        audio_player_proc=audio_player_proc,
+                        turn_state=turn_state,
+                        reason="talkover_cut_in",
+                    )
 
             await session.send_realtime_input(text=prompt)
 
@@ -1786,7 +1938,10 @@ def _start_event_runtime_file_thread(
                     flush=True,
                 )
 
-                _clear_audio_player_queue(audio_player_proc)
+                _clear_audio_player_queue(
+                    audio_player_proc,
+                    reason="event_runtime",
+                )
 
                 if bool(resolved_event.get("audio", False)) and m35_repo is not None:
                     audio_source = str(resolved_event.get("audio_source", "")).strip().lower()
@@ -2622,6 +2777,17 @@ async def _process_pipeline_chunk_task(
             enqueue_blocked = True
             png_verified = False
 
+        # Drop stale work cancelled/superseded by user interrupt clear.
+        min_keep = int(turn_state.get("pipeline_interrupt_min_seq", 0) or 0)
+        if int(pipeline_seq) < min_keep:
+            print(
+                "[sync][pipeline_chunk][interrupt_drop]",
+                f"pipeline_seq={int(pipeline_seq)}",
+                f"min_seq={min_keep}",
+                flush=True,
+            )
+            return
+
         turn_state["pipeline_continuous_errors"] = 0
         item = _PipelineEnqueueItem(
             pipeline_seq=int(pipeline_seq),
@@ -2643,6 +2809,19 @@ async def _process_pipeline_chunk_task(
             stage_m0_done_ms=float(stage_m0_done_ms),
         )
         enqueue_queue.put_nowait(item)
+    except asyncio.CancelledError:
+        # Interrupt cancel: advance push turn if held; never enqueue leftover audio.
+        try:
+            await _advance_pipeline_push_turn(turn_state, int(pipeline_seq))
+        except BaseException:
+            pass
+        print(
+            "[sync][pipeline_chunk][cancelled]",
+            f"pipeline_seq={int(pipeline_seq)}",
+            f"chunk_idx={int(job.playback_chunk_idx)}",
+            flush=True,
+        )
+        raise
     except BaseException as e:
         err_cnt = int(turn_state.get("pipeline_continuous_errors", 0)) + 1
         turn_state["pipeline_continuous_errors"] = err_cnt
@@ -2661,27 +2840,29 @@ async def _process_pipeline_chunk_task(
                     await _advance_pipeline_push_turn(turn_state, int(pipeline_seq))
             except BaseException:
                 pass
-        enqueue_queue.put_nowait(
-            _PipelineEnqueueItem(
-                pipeline_seq=int(pipeline_seq),
-                job=job,
-                effective_playback=b"",
-                enqueue_blocked=True,
-                enqueue_timeline_end_ms=0,
-                emitted=0,
-                knn_ms=0.0,
-                m0_ms=0.0,
-                m0_chunks=0,
-                hang_used=False,
-                png_verified=False,
-                frames_n=0,
-                m0_last_cid=-1,
-                m0_last_global=-1,
-                t_pipeline0=time.perf_counter(),
-                stage_knn_done_ms=0.0,
-                stage_m0_done_ms=0.0,
+        min_keep = int(turn_state.get("pipeline_interrupt_min_seq", 0) or 0)
+        if int(pipeline_seq) >= min_keep:
+            enqueue_queue.put_nowait(
+                _PipelineEnqueueItem(
+                    pipeline_seq=int(pipeline_seq),
+                    job=job,
+                    effective_playback=b"",
+                    enqueue_blocked=True,
+                    enqueue_timeline_end_ms=0,
+                    emitted=0,
+                    knn_ms=0.0,
+                    m0_ms=0.0,
+                    m0_chunks=0,
+                    hang_used=False,
+                    png_verified=False,
+                    frames_n=0,
+                    m0_last_cid=-1,
+                    m0_last_global=-1,
+                    t_pipeline0=time.perf_counter(),
+                    stage_knn_done_ms=0.0,
+                    stage_m0_done_ms=0.0,
+                )
             )
-        )
     finally:
         _pipeline_inflight_dec(turn_state)
         inflight_sem.release()
@@ -2783,20 +2964,49 @@ async def _pipeline_enqueue_dispatcher_loop(
             enqueue_queue.task_done()
             if got is None:
                 saw_sentinel = True
+            elif isinstance(got, _PipelineInterruptClear):
+                drop_before = int(got.min_seq)
+                dropped = [s for s in list(pending.keys()) if int(s) < drop_before]
+                for s in dropped:
+                    pending.pop(s, None)
+                order = _ensure_pipeline_enqueue_order(turn_state)
+                cond: asyncio.Condition = order["cond"]
+                async with cond:
+                    order["expected_seq"] = max(int(order["expected_seq"]), drop_before)
+                    order["expected_push_seq"] = max(
+                        int(order["expected_push_seq"]), drop_before
+                    )
+                    cond.notify_all()
+                print(
+                    "[battle_talkover][enqueue_pending_dropped]",
+                    f"min_seq={drop_before}",
+                    f"dropped_n={len(dropped)}",
+                    f"expected_seq={int(order['expected_seq'])}",
+                    flush=True,
+                )
             else:
                 assert isinstance(got, _PipelineEnqueueItem)
                 seq = int(got.pipeline_seq)
-                pending[seq] = got
-                order = _ensure_pipeline_enqueue_order(turn_state)
-                if seq != int(order["expected_seq"]):
+                min_keep = int(turn_state.get("pipeline_interrupt_min_seq", 0) or 0)
+                if seq < min_keep:
                     print(
-                        "[sync][enqueue_order][pending]",
+                        "[sync][enqueue_order][interrupt_drop]",
                         f"pipeline_seq={seq}",
-                        f"chunk_idx={int(got.job.playback_chunk_idx)}",
-                        f"expected_seq={int(order['expected_seq'])}",
-                        f"pending_n={len(pending)}",
+                        f"min_seq={min_keep}",
                         flush=True,
                     )
+                else:
+                    pending[seq] = got
+                    order = _ensure_pipeline_enqueue_order(turn_state)
+                    if seq != int(order["expected_seq"]):
+                        print(
+                            "[sync][enqueue_order][pending]",
+                            f"pipeline_seq={seq}",
+                            f"chunk_idx={int(got.job.playback_chunk_idx)}",
+                            f"expected_seq={int(order['expected_seq'])}",
+                            f"pending_n={len(pending)}",
+                            flush=True,
+                        )
 
         order = _ensure_pipeline_enqueue_order(turn_state)
         while int(order["expected_seq"]) in pending:
@@ -2856,6 +3066,11 @@ async def _receive_loop(
     pipeline_seq = 0
     pipeline_active_tasks: list[asyncio.Task[None]] = []
     m0_pipeline_ref = turn_state.get("m0_pipeline_ref")
+    turn_state["pipeline_active_tasks_ref"] = pipeline_active_tasks
+    turn_state["pipeline_next_seq"] = 0
+    turn_state["pipeline_interrupt_min_seq"] = 0
+    if mouth_obj_ref is not None:
+        turn_state["mouth_obj_ref"] = mouth_obj_ref
 
     if bool(pipeline_sync):
         turn_state["pipeline_inflight"] = 0
@@ -2913,6 +3128,18 @@ async def _receive_loop(
                     try:
                         server_content = getattr(msg, "server_content", None)
                         if server_content is not None:
+                            # generation_complete = 入力終了マーカーのみ。
+                            # clear_queue / ループ停止 / tail 打ち切りは禁止（Phase 4）。
+                            if bool(
+                                getattr(server_content, "generation_complete", False)
+                            ):
+                                print(
+                                    "[session_loop][generation_complete]",
+                                    "marker_only",
+                                    "no_clear_queue",
+                                    f"active_turn={turn_state.get('active_turn')}",
+                                    flush=True,
+                                )
                             model_turn = getattr(server_content, "model_turn", None)
                             if model_turn is not None:
                                 parts = getattr(model_turn, "parts", None) or []
@@ -3107,6 +3334,7 @@ async def _receive_loop(
                             if playback_audio:
                                 playback_chunk_idx += 1
                             audio_chunk_idx += 1
+                            turn_state["pipeline_next_seq"] = int(pipeline_seq) + 1
                             task = asyncio.create_task(
                                 _process_pipeline_chunk_task(
                                     job=job,
@@ -4217,6 +4445,7 @@ async def _run(args: argparse.Namespace) -> int:
                 and battle_talkover_cut_in_event.is_set()
             ):
                 # activity_end は _send_mic_once 内で送信済み（audio_stream_end は使わない）
+                # interrupt clear は _battle_interrupt_send_loop 側で実施済み
                 print(
                     "[battle_talkover][activity_end_path]",
                     f"turn={turn_no}",
@@ -4242,8 +4471,6 @@ async def _run(args: argparse.Namespace) -> int:
                     idx_trigger = min(i, len(trigger_list) - 1)
                     response_trigger = trigger_list[idx_trigger]
 
-            consumed_file_control = False
-
             has_pending_interrupt = bool(battle_file_pending_lines)
             has_pending_control = bool(battle_control_lines)
 
@@ -4264,6 +4491,7 @@ async def _run(args: argparse.Namespace) -> int:
                     flush=True,
                 )
 
+            control_text_to_send = ""
             if battle_control_lines:
                 latest_control = battle_control_lines.pop(-1)
 
@@ -4291,6 +4519,7 @@ async def _run(args: argparse.Namespace) -> int:
                 elif latest_text:
                     if battle_control_active_ref is not None:
                         battle_control_active_ref["value"] = latest_text
+                    control_text_to_send = latest_text
 
                 if latest_mic_gate in ("mute", "open"):
                     if battle_mic_gate_ref is not None:
@@ -4318,19 +4547,7 @@ async def _run(args: argparse.Namespace) -> int:
                 else ""
             ).strip()
 
-            if active_control:
-                print(
-                    "[battle_control][apply_active]",
-                    f"turn={turn_no}",
-                    f"active={active_control}",
-                    flush=True,
-                )
-
-                response_trigger = (
-                    f"{response_trigger}\n"
-                    f"【管理者制御】{active_control}"
-                )
-
+            interrupt_text_to_send = ""
             if battle_file_pending_lines:
                 latest_control = battle_file_pending_lines[-1]
 
@@ -4356,7 +4573,7 @@ async def _run(args: argparse.Namespace) -> int:
                         )
 
                         print(
-                            "[battle_interrupt][file_apply_as_control]",
+                            "[battle_interrupt][file_apply_activity_path]",
                             f"turn={turn_no}",
                             f"priority={latest_priority}",
                             f"age_sec={age_sec:.3f}",
@@ -4364,28 +4581,20 @@ async def _run(args: argparse.Namespace) -> int:
                             f"latest={latest}",
                             flush=True,
                         )
-
-                        response_trigger = (
-                            f"{response_trigger}\n"
-                            f"【管理者割り込み予約】{latest}"
-                        )
+                        interrupt_text_to_send = latest
 
                 else:
                     latest = str(latest_control).strip()
                     latest_priority = "normal"
 
                     print(
-                        "[battle_interrupt][file_apply_as_control]",
+                        "[battle_interrupt][file_apply_activity_path]",
                         f"turn={turn_no}",
                         f"priority={latest_priority}",
                         f"latest={latest}",
                         flush=True,
                     )
-
-                    response_trigger = (
-                        f"{response_trigger}\n"
-                        f"【管理者割り込み予約】{latest}"
-                    )
+                    interrupt_text_to_send = latest
 
             if bool(args.skip_response_trigger):
                 print(
@@ -4393,7 +4602,63 @@ async def _run(args: argparse.Namespace) -> int:
                     f"(client VAD / activity_end path)",
                     flush=True,
                 )
+                # Phase 4: battle は方式2整合（activity_end 後の直接 text）。
+                # 通常ターンの response_trigger は復活させない。
+                # active_control の継続保持は emo 用。text 再送は新規 activate 時のみ。
+                # arbitration: interrupt > control（同時時は interrupt のみ送る）
+                if active_control:
+                    print(
+                        "[battle_control][emo_active]",
+                        f"turn={turn_no}",
+                        f"active={active_control}",
+                        flush=True,
+                    )
+                if interrupt_text_to_send:
+                    if bool(args.battle_interrupt_file_immediate_send):
+                        # immediate_send 済み。二重送信しない（pending は consume 用に残す）
+                        print(
+                            "[battle_interrupt][activity_path_skip_already_immediate]",
+                            f"turn={turn_no}",
+                            f"text={interrupt_text_to_send}",
+                            flush=True,
+                        )
+                    else:
+                        prompt = _build_battle_interrupt_prompt(interrupt_text_to_send)
+                        print(
+                            "[battle_interrupt][activity_path_sent]",
+                            f"turn={turn_no}",
+                            f"text={interrupt_text_to_send}",
+                            flush=True,
+                        )
+                        await session.send_realtime_input(text=prompt)
+                elif control_text_to_send:
+                    print(
+                        "[battle_control][activity_path_sent]",
+                        f"turn={turn_no}",
+                        f"text={control_text_to_send}",
+                        flush=True,
+                    )
+                    await session.send_realtime_input(
+                        text=f"【管理者制御】{control_text_to_send}"
+                    )
             else:
+                # debug only: legacy response_trigger 合成（通常運用では skip=True）
+                if active_control:
+                    print(
+                        "[battle_control][apply_active]",
+                        f"turn={turn_no}",
+                        f"active={active_control}",
+                        flush=True,
+                    )
+                    response_trigger = (
+                        f"{response_trigger}\n"
+                        f"【管理者制御】{active_control}"
+                    )
+                if interrupt_text_to_send:
+                    response_trigger = (
+                        f"{response_trigger}\n"
+                        f"【管理者割り込み予約】{interrupt_text_to_send}"
+                    )
                 print(
                     f"[session_loop][response_trigger] "
                     f"turn={turn_no} text={response_trigger}",
@@ -4810,6 +5075,8 @@ async def _run(args: argparse.Namespace) -> int:
                                             if bool(args.battle_talkover_cut_in_on_interrupt)
                                             else None
                                         ),
+                                        audio_player_proc=audio_player_proc,
+                                        turn_state=turn_state,
                                     )
                                 )
 
@@ -5115,9 +5382,9 @@ def main() -> int:
         "--battle_talkover_cut_in_on_interrupt",
         action="store_true",
         help=(
-            "Soft cut-in mode: when battle interrupt is sent, stop mic send early "
-            "and complete the turn via activity_end (not audio_stream_end). "
-            "This is not abort."
+            "Talkover cut-in: on battle interrupt, stop mic early, send activity_end, "
+            "then interrupt-exception clear_queue + cancel in-flight chunk tasks "
+            "(not audio_stream_end). Normal turns still never clear before tail drain."
         ),
     )
     ap.add_argument(
