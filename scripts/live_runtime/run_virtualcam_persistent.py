@@ -71,15 +71,75 @@ def _read_bg_override(path: Path | None, last_mtime: float) -> tuple[dict | None
     return obj, mtime
 
 
-def _get_pngs(fg_dir: Path) -> list[Path]:
-    if not fg_dir.exists():
-        return []
-    return sorted(fg_dir.glob("*.png"))
+def _read_json_file(path: Path | None) -> dict | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8-sig").strip()
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_ssot_target(
+    *,
+    playback_state: dict | None,
+    sync_meta: dict | None,
+    step_ms: int,
+    frame_offset_cli: int,
+) -> dict:
+    """Map player played_samples → mouth/M0 audio_ms → target PNG frame index."""
+    step = int(step_ms)
+    if sync_meta is not None and int(sync_meta.get("step_ms", 0) or 0) > 0:
+        step = int(sync_meta.get("step_ms") or step)
+
+    frame_offset = int(frame_offset_cli)
+    origin_ms = 0
+    base_samples = 0
+    if sync_meta is not None:
+        frame_offset = int(sync_meta.get("frame_offset", frame_offset) or frame_offset)
+        origin_ms = int(sync_meta.get("playback_origin_ms", 0) or 0)
+        base_samples = int(sync_meta.get("base_played_samples", 0) or 0)
+
+    state = "UNKNOWN"
+    played_samples = 0
+    player_local_ms = 0.0
+    sample_rate = 24000
+    if playback_state is not None:
+        state = str(playback_state.get("state", "UNKNOWN") or "UNKNOWN")
+        played_samples = int(playback_state.get("played_samples", 0) or 0)
+        sample_rate = int(playback_state.get("sample_rate", 24000) or 24000)
+        if sample_rate <= 0:
+            sample_rate = 24000
+        if "player_local_ms" in playback_state:
+            player_local_ms = float(playback_state.get("player_local_ms") or 0.0)
+        else:
+            player_local_ms = float(played_samples) * 1000.0 / float(sample_rate)
+
+    rel_samples = max(0, int(played_samples) - int(base_samples))
+    audio_ms = int(rel_samples * 1000.0 / float(sample_rate))
+    target_t_ms = int(origin_ms) + int(audio_ms)
+    target_frame = int(frame_offset) + int(target_t_ms // max(1, step))
+
+    return {
+        "state": state,
+        "played_samples": int(played_samples),
+        "player_local_ms": float(player_local_ms),
+        "audio_ms": int(audio_ms),
+        "target_t_ms": int(target_t_ms),
+        "target_frame": int(target_frame),
+        "frame_offset": int(frame_offset),
+        "step_ms": int(step),
+        "base_played_samples": int(base_samples),
+    }
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Persistent virtualcam: watch FG PNG dir and stream to OBS"
+        description="Persistent virtualcam: audio_ms SSOT FG select → OBS"
     )
 
     ap.add_argument("--fg_dir", required=True)
@@ -89,6 +149,28 @@ def main() -> int:
         default=None,
         help="JSON file for temporary BG video override.",
     )
+    ap.add_argument(
+        "--playback_state_file",
+        default=None,
+        help="Player-published JSON with played_samples / player_local_ms.",
+    )
+    ap.add_argument(
+        "--sync_meta_file",
+        default=None,
+        help="session_loop JSON: frame_offset / base_played_samples / step_ms.",
+    )
+    ap.add_argument(
+        "--step_ms",
+        type=int,
+        default=40,
+        help="Mouth/M0 frame step (ms). Must match session_loop --step_ms.",
+    )
+    ap.add_argument(
+        "--frame_offset",
+        type=int,
+        default=0,
+        help="Fallback frame_offset if sync_meta_file absent.",
+    )
 
     ap.add_argument("--fps", type=int, default=25)
     ap.add_argument("--width", type=int, default=720)
@@ -97,7 +179,11 @@ def main() -> int:
     ap.add_argument("--poll_s", type=float, default=0.02)
     ap.add_argument("--idle_hold", action="store_true")
     ap.add_argument("--loop_bg", action="store_true")
-    ap.add_argument("--loop_fg", action="store_true")
+    ap.add_argument(
+        "--loop_fg",
+        action="store_true",
+        help="Legacy flag (ignored in audio_ms SSOT mode).",
+    )
 
     args = ap.parse_args()
 
@@ -108,6 +194,14 @@ def main() -> int:
         Path(args.bg_override_file).resolve()
         if args.bg_override_file
         else None
+    )
+    playback_state_file = (
+        Path(args.playback_state_file).resolve()
+        if args.playback_state_file
+        else None
+    )
+    sync_meta_file = (
+        Path(args.sync_meta_file).resolve() if args.sync_meta_file else None
     )
 
     cap = _open_bg_capture(bg_video)
@@ -120,16 +214,27 @@ def main() -> int:
     height = int(args.height)
     fps = int(args.fps)
 
-    idx = 0
     sent = 0
     last_rgb = None
     last_fg = None
+    last_displayed_frame: int | None = None
+    last_logged_target = None
+    ssot_enabled = playback_state_file is not None
 
     print("[virtualcam_persistent][START]", flush=True)
     print(f"  fg_dir  : {fg_dir}", flush=True)
     print(f"  bg_video: {bg_video}", flush=True)
     if bg_override_file is not None:
         print(f"  bg_override_file: {bg_override_file}", flush=True)
+    print(
+        "[virtualcam_persistent][ssot]",
+        f"mode={'audio_ms' if ssot_enabled else 'idle_only_no_playback_state'}",
+        f"playback_state_file={playback_state_file}",
+        f"sync_meta_file={sync_meta_file}",
+        f"step_ms={int(args.step_ms)}",
+        "sequential_idx=disabled",
+        flush=True,
+    )
 
     with pyvirtualcam.Camera(
         width=width,
@@ -203,55 +308,19 @@ def main() -> int:
                         flush=True,
                     )
 
-            pngs = _get_pngs(fg_dir)
-
-            # --- 修正箇所：置換ブロック ---
-            if idx >= len(pngs):
-                if override_active:
-                    ok, bg = cap.read()
-                    if not ok:
-                        if args.loop_bg:
-                            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                            ok, bg = cap.read()
-                        if not ok:
-                            print("[virtualcam_persistent][bg_override_frame_warn] failed to read bg frame", flush=True)
-                            time.sleep(float(args.poll_s))
-                            continue
-
-                    bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
-                    comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
-
-                    cam.send(comp_rgb)
-                    cam.sleep_until_next_frame()
-
-                    last_rgb = comp_rgb
-                    sent += 1
-
-                    if sent % 25 == 0:
-                        print(f"[virtualcam_persistent] sent={sent}", flush=True)
-
-                    continue
-
-                elif args.loop_fg and len(pngs) > 0:
-                    idx = 0
-                    continue
-                elif args.idle_hold and last_rgb is not None:
-                    cam.send(last_rgb)
-                    cam.sleep_until_next_frame()
-                    continue
-                else:
-                    time.sleep(float(args.poll_s))
-                    continue
-            # ------------------------------
-
-            fg_path = pngs[idx]
-
             ok, bg = cap.read()
             if not ok:
                 if args.loop_bg:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     ok, bg = cap.read()
                 if not ok:
+                    if override_active:
+                        print(
+                            "[virtualcam_persistent][bg_override_frame_warn] failed to read bg frame",
+                            flush=True,
+                        )
+                        time.sleep(float(args.poll_s))
+                        continue
                     raise RuntimeError("failed to read bg frame")
 
             bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
@@ -267,6 +336,57 @@ def main() -> int:
                 if sent % 25 == 0:
                     print(f"[virtualcam_persistent] sent={sent}", flush=True)
 
+                continue
+
+            fg_path: Path | None = None
+            target = None
+            missing_png = False
+
+            if ssot_enabled:
+                playback_state = _read_json_file(playback_state_file)
+                sync_meta = _read_json_file(sync_meta_file)
+                target = _resolve_ssot_target(
+                    playback_state=playback_state,
+                    sync_meta=sync_meta,
+                    step_ms=int(args.step_ms),
+                    frame_offset_cli=int(args.frame_offset),
+                )
+                # Follow audio only while actually playing; hold otherwise.
+                if str(target["state"]) == "PLAYING":
+                    cand = fg_dir / f"{int(target['target_frame']):08d}.png"
+                    if cand.exists():
+                        fg_path = cand
+                    else:
+                        missing_png = True
+                        if last_logged_target != (
+                            int(target["audio_ms"]),
+                            int(target["target_frame"]),
+                            "missing",
+                        ):
+                            print(
+                                "[sync][virtualcam][SSOT_WAIT]",
+                                f"audio_ms={int(target['audio_ms'])}",
+                                f"player_local_ms={float(target['player_local_ms']):.1f}",
+                                f"target_frame={int(target['target_frame'])}",
+                                f"displayed_frame={last_displayed_frame}",
+                                f"state={target['state']}",
+                                flush=True,
+                            )
+                            last_logged_target = (
+                                int(target["audio_ms"]),
+                                int(target["target_frame"]),
+                                "missing",
+                            )
+
+            if fg_path is None:
+                if args.idle_hold and last_rgb is not None:
+                    cam.send(last_rgb)
+                    cam.sleep_until_next_frame()
+                    sent += 1
+                    if sent % 25 == 0:
+                        print(f"[virtualcam_persistent] sent={sent}", flush=True)
+                    continue
+                time.sleep(float(args.poll_s))
                 continue
 
             fg = None
@@ -313,7 +433,28 @@ def main() -> int:
 
             last_rgb = comp_rgb
             sent += 1
-            idx += 1
+            if target is not None:
+                last_displayed_frame = int(target["target_frame"])
+                log_key = (
+                    int(target["audio_ms"]),
+                    int(target["target_frame"]),
+                    "ok",
+                )
+                if last_logged_target != log_key and (
+                    sent % 5 == 0 or missing_png or last_logged_target is None
+                ):
+                    print(
+                        "[sync][virtualcam]",
+                        f"audio_ms={int(target['audio_ms'])}",
+                        f"player_local_ms={float(target['player_local_ms']):.1f}",
+                        f"target_frame={int(target['target_frame'])}",
+                        f"displayed_frame={int(target['target_frame'])}",
+                        f"frame_offset={int(target['frame_offset'])}",
+                        f"step_ms={int(target['step_ms'])}",
+                        f"state={target['state']}",
+                        flush=True,
+                    )
+                    last_logged_target = log_key
 
             if sent % 25 == 0:
                 print(f"[virtualcam_persistent] sent={sent}", flush=True)

@@ -54,6 +54,7 @@ class PersistentPcmPlayer:
         start_fallback_ms: int = 1000,
         rebuffer_target_ms: int = 240,
         min_start_pcm_ms: int = 20,
+        playback_state_file: Path | None = None,
     ) -> None:
         self.sr = int(sr)
         self.device = _device_arg(device)
@@ -63,6 +64,9 @@ class PersistentPcmPlayer:
         self.start_fallback_ms = max(0, int(start_fallback_ms))
         self.rebuffer_target_ms = max(0, int(rebuffer_target_ms))
         self.min_start_pcm_ms = max(0, int(min_start_pcm_ms))
+        self.playback_state_file = (
+            Path(playback_state_file).resolve() if playback_state_file else None
+        )
 
         self.initial_buffer_samples = int(
             self.sr * self.initial_buffer_ms / 1000
@@ -100,6 +104,9 @@ class PersistentPcmPlayer:
         # Alias for older response consumers / log greps.
         self.underrun_count = 0
 
+        self._state_stop = threading.Event()
+        self._state_thread: threading.Thread | None = None
+
         self.stream = sd.OutputStream(
             samplerate=self.sr,
             device=self.device,
@@ -109,6 +116,7 @@ class PersistentPcmPlayer:
             blocksize=0,
         )
         self.stream.start()
+        self._start_playback_state_publisher()
 
         print(
             "[audio_chunk_player_persistent][STREAM_START]",
@@ -141,11 +149,15 @@ class PersistentPcmPlayer:
 
     def _stats_locked(self) -> dict:
         pending_samples = max(0, int(self.pending_samples))
+        played_samples = int(self.played_samples)
+        player_local_ms = round(self._samples_to_ms(played_samples), 3)
         return {
             "state": str(self.state),
             "pending_samples": pending_samples,
             "pending_ms": round(self._samples_to_ms(pending_samples), 3),
-            "played_samples": int(self.played_samples),
+            "played_samples": played_samples,
+            "player_local_ms": player_local_ms,
+            "sample_rate": int(self.sr),
             "queued_samples_total": int(self.queued_samples),
             "play_requests": int(self.play_requests),
             "active_playback_underrun_count": int(
@@ -159,6 +171,61 @@ class PersistentPcmPlayer:
             "rebuffer_target_ms": int(self.rebuffer_target_ms),
             "min_start_pcm_ms": int(self.min_start_pcm_ms),
         }
+
+    def _start_playback_state_publisher(self) -> None:
+        if self.playback_state_file is None:
+            return
+        self.playback_state_file.parent.mkdir(parents=True, exist_ok=True)
+        self._write_playback_state_file()
+        self._state_thread = threading.Thread(
+            target=self._playback_state_publisher_loop,
+            name="playback_state_publisher",
+            daemon=True,
+        )
+        self._state_thread.start()
+
+    def _playback_state_publisher_loop(self) -> None:
+        # Publish outside the audio callback to avoid callback I/O glitches.
+        while not self._state_stop.wait(0.02):
+            try:
+                self._write_playback_state_file()
+            except Exception:
+                pass
+
+    def _write_playback_state_file(self) -> None:
+        if self.playback_state_file is None:
+            return
+        with self.lock:
+            stats = self._stats_locked()
+        payload = {
+            "ok": True,
+            "played_samples": int(stats["played_samples"]),
+            "player_local_ms": float(stats["player_local_ms"]),
+            "sample_rate": int(stats["sample_rate"]),
+            "state": str(stats["state"]),
+            "pending_ms": float(stats["pending_ms"]),
+            "playout_started_at": stats["playout_started_at"],
+            "updated_mono_s": float(time.monotonic()),
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+        tmp = self.playback_state_file.with_suffix(
+            self.playback_state_file.suffix + ".tmp"
+        )
+        tmp.write_text(text, encoding="utf-8")
+        replaced = False
+        for _ in range(8):
+            try:
+                tmp.replace(self.playback_state_file)
+                replaced = True
+                break
+            except PermissionError:
+                time.sleep(0.005)
+        if not replaced:
+            self.playback_state_file.write_text(text, encoding="utf-8")
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _emit_playout_transition(self, transition: dict, stats: dict) -> None:
         print(
@@ -210,10 +277,18 @@ class PersistentPcmPlayer:
         )
 
     def close(self) -> None:
+        self._state_stop.set()
+        if self._state_thread is not None:
+            self._state_thread.join(timeout=0.5)
+            self._state_thread = None
         try:
             self.stream.stop()
         finally:
             self.stream.close()
+        try:
+            self._write_playback_state_file()
+        except Exception:
+            pass
 
     def enqueue(self, audio: np.ndarray) -> dict:
         if audio.dtype != np.int16:
@@ -589,6 +664,11 @@ def main() -> int:
             "(drops tiny leading slices like samples=1)."
         ),
     )
+    ap.add_argument(
+        "--playback_state_file",
+        default=None,
+        help="JSON path publishing played_samples / player_local_ms for VirtualCam SSOT.",
+    )
     args = ap.parse_args()
 
     if int(args.initial_buffer_ms) < 0:
@@ -600,6 +680,12 @@ def main() -> int:
     if int(args.min_start_pcm_ms) < 0:
         raise SystemExit("--min_start_pcm_ms must be >= 0")
 
+    playback_state_file = (
+        Path(args.playback_state_file).resolve()
+        if args.playback_state_file
+        else None
+    )
+
     player = PersistentPcmPlayer(
         sr=int(args.sr),
         device=args.device,
@@ -608,6 +694,7 @@ def main() -> int:
         start_fallback_ms=int(args.start_fallback_ms),
         rebuffer_target_ms=int(args.rebuffer_target_ms),
         min_start_pcm_ms=int(args.min_start_pcm_ms),
+        playback_state_file=playback_state_file,
     )
 
     print(

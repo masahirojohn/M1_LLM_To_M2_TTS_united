@@ -3491,6 +3491,68 @@ async def _receive_loop(
             pass
 
 
+def _read_played_samples_from_state_file(path: Path | None) -> int:
+    if path is None or not path.exists():
+        return 0
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(obj, dict):
+            return int(obj.get("played_samples", 0) or 0)
+    except Exception:
+        return 0
+    return 0
+
+
+def _write_virtualcam_sync_meta(
+    path: Path | None,
+    *,
+    frame_offset: int,
+    step_ms: int,
+    base_played_samples: int,
+    playback_origin_ms: int = 0,
+    turn_no: int | None = None,
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "type": "virtualcam_sync_meta",
+        "frame_offset": int(frame_offset),
+        "step_ms": int(step_ms),
+        "base_played_samples": int(base_played_samples),
+        "playback_origin_ms": int(playback_origin_ms),
+        "turn_no": int(turn_no) if turn_no is not None else None,
+        "updated_mono_s": float(time.monotonic()),
+    }
+    text = json.dumps(payload, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    replaced = False
+    for _ in range(8):
+        try:
+            tmp.replace(path)
+            replaced = True
+            break
+        except PermissionError:
+            # Windows: reader (virtualcam) may briefly lock the target.
+            time.sleep(0.01)
+    if not replaced:
+        path.write_text(text, encoding="utf-8")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+    print(
+        "[sync][virtualcam_meta]",
+        f"frame_offset={int(frame_offset)}",
+        f"step_ms={int(step_ms)}",
+        f"base_played_samples={int(base_played_samples)}",
+        f"playback_origin_ms={int(playback_origin_ms)}",
+        f"turn_no={turn_no}",
+        flush=True,
+    )
+
+
 def _start_virtualcam(
     *,
     py: Path,
@@ -3503,6 +3565,10 @@ def _start_virtualcam(
     cwd: Path,
     env: dict[str, str],
     bg_override_file: Path | None = None,
+    playback_state_file: Path | None = None,
+    sync_meta_file: Path | None = None,
+    step_ms: int = 40,
+    frame_offset: int = 0,
 ) -> subprocess.Popen:
     cmd = [
         str(py),
@@ -3519,6 +3585,10 @@ def _start_virtualcam(
         str(int(height)),
         "--idle_hold",
         "--loop_bg",
+        "--step_ms",
+        str(int(step_ms)),
+        "--frame_offset",
+        str(int(frame_offset)),
     ]
 
     if bg_override_file is not None:
@@ -3526,6 +3596,20 @@ def _start_virtualcam(
             [
                 "--bg_override_file",
                 str(bg_override_file),
+            ]
+        )
+    if playback_state_file is not None:
+        cmd.extend(
+            [
+                "--playback_state_file",
+                str(Path(playback_state_file).resolve()),
+            ]
+        )
+    if sync_meta_file is not None:
+        cmd.extend(
+            [
+                "--sync_meta_file",
+                str(Path(sync_meta_file).resolve()),
             ]
         )
 
@@ -3643,6 +3727,21 @@ async def _run(args: argparse.Namespace) -> int:
     )
     bg_override_file.parent.mkdir(parents=True, exist_ok=True)
     bg_override_file.write_text("", encoding="utf-8")
+
+    # Phase 5: player clock + turn timeline meta for VirtualCam audio_ms SSOT.
+    sync_dir = out_root / "sync"
+    sync_dir.mkdir(parents=True, exist_ok=True)
+    playback_state_file = sync_dir / "playback_state.json"
+    virtualcam_sync_meta_file = sync_dir / "virtualcam_sync_meta.json"
+    _write_virtualcam_sync_meta(
+        virtualcam_sync_meta_file,
+        frame_offset=0,
+        step_ms=int(args.step_ms),
+        base_played_samples=0,
+        playback_origin_ms=0,
+        turn_no=0,
+    )
+
     knn_script = m3_repo / "tools" / "knn_from_formant_raw_to_mouth_timeline.py"
 
     base_cfg_path = (
@@ -3677,6 +3776,10 @@ async def _run(args: argparse.Namespace) -> int:
             cwd=m1_repo,
             env=env,
             bg_override_file=bg_override_file,
+            playback_state_file=playback_state_file,
+            sync_meta_file=virtualcam_sync_meta_file,
+            step_ms=int(args.step_ms),
+            frame_offset=0,
         )
 
         print("[session_loop] start m0 tcp worker", flush=True)
@@ -3711,6 +3814,7 @@ async def _run(args: argparse.Namespace) -> int:
             start_fallback_ms=int(args.audio_player_start_fallback_ms),
             rebuffer_target_ms=int(args.audio_player_rebuffer_target_ms),
             min_start_pcm_ms=int(args.audio_player_min_start_pcm_ms),
+            playback_state_file=playback_state_file,
         )
 
         mouth_streamer = None
@@ -4277,6 +4381,21 @@ async def _run(args: argparse.Namespace) -> int:
                 getattr(args, "fast_inmemory", False)
                 and getattr(args, "skip_archive_pcm", False)
             )
+
+            # VirtualCam SSOT: align PNG index to player audio_ms for this turn.
+            base_played = _read_played_samples_from_state_file(playback_state_file)
+            _write_virtualcam_sync_meta(
+                virtualcam_sync_meta_file,
+                frame_offset=int(next_frame_offset),
+                step_ms=int(args.step_ms),
+                base_played_samples=int(base_played),
+                playback_origin_ms=0,
+                turn_no=int(turn_no),
+            )
+            playback_ref_init = turn_state["audio_playback_state_ref"]
+            with playback_ref_init["lock"]:
+                playback_ref_init["response_playback_base_samples"] = int(base_played)
+                playback_ref_init["playback_origin_ms"] = 0
 
             mouth_obj_ref: dict[str, Any] = {"obj": None}
             pipeline_sync = bool(getattr(args, "pipeline_sync", True))

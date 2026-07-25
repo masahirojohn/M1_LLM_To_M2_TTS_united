@@ -305,27 +305,36 @@ def _start_audio_player(
     start_fallback_ms: int = 1000,
     rebuffer_target_ms: int = 240,
     min_start_pcm_ms: int = 20,
+    playback_state_file: Path | None = None,
 ) -> subprocess.Popen:
     # Phase 3: data-amount jitter knobs (distinct from M0 hang timeout).
+    cmd = [
+        str(py),
+        str(audio_script),
+        "--device",
+        str(audio_device),
+        "--sr",
+        "24000",
+        "--chunk_ms",
+        "400",
+        "--initial_buffer_ms",
+        str(int(initial_buffer_ms)),
+        "--start_fallback_ms",
+        str(int(start_fallback_ms)),
+        "--rebuffer_target_ms",
+        str(int(rebuffer_target_ms)),
+        "--min_start_pcm_ms",
+        str(int(min_start_pcm_ms)),
+    ]
+    if playback_state_file is not None:
+        cmd.extend(
+            [
+                "--playback_state_file",
+                str(Path(playback_state_file).resolve()),
+            ]
+        )
     proc = subprocess.Popen(
-        [
-            str(py),
-            str(audio_script),
-            "--device",
-            str(audio_device),
-            "--sr",
-            "24000",
-            "--chunk_ms",
-            "400",
-            "--initial_buffer_ms",
-            str(int(initial_buffer_ms)),
-            "--start_fallback_ms",
-            str(int(start_fallback_ms)),
-            "--rebuffer_target_ms",
-            str(int(rebuffer_target_ms)),
-            "--min_start_pcm_ms",
-            str(int(min_start_pcm_ms)),
-        ],
+        cmd,
         cwd=str(cwd),
         env=env,
         stdin=subprocess.PIPE,
