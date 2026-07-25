@@ -301,7 +301,12 @@ def _start_audio_player(
     audio_device: str,
     cwd: Path,
     env: dict[str, str],
+    initial_buffer_ms: int = 300,
+    start_fallback_ms: int = 1000,
+    rebuffer_target_ms: int = 240,
+    min_start_pcm_ms: int = 20,
 ) -> subprocess.Popen:
+    # Phase 3: data-amount jitter knobs (distinct from M0 hang timeout).
     proc = subprocess.Popen(
         [
             str(py),
@@ -312,6 +317,14 @@ def _start_audio_player(
             "24000",
             "--chunk_ms",
             "400",
+            "--initial_buffer_ms",
+            str(int(initial_buffer_ms)),
+            "--start_fallback_ms",
+            str(int(start_fallback_ms)),
+            "--rebuffer_target_ms",
+            str(int(rebuffer_target_ms)),
+            "--min_start_pcm_ms",
+            str(int(min_start_pcm_ms)),
         ],
         cwd=str(cwd),
         env=env,

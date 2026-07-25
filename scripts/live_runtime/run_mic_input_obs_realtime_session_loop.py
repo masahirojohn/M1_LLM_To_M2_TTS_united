@@ -3463,12 +3463,26 @@ async def _run(args: argparse.Namespace) -> int:
         time.sleep(1.0)
 
         print("[session_loop] start audio player", flush=True)
+        print(
+            "[audio_player][config]",
+            f"initial_buffer_ms={int(args.audio_player_initial_buffer_ms)}",
+            f"start_fallback_ms={int(args.audio_player_start_fallback_ms)}",
+            f"rebuffer_target_ms={int(args.audio_player_rebuffer_target_ms)}",
+            f"min_start_pcm_ms={int(args.audio_player_min_start_pcm_ms)}",
+            f"m0_hang_timeout_ms={int(_M0_PIPELINE_HANG_TIMEOUT_MS)}",
+            "(jitter≠m0_hang; min_start≠hang)",
+            flush=True,
+        )
         audio_player_proc = _start_audio_player(
             py=py,
             audio_script=audio_script,
             audio_device=str(args.ai_audio_output_device),
             cwd=m1_repo,
             env=env,
+            initial_buffer_ms=int(args.audio_player_initial_buffer_ms),
+            start_fallback_ms=int(args.audio_player_start_fallback_ms),
+            rebuffer_target_ms=int(args.audio_player_rebuffer_target_ms),
+            min_start_pcm_ms=int(args.audio_player_min_start_pcm_ms),
         )
 
         mouth_streamer = None
@@ -5021,6 +5035,41 @@ def main() -> int:
 
     ap.add_argument("--audio_device", default="15")
     ap.add_argument("--input_sr", type=int, default=16000)
+
+    # --- Phase 3: player data-amount jitter (≠ M0 hang timeout) ---
+    ap.add_argument(
+        "--audio_player_initial_buffer_ms",
+        type=int,
+        default=300,
+        help=(
+            "Initial jitter: queued audio ms before playout starts "
+            "(data-amount trigger; typical 300-500). Distinct from M0 hang."
+        ),
+    )
+    ap.add_argument(
+        "--audio_player_start_fallback_ms",
+        type=int,
+        default=1000,
+        help=(
+            "Force playout if initial buffer not reached after this many ms "
+            "from first enqueued sample (prevents infinite wait)."
+        ),
+    )
+    ap.add_argument(
+        "--audio_player_rebuffer_target_ms",
+        type=int,
+        default=240,
+        help="Rebuffer data-amount target after an active-playback underrun.",
+    )
+    ap.add_argument(
+        "--audio_player_min_start_pcm_ms",
+        type=int,
+        default=20,
+        help=(
+            "Drop PCM shorter than this from player queue/clock/fallback "
+            "(Hotfix for tiny leading slices; default 20ms)."
+        ),
+    )
 
     # --- [ADD] Battle Runtime audio routing ---
     ap.add_argument(
