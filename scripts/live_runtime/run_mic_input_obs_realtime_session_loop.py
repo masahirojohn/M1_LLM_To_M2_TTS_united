@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob
 import importlib.util
 import inspect
 import json
@@ -489,12 +490,14 @@ def _project_streamer_obj_to_raw(streamer: MouthStreamerOC) -> dict[str, Any]:
     }
 
 
+_KNN_MODULE_CACHE: dict[str, Any] = {}
 _KNN_FUNC_CACHE: dict[str, Any] = {}
+_KNN_GT_CACHE: dict[str, dict[str, Any]] = {}
 
 
-def _load_knn_from_raw_obj_fn(*, knn_script: Path) -> Any:
+def _load_knn_runtime_module(*, knn_script: Path) -> Any:
     key = str(knn_script.resolve())
-    if key not in _KNN_FUNC_CACHE:
+    if key not in _KNN_MODULE_CACHE:
         spec = importlib.util.spec_from_file_location(
             "knn_from_formant_raw_to_mouth_timeline_runtime",
             str(knn_script.resolve()),
@@ -509,8 +512,83 @@ def _load_knn_from_raw_obj_fn(*, knn_script: Path) -> Any:
         if fn is None:
             raise RuntimeError(f"missing run_knn_from_raw_obj(): {knn_script}")
 
+        _KNN_MODULE_CACHE[key] = mod
         _KNN_FUNC_CACHE[key] = fn
-    return _KNN_FUNC_CACHE[key]
+    return _KNN_MODULE_CACHE[key]
+
+
+def _load_knn_from_raw_obj_fn(*, knn_script: Path) -> Any:
+    _load_knn_runtime_module(knn_script=knn_script)
+    return _KNN_FUNC_CACHE[str(knn_script.resolve())]
+
+
+def _ensure_knn_gt_runtime(*, knn_script: Path, gt_glob: str) -> dict[str, Any]:
+    """Cache GT DB + z-score once per (knn_script, gt_glob). Phase 7 O(N²) fix."""
+    cache_key = f"{knn_script.resolve()}|{gt_glob}"
+    if cache_key not in _KNN_GT_CACHE:
+        mod = _load_knn_runtime_module(knn_script=knn_script)
+        gt_paths = sorted(glob.glob(str(gt_glob)))
+        if not gt_paths:
+            raise RuntimeError(f"[knn] no gt files matched: {gt_glob}")
+
+        db = mod._load_knn_db(gt_paths)
+        z = mod._compute_z(db)
+        db_z = [(mod._z_point(f1, f2, z), vid) for (f1, f2, vid) in db]
+        _KNN_GT_CACHE[cache_key] = {
+            "mod": mod,
+            "db_z": db_z,
+            "z": z,
+        }
+    return _KNN_GT_CACHE[cache_key]
+
+
+def _knn_mouth_frames_from_raw_frames(
+    *,
+    frames_in: list[dict[str, Any]],
+    gt_runtime: dict[str, Any],
+    k: int = 5,
+    fallback_id_active: int = 2,
+    min_conf_ratio: float = 1.0,
+) -> list[dict[str, Any]]:
+    mod = gt_runtime["mod"]
+    db_z = gt_runtime["db_z"]
+    z = gt_runtime["z"]
+    out_frames: list[dict[str, Any]] = []
+
+    for fr in frames_in:
+        t_ms = fr.get("t_ms")
+        vad = fr.get("vad_active")
+        if t_ms is None:
+            continue
+
+        t_ms = int(t_ms)
+        vad = int(vad) if vad is not None else 0
+        if vad == 0:
+            out_frames.append({"t_ms": t_ms, "mouth_id": 0})
+            continue
+
+        f1 = fr.get("f1_hz")
+        f2 = fr.get("f2_hz")
+        if not (
+            isinstance(f1, (int, float))
+            and isinstance(f2, (int, float))
+            and f1 == f1
+            and f2 == f2
+        ):
+            mid = int(fallback_id_active)
+            if mid == 0:
+                mid = 2
+            out_frames.append({"t_ms": t_ms, "mouth_id": mid})
+            continue
+
+        qz = mod._z_point(float(f1), float(f2), z)
+        pred, top, top2 = mod._predict_knn(qz, db_z, int(k))
+        ratio = (top / top2) if top2 > 0 else 999.0
+        if ratio < float(min_conf_ratio):
+            pred = int(fallback_id_active) if int(fallback_id_active) != 0 else 2
+        out_frames.append({"t_ms": t_ms, "mouth_id": int(pred)})
+
+    return out_frames
 
 
 def _run_knn_from_raw_obj(
@@ -520,20 +598,92 @@ def _run_knn_from_raw_obj(
     gt_glob: str,
     step_ms: int,
 ) -> tuple[dict[str, Any], float]:
-    """Phase 5b knn_inmemory: run KNN from raw_obj without raw/mouth JSON I/O."""
+    """Run KNN from raw_obj with cached GT DB (no per-call GT reload)."""
     t0 = time.perf_counter()
-    fn = _load_knn_from_raw_obj_fn(knn_script=knn_script)
-    out_obj = fn(
-        raw_obj=raw_obj,
-        gt_glob=str(gt_glob),
-        step_ms=int(step_ms),
-        k=5,
-        fallback_id_active=2,
-        min_conf_ratio=1.0,
+    gt_runtime = _ensure_knn_gt_runtime(knn_script=knn_script, gt_glob=gt_glob)
+    frames_in = list(raw_obj.get("frames") or [])
+    out_frames = _knn_mouth_frames_from_raw_frames(
+        frames_in=frames_in,
+        gt_runtime=gt_runtime,
     )
-    if not isinstance(out_obj, dict):
-        raise RuntimeError("run_knn_from_raw_obj returned non-dict")
+    out_obj = {
+        "audio": "",
+        "step_ms": int(step_ms),
+        "frames": out_frames,
+    }
     return out_obj, time.perf_counter() - t0
+
+
+def _run_knn_incremental_from_raw_obj(
+    *,
+    knn_script: Path,
+    raw_obj: dict[str, Any],
+    gt_glob: str,
+    step_ms: int,
+    mouth_obj_ref: dict[str, Any],
+) -> tuple[dict[str, Any], float, int, int]:
+    """Delta-only KNN: process new raw frames and append to mouth_obj_ref.
+
+    Safe under 図A because push+KNN is serialized by pipeline_seq.
+    """
+    t0 = time.perf_counter()
+    raw_frames = list(raw_obj.get("frames") or [])
+    prev_n = int(mouth_obj_ref.get("knn_raw_frames_done", 0) or 0)
+
+    if len(raw_frames) < prev_n:
+        prev_n = 0
+        mouth_obj_ref["obj"] = None
+
+    if len(raw_frames) == prev_n:
+        existing = mouth_obj_ref.get("obj")
+        if isinstance(existing, dict):
+            total_n = len(existing.get("frames") or existing.get("timeline") or [])
+            return existing, 0.0, 0, int(total_n)
+        prev_n = 0
+
+    delta_frames = raw_frames[prev_n:]
+    if not delta_frames:
+        existing = mouth_obj_ref.get("obj")
+        if isinstance(existing, dict):
+            total_n = len(existing.get("frames") or existing.get("timeline") or [])
+            return existing, 0.0, 0, int(total_n)
+        out_obj = {
+            "audio": "",
+            "step_ms": int(step_ms),
+            "frames": [],
+        }
+        mouth_obj_ref["knn_raw_frames_done"] = len(raw_frames)
+        mouth_obj_ref["obj"] = out_obj
+        return out_obj, time.perf_counter() - t0, 0, 0
+
+    gt_runtime = _ensure_knn_gt_runtime(knn_script=knn_script, gt_glob=gt_glob)
+    delta_out = _knn_mouth_frames_from_raw_frames(
+        frames_in=delta_frames,
+        gt_runtime=gt_runtime,
+    )
+
+    prev_obj = mouth_obj_ref.get("obj")
+    if isinstance(prev_obj, dict) and prev_n > 0:
+        prev_mouth_frames = list(
+            prev_obj.get("frames") or prev_obj.get("timeline") or []
+        )
+    else:
+        prev_mouth_frames = []
+
+    merged_frames = prev_mouth_frames + delta_out
+    out_obj = {
+        "audio": "",
+        "step_ms": int(step_ms),
+        "frames": merged_frames,
+    }
+    mouth_obj_ref["knn_raw_frames_done"] = len(raw_frames)
+    mouth_obj_ref["obj"] = out_obj
+    return (
+        out_obj,
+        time.perf_counter() - t0,
+        len(delta_frames),
+        len(merged_frames),
+    )
 
 
 def _run_knn_in_process(
@@ -544,23 +694,19 @@ def _run_knn_in_process(
     gt_glob: str,
     step_ms: int,
 ) -> float:
-    t0 = time.perf_counter()
-    fn = _load_knn_from_raw_obj_fn(knn_script=knn_script)
     raw_obj = json.loads(raw_json.read_text(encoding="utf-8"))
-
-    out_obj = fn(
+    out_obj, elapsed = _run_knn_from_raw_obj(
+        knn_script=knn_script,
         raw_obj=raw_obj,
-        gt_glob=str(gt_glob),
-        step_ms=int(step_ms),
-        k=5,
-        fallback_id_active=2,
-        min_conf_ratio=1.0,
+        gt_glob=gt_glob,
+        step_ms=step_ms,
     )
-
     out_json.parent.mkdir(parents=True, exist_ok=True)
-    out_json.write_text(json.dumps(out_obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    return time.perf_counter() - t0
+    out_json.write_text(
+        json.dumps(out_obj, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    return elapsed
 
 
 async def _send_mic_once(
@@ -974,6 +1120,8 @@ def _clear_draw_queue_state(turn_state: dict[str, Any]) -> None:
                 obj["timeline"] = []
                 cleared = True
         mouth_ref["obj"] = {"frames": [], "timeline": []} if not isinstance(obj, dict) else obj
+        # Phase 7: reset incremental cursor so next KNN rebuilds from raw[0:].
+        mouth_ref["knn_raw_frames_done"] = 0
         cleared = True
     print(
         "[battle_talkover][draw_queue_cleared]",
@@ -2448,8 +2596,9 @@ def _process_audio_chunk_knn_sync(
     turn_state: dict[str, Any],
 ) -> int:
     if not bool(job.knn_inmemory):
+        # Phase 7: compact JSON (indent=2 grew with N and inflated knn_ms on OFF path).
         job.mouth_raw_json.write_text(
-            json.dumps(raw_obj, ensure_ascii=False, indent=2),
+            json.dumps(raw_obj, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
 
@@ -2465,8 +2614,37 @@ def _process_audio_chunk_knn_sync(
         turn_state["first_mouth_json_logged"] = True
 
     frames_n = 0
-    if bool(job.knn_inmemory):
-        # Phase 5b: in-memory KNN (full rescan; no incremental / O(N²) Fix).
+    knn_incremental = bool(turn_state.get("knn_incremental", True))
+
+    # Phase 7: delta-only KNN (+ GT cache). Push+KNN is arrival-ordered, so merge is safe.
+    if job.mouth_obj_ref is not None and knn_incremental:
+        out_obj, knn_sec, delta_n, frames_n = _run_knn_incremental_from_raw_obj(
+            knn_script=job.knn_script,
+            raw_obj=raw_obj,
+            gt_glob=job.gt_glob,
+            step_ms=job.step_ms,
+            mouth_obj_ref=job.mouth_obj_ref,
+        )
+        if not bool(job.knn_inmemory):
+            job.mouth_json.parent.mkdir(parents=True, exist_ok=True)
+            job.mouth_json.write_text(
+                json.dumps(out_obj, ensure_ascii=False, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        tag = (
+            "[knn_inmemory][mouth_obj_updated]"
+            if bool(job.knn_inmemory)
+            else "[knn][mouth_obj_updated]"
+        )
+        print(
+            tag,
+            f"frames={int(frames_n)}",
+            f"delta={int(delta_n)}",
+            f"knn_sec={float(knn_sec):.3f}",
+            "mode=incremental",
+            flush=True,
+        )
+    elif bool(job.knn_inmemory):
         if job.mouth_obj_ref is None:
             raise RuntimeError("knn_inmemory requires mouth_obj_ref")
         mouth_obj, knn_sec = _run_knn_from_raw_obj(
@@ -2476,6 +2654,7 @@ def _process_audio_chunk_knn_sync(
             step_ms=job.step_ms,
         )
         job.mouth_obj_ref["obj"] = mouth_obj
+        job.mouth_obj_ref["knn_raw_frames_done"] = len(raw_obj.get("frames") or [])
         frames_n = len(mouth_obj.get("frames") or mouth_obj.get("timeline") or [])
         print(
             "[knn_inmemory][mouth_obj_updated]",
@@ -2502,6 +2681,9 @@ def _process_audio_chunk_knn_sync(
             try:
                 job.mouth_obj_ref["obj"] = json.loads(
                     job.mouth_json.read_text(encoding="utf-8")
+                )
+                job.mouth_obj_ref["knn_raw_frames_done"] = len(
+                    raw_obj.get("frames") or []
                 )
             except Exception:
                 pass
@@ -3237,6 +3419,7 @@ async def _receive_loop(
             f"m0_hang_timeout_ms={int(_M0_PIPELINE_HANG_TIMEOUT_MS)}",
             f"fast_inmemory={bool(fast_inmemory)}",
             f"knn_inmemory={bool(knn_inmemory)}",
+            f"knn_incremental={bool(turn_state.get('knn_incremental', True))}",
             f"skip_archive_pcm={bool(skip_archive_pcm)}",
             flush=True,
         )
@@ -4552,12 +4735,14 @@ async def _run(args: argparse.Namespace) -> int:
                 playback_ref_init["response_playback_base_samples"] = int(base_played)
                 playback_ref_init["playback_origin_ms"] = 0
 
-            mouth_obj_ref: dict[str, Any] = {"obj": None}
+            mouth_obj_ref: dict[str, Any] = {"obj": None, "knn_raw_frames_done": 0}
             pipeline_sync = bool(getattr(args, "pipeline_sync", True))
             knn_inmemory = bool(getattr(args, "knn_inmemory", False))
             m0_inmemory = bool(getattr(args, "m0_inmemory", False))
             fast_inmemory = bool(getattr(args, "fast_inmemory", False))
+            knn_incremental = bool(getattr(args, "knn_incremental", True))
             skip_archive_pcm = bool(turn_state.get("skip_archive_pcm", False))
+            turn_state["knn_incremental"] = bool(knn_incremental)
 
             if bool(args.inline_emo_tag_mode):
                 turn_state["live_emo_id_getter"] = (
@@ -5850,6 +6035,12 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="KNN in-memory branch (default OFF for Phase2 disk path).",
+    )
+    ap.add_argument(
+        "--knn_incremental",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Phase7 delta-only KNN with cached GT DB (default ON).",
     )
     ap.add_argument(
         "--m0_inmemory",

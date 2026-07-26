@@ -137,6 +137,53 @@ def _resolve_ssot_target(
     }
 
 
+def _fg_png_path(fg_dir: Path, frame_idx: int) -> Path:
+    return fg_dir / f"{int(frame_idx):08d}.png"
+
+
+def _find_latest_fg_at_or_before(
+    *,
+    fg_dir: Path,
+    target_frame: int,
+    hint_frame: int | None,
+    max_scan: int = 256,
+) -> tuple[Path, int] | None:
+    """Latest existing PNG with index <= target_frame (never ahead of audio_ms).
+
+    Phase7 Hotfix: avoid idle_hold freeze on missing exact target by catching up
+    to the newest ready frame at/before audio. hint_frame accelerates the scan.
+    """
+    hi = int(target_frame)
+    if hi < 0:
+        return None
+
+    # Fast path: previously displayed / known high-water still valid.
+    if hint_frame is not None:
+        hint = int(hint_frame)
+        if 0 <= hint <= hi:
+            p = _fg_png_path(fg_dir, hint)
+            if p.exists():
+                # Try to walk forward from hint toward target (small gap catch-up).
+                best_i = hint
+                best_p = p
+                fwd_lim = min(hi, hint + max(1, int(max_scan)))
+                for i in range(hint + 1, fwd_lim + 1):
+                    cand = _fg_png_path(fg_dir, i)
+                    if cand.exists():
+                        best_i = i
+                        best_p = cand
+                    else:
+                        break
+                return best_p, int(best_i)
+
+    lo = max(0, hi - max(0, int(max_scan)) + 1)
+    for i in range(hi, lo - 1, -1):
+        p = _fg_png_path(fg_dir, i)
+        if p.exists():
+            return p, int(i)
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Persistent virtualcam: audio_ms SSOT FG select → OBS"
@@ -218,6 +265,7 @@ def main() -> int:
     last_rgb = None
     last_fg = None
     last_displayed_frame: int | None = None
+    max_existing_frame: int | None = None
     last_logged_target = None
     ssot_enabled = playback_state_file is not None
 
@@ -341,6 +389,7 @@ def main() -> int:
             fg_path: Path | None = None
             target = None
             missing_png = False
+            display_frame_idx: int | None = None
 
             if ssot_enabled:
                 playback_state = _read_json_file(playback_state_file)
@@ -353,30 +402,75 @@ def main() -> int:
                 )
                 # Follow audio only while actually playing; hold otherwise.
                 if str(target["state"]) == "PLAYING":
-                    cand = fg_dir / f"{int(target['target_frame']):08d}.png"
+                    target_i = int(target["target_frame"])
+                    cand = _fg_png_path(fg_dir, target_i)
                     if cand.exists():
                         fg_path = cand
+                        display_frame_idx = target_i
+                        max_existing_frame = (
+                            target_i
+                            if max_existing_frame is None
+                            else max(int(max_existing_frame), target_i)
+                        )
                     else:
+                        # Phase7 Hotfix: catch up to newest PNG <= audio target.
+                        # Never select a frame ahead of audio_ms (Sync SSOT preserved).
                         missing_png = True
-                        if last_logged_target != (
-                            int(target["audio_ms"]),
-                            int(target["target_frame"]),
-                            "missing",
-                        ):
-                            print(
-                                "[sync][virtualcam][SSOT_WAIT]",
-                                f"audio_ms={int(target['audio_ms'])}",
-                                f"player_local_ms={float(target['player_local_ms']):.1f}",
-                                f"target_frame={int(target['target_frame'])}",
-                                f"displayed_frame={last_displayed_frame}",
-                                f"state={target['state']}",
-                                flush=True,
+                        hint = max_existing_frame
+                        if last_displayed_frame is not None:
+                            hint = (
+                                int(last_displayed_frame)
+                                if hint is None
+                                else max(int(hint), int(last_displayed_frame))
                             )
-                            last_logged_target = (
+                        fb = _find_latest_fg_at_or_before(
+                            fg_dir=fg_dir,
+                            target_frame=target_i,
+                            hint_frame=hint,
+                        )
+                        if fb is not None:
+                            fg_path, fb_i = fb
+                            display_frame_idx = int(fb_i)
+                            max_existing_frame = (
+                                int(fb_i)
+                                if max_existing_frame is None
+                                else max(int(max_existing_frame), int(fb_i))
+                            )
+                            log_key = (
                                 int(target["audio_ms"]),
-                                int(target["target_frame"]),
+                                target_i,
+                                "catchup",
+                                int(fb_i),
+                            )
+                            if last_logged_target != log_key:
+                                print(
+                                    "[sync][virtualcam][SSOT_CATCHUP]",
+                                    f"audio_ms={int(target['audio_ms'])}",
+                                    f"player_local_ms={float(target['player_local_ms']):.1f}",
+                                    f"target_frame={target_i}",
+                                    f"fallback_frame={int(fb_i)}",
+                                    f"displayed_frame={int(fb_i)}",
+                                    f"state={target['state']}",
+                                    flush=True,
+                                )
+                                last_logged_target = log_key
+                        else:
+                            log_key = (
+                                int(target["audio_ms"]),
+                                target_i,
                                 "missing",
                             )
+                            if last_logged_target != log_key:
+                                print(
+                                    "[sync][virtualcam][SSOT_WAIT]",
+                                    f"audio_ms={int(target['audio_ms'])}",
+                                    f"player_local_ms={float(target['player_local_ms']):.1f}",
+                                    f"target_frame={target_i}",
+                                    f"displayed_frame={last_displayed_frame}",
+                                    f"state={target['state']}",
+                                    flush=True,
+                                )
+                                last_logged_target = log_key
 
             if fg_path is None:
                 if args.idle_hold and last_rgb is not None:
@@ -434,11 +528,22 @@ def main() -> int:
             last_rgb = comp_rgb
             sent += 1
             if target is not None:
-                last_displayed_frame = int(target["target_frame"])
+                shown = (
+                    int(display_frame_idx)
+                    if display_frame_idx is not None
+                    else int(target["target_frame"])
+                )
+                last_displayed_frame = int(shown)
+                max_existing_frame = (
+                    int(shown)
+                    if max_existing_frame is None
+                    else max(int(max_existing_frame), int(shown))
+                )
                 log_key = (
                     int(target["audio_ms"]),
                     int(target["target_frame"]),
                     "ok",
+                    int(shown),
                 )
                 if last_logged_target != log_key and (
                     sent % 5 == 0 or missing_png or last_logged_target is None
@@ -448,7 +553,7 @@ def main() -> int:
                         f"audio_ms={int(target['audio_ms'])}",
                         f"player_local_ms={float(target['player_local_ms']):.1f}",
                         f"target_frame={int(target['target_frame'])}",
-                        f"displayed_frame={int(target['target_frame'])}",
+                        f"displayed_frame={int(shown)}",
                         f"frame_offset={int(target['frame_offset'])}",
                         f"step_ms={int(target['step_ms'])}",
                         f"state={target['state']}",

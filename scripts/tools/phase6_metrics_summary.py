@@ -30,12 +30,16 @@ def main() -> int:
     print(f"AUDIO_BEFORE_M0={count(r'AUDIO_BEFORE_M0')}")
     print(f"ENQUEUE_BLOCKED={count(r'ENQUEUE_BLOCKED')}")
     print(f"REBUFFERING={count(r'\[REBUFFERING\]')}")
+    print(f"SSOT_WAIT={count(r'\[sync\]\[virtualcam\]\[SSOT_WAIT\]')}")
+    print(f"SSOT_CATCHUP={count(r'\[sync\]\[virtualcam\]\[SSOT_CATCHUP\]')}")
     print(f"m0_breakdown={count(r'\[m0_breakdown\]')}")
     print(f"ssot_audio_ms={count(r'mode=audio_ms')}")
     print(f"fast_inmemory_False={count(r'fast_inmemory=False')}")
     print(f"fast_inmemory_True={count(r'fast_inmemory=True')}")
     print(f"fast_inmemory_ENABLED={count(r'\[fast_inmemory\]\[ENABLED\]')}")
     print(f"knn_inmemory_updated={count(r'\[knn_inmemory\]\[mouth_obj_updated\]')}")
+    print(f"knn_mode_incremental={count(r'mode=incremental')}")
+    print(f"knn_mode_full={count(r'mode=full')}")
     print(f"OK={count(r'run_mic_input_obs_realtime_session_loop\]\[OK\]')}")
 
     rows = []
@@ -116,6 +120,26 @@ def main() -> int:
     reb = [int(x) for x in re.findall(r"rebuffer_count.: (\d+)", text)]
     print(f"max_underrun_count={max(und) if und else 0}")
     print(f"max_rebuffer_count={max(reb) if reb else 0}")
+
+    # VirtualCam freeze signal: longest run of identical displayed_frame on SSOT_WAIT.
+    wait_disp = [
+        int(x)
+        for x in re.findall(
+            r"\[sync\]\[virtualcam\]\[SSOT_WAIT\].*?displayed_frame=([0-9]+)",
+            text,
+        )
+    ]
+    max_stuck = 0
+    run = 0
+    prev = None
+    for d in wait_disp:
+        if prev is not None and d == prev:
+            run += 1
+        else:
+            run = 1
+        max_stuck = max(max_stuck, run)
+        prev = d
+    print(f"SSOT_WAIT_max_same_displayed_run={max_stuck}")
     return 0
 
 
