@@ -33,6 +33,9 @@ def main() -> int:
     print(f"m0_breakdown={count(r'\[m0_breakdown\]')}")
     print(f"ssot_audio_ms={count(r'mode=audio_ms')}")
     print(f"fast_inmemory_False={count(r'fast_inmemory=False')}")
+    print(f"fast_inmemory_True={count(r'fast_inmemory=True')}")
+    print(f"fast_inmemory_ENABLED={count(r'\[fast_inmemory\]\[ENABLED\]')}")
+    print(f"knn_inmemory_updated={count(r'\[knn_inmemory\]\[mouth_obj_updated\]')}")
     print(f"OK={count(r'run_mic_input_obs_realtime_session_loop\]\[OK\]')}")
 
     rows = []

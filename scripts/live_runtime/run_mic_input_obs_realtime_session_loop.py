@@ -459,20 +459,41 @@ def _project_streamer_to_raw(streamer_json_path: Path) -> dict[str, Any]:
     }
 
 
+def _project_streamer_obj_to_raw(streamer: MouthStreamerOC) -> dict[str, Any]:
+    """Phase 5b: project in-memory streamer frames without flush/disk read."""
+    frames_in = list(getattr(streamer, "_frames", []) or [])
+    frames_out: list[dict[str, Any]] = []
+    for fr in frames_in:
+        if not isinstance(fr, dict):
+            continue
+        meta = fr.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        frames_out.append(
+            {
+                "t_ms": fr.get("t_ms"),
+                "vad_active": int(meta.get("vad_active", 0) or 0),
+                "f1_hz": meta.get("f1_hz"),
+                "f2_hz": meta.get("f2_hz"),
+                "src": "session_loop_stream_mouth",
+            }
+        )
+
+    step_ms = int(getattr(getattr(streamer, "cfg", None), "step_ms", 40) or 40)
+    meta_obj = getattr(streamer, "_meta", {}) or {}
+    return {
+        "version": "m3p.mouth.timeline.v1",
+        "step_ms": int(step_ms),
+        "frames": frames_out,
+        "meta": meta_obj if isinstance(meta_obj, dict) else {},
+    }
+
+
 _KNN_FUNC_CACHE: dict[str, Any] = {}
 
 
-def _run_knn_in_process(
-    *,
-    knn_script: Path,
-    raw_json: Path,
-    out_json: Path,
-    gt_glob: str,
-    step_ms: int,
-) -> float:
-    t0 = time.perf_counter()
+def _load_knn_from_raw_obj_fn(*, knn_script: Path) -> Any:
     key = str(knn_script.resolve())
-
     if key not in _KNN_FUNC_CACHE:
         spec = importlib.util.spec_from_file_location(
             "knn_from_formant_raw_to_mouth_timeline_runtime",
@@ -489,10 +510,45 @@ def _run_knn_in_process(
             raise RuntimeError(f"missing run_knn_from_raw_obj(): {knn_script}")
 
         _KNN_FUNC_CACHE[key] = fn
+    return _KNN_FUNC_CACHE[key]
 
+
+def _run_knn_from_raw_obj(
+    *,
+    knn_script: Path,
+    raw_obj: dict[str, Any],
+    gt_glob: str,
+    step_ms: int,
+) -> tuple[dict[str, Any], float]:
+    """Phase 5b knn_inmemory: run KNN from raw_obj without raw/mouth JSON I/O."""
+    t0 = time.perf_counter()
+    fn = _load_knn_from_raw_obj_fn(knn_script=knn_script)
+    out_obj = fn(
+        raw_obj=raw_obj,
+        gt_glob=str(gt_glob),
+        step_ms=int(step_ms),
+        k=5,
+        fallback_id_active=2,
+        min_conf_ratio=1.0,
+    )
+    if not isinstance(out_obj, dict):
+        raise RuntimeError("run_knn_from_raw_obj returned non-dict")
+    return out_obj, time.perf_counter() - t0
+
+
+def _run_knn_in_process(
+    *,
+    knn_script: Path,
+    raw_json: Path,
+    out_json: Path,
+    gt_glob: str,
+    step_ms: int,
+) -> float:
+    t0 = time.perf_counter()
+    fn = _load_knn_from_raw_obj_fn(knn_script=knn_script)
     raw_obj = json.loads(raw_json.read_text(encoding="utf-8"))
 
-    out_obj = _KNN_FUNC_CACHE[key](
+    out_obj = fn(
         raw_obj=raw_obj,
         gt_glob=str(gt_glob),
         step_ms=int(step_ms),
@@ -2410,19 +2466,24 @@ def _process_audio_chunk_knn_sync(
 
     frames_n = 0
     if bool(job.knn_inmemory):
-        # Phase 5b path reserved; Phase 2 default is disk KNN.
+        # Phase 5b: in-memory KNN (full rescan; no incremental / O(N²) Fix).
         if job.mouth_obj_ref is None:
             raise RuntimeError("knn_inmemory requires mouth_obj_ref")
-        _run_knn_in_process(
+        mouth_obj, knn_sec = _run_knn_from_raw_obj(
             knn_script=job.knn_script,
-            raw_json=job.mouth_raw_json,
-            out_json=job.mouth_json,
+            raw_obj=raw_obj,
             gt_glob=job.gt_glob,
             step_ms=job.step_ms,
         )
-        mouth_obj = json.loads(job.mouth_json.read_text(encoding="utf-8"))
         job.mouth_obj_ref["obj"] = mouth_obj
         frames_n = len(mouth_obj.get("frames") or mouth_obj.get("timeline") or [])
+        print(
+            "[knn_inmemory][mouth_obj_updated]",
+            f"frames={int(frames_n)}",
+            f"knn_sec={float(knn_sec):.3f}",
+            "mode=full",
+            flush=True,
+        )
     else:
         _run_knn_in_process(
             knn_script=job.knn_script,
@@ -2492,7 +2553,8 @@ def _process_audio_chunk_push_knn_sync(
 
     if int(emitted) > 0:
         if bool(job.fast_inmemory):
-            raw_obj = _project_streamer_to_raw(job.mouth_streamer_json)
+            # Skip flush I/O; project from in-memory streamer frames.
+            raw_obj = _project_streamer_obj_to_raw(job.mouth_streamer)
         else:
             raw_obj = _project_streamer_to_raw(job.mouth_streamer_json)
 
@@ -3174,14 +3236,25 @@ async def _receive_loop(
             "[sync][pipeline][ENABLED]",
             f"m0_hang_timeout_ms={int(_M0_PIPELINE_HANG_TIMEOUT_MS)}",
             f"fast_inmemory={bool(fast_inmemory)}",
+            f"knn_inmemory={bool(knn_inmemory)}",
+            f"skip_archive_pcm={bool(skip_archive_pcm)}",
             flush=True,
         )
+        if bool(fast_inmemory):
+            print(
+                "[fast_inmemory][ENABLED]",
+                f"knn_inmemory={bool(knn_inmemory)}",
+                f"skip_archive_pcm={bool(skip_archive_pcm)}",
+                "streamer_flush=skipped",
+                flush=True,
+            )
 
     audio_f_legacy = None
     try:
-        audio_f_legacy = audio_response_pcm.open("ab")
-        if bool(pipeline_sync):
-            pipeline_io_ref["audio_f"] = audio_f_legacy
+        if not bool(skip_archive_pcm):
+            audio_f_legacy = audio_response_pcm.open("ab")
+            if bool(pipeline_sync):
+                pipeline_io_ref["audio_f"] = audio_f_legacy
 
         while not stop_event.is_set():
             got_any = False
