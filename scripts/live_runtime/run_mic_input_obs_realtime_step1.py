@@ -22,10 +22,11 @@ RESPONSE_PREFIX = "__M0_WORKER_RESPONSE__ "
 _M0_PIPELINE_HANG_TIMEOUT_MS = 3000
 
 # Phase 6 observability: m0_ms breakdown keys (sum ≈ wall-clock m0_ms).
-# wait_mouth: coverage wait in session_loop; lock: m0_pipeline lock / advance overhead;
-# slice: timeline slice; disk: json/yaml IO; req_send: worker request send;
-# png_wait: worker response (= PNG gen+arrive); verify: post PNG exist + pipeline verify;
-# other: remainder at log time.
+# wait_mouth: coverage wait in session_loop;
+# lock: advance wall residual (peer worker_owner wait / cond); often ≈ peer png_wait;
+# slice: timeline slice (bisect; suspicion B); disk: json/yaml IO; req_send: worker send;
+# png_wait: worker response (= PNG gen+arrive; Phase 9 if dominant);
+# verify: post PNG exist + pipeline verify; other: remainder at log time.
 _M0_BREAKDOWN_KEYS = (
     "m0_wait_mouth_ms",
     "m0_lock_ms",
@@ -536,32 +537,49 @@ def _wrap_like(raw: Any, frames_new: list[dict[str, Any]]) -> Any:
     return {"frames": frames_new}
 
 
-def _slice_shift_timeline(raw: Any, t0_ms: int, t1_ms: int) -> Any:
-    frames = _as_frames(raw)
+def _frame_t_ms(fr: dict[str, Any]) -> int:
+    return int(fr.get("t_ms", 0) or 0)
 
-    inside = [
-        fr for fr in frames
-        if t0_ms <= int(fr.get("t_ms", 0) or 0) < t1_ms
-    ]
 
-    prev = None
-    for fr in frames:
-        t = int(fr.get("t_ms", 0) or 0)
-        if t < t0_ms:
-            prev = fr
+def _bisect_frames_left(frames: list[dict[str, Any]], t_ms: int) -> int:
+    """First index with t_ms >= target. Assumes frames sorted by t_ms."""
+    lo = 0
+    hi = len(frames)
+    target = int(t_ms)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _frame_t_ms(frames[mid]) < target:
+            lo = mid + 1
         else:
-            break
+            hi = mid
+    return int(lo)
+
+
+def _slice_shift_timeline(raw: Any, t0_ms: int, t1_ms: int) -> Any:
+    """Slice [t0_ms, t1_ms) and shift to local t=0.
+
+    Assumes frames/timeline are sorted by t_ms (mouth/pose producers guarantee this).
+    Uses bisect so cost is O(log N + K) for window size K, not O(N) full scans.
+    """
+    frames = _as_frames(raw)
+    if not frames:
+        return _wrap_like(raw, [])
+
+    t0 = int(t0_ms)
+    t1 = int(t1_ms)
+    i0 = _bisect_frames_left(frames, t0)
+    i1 = _bisect_frames_left(frames, t1)
+    prev = frames[i0 - 1] if i0 > 0 else None
 
     out: list[dict[str, Any]] = []
-
     if prev is not None:
         fr0 = dict(prev)
         fr0["t_ms"] = 0
         out.append(fr0)
 
-    for fr in inside:
+    for fr in frames[i0:i1]:
         fr2 = dict(fr)
-        fr2["t_ms"] = int(fr2.get("t_ms", 0) or 0) - int(t0_ms)
+        fr2["t_ms"] = _frame_t_ms(fr2) - t0
         out.append(fr2)
 
     return _wrap_like(raw, out)
@@ -811,8 +829,12 @@ def _create_m0_pipeline_ref(
     chunks_root = work_dir / "stream_chunks"
     chunks_root.mkdir(parents=True, exist_ok=True)
 
+    lock = threading.Lock()
     return {
-        "lock": threading.Lock(),
+        "lock": lock,
+        "cond": threading.Condition(lock),
+        # Exclusive M0 worker owner (threading.get_ident). None = free.
+        "worker_owner": None,
         "rendered_chunks": 0,
         "total_frames": 0,
         "py": py,
@@ -898,16 +920,18 @@ def _m0_pipeline_render_one_chunk_sync(
     _m0_timing_add(timing_acc, "m0_slice_ms", (time.perf_counter() - t_slice0) * 1000.0)
 
     t_disk0 = time.perf_counter()
+    # Compact JSON: hot-path chunk IO (indent was pure overhead for M0 worker).
+    _json_dump_kw = {"ensure_ascii": False, "separators": (",", ":")}
     pose_chunk_json.write_text(
-        json.dumps(pose_chunk, ensure_ascii=False, indent=2),
+        json.dumps(pose_chunk, **_json_dump_kw),
         encoding="utf-8",
     )
     mouth_chunk_json.write_text(
-        json.dumps(mouth_chunk, ensure_ascii=False, indent=2),
+        json.dumps(mouth_chunk, **_json_dump_kw),
         encoding="utf-8",
     )
     expr_chunk_json.write_text(
-        json.dumps(expr_chunk, ensure_ascii=False, indent=2),
+        json.dumps(expr_chunk, **_json_dump_kw),
         encoding="utf-8",
     )
     _m0_timing_add(timing_acc, "m0_disk_ms", (time.perf_counter() - t_disk0) * 1000.0)
@@ -1037,6 +1061,16 @@ def _m0_pipeline_advance_sync(
     max_chunks: int = 256,
     until_t1_ms: int | None = None,
 ) -> dict[str, Any]:
+    """Advance M0 render coverage up to until_t1_ms.
+
+    Phase 8 lock policy (M1 only):
+    - One thread owns the single M0 worker for the duration of this advance
+      (`worker_owner`), so render stays a tight loop (no peer steal mid-run).
+    - State lock is released during slice/disk/png_wait; after each cid commit
+      peers that are already covered can return and enqueue early.
+    - Peers that still need coverage wait for worker_owner without holding the
+      lock across png_wait (lock ≈ peer png_wait → Phase 9 if dominant).
+    """
     result = {
         "chunks_rendered": 0,
         "m0_ms_total": 0.0,
@@ -1062,20 +1096,48 @@ def _m0_pipeline_advance_sync(
     step_ms = int(m0_pipeline_ref["step_ms"])
     close_mouth_id = int(m0_pipeline_ref.get("close_mouth_id", 0))
 
-    with m0_pipeline_ref["lock"]:
+    lock = m0_pipeline_ref["lock"]
+    cond = m0_pipeline_ref.get("cond")
+    if not isinstance(cond, threading.Condition):
+        cond = threading.Condition(lock)
+        m0_pipeline_ref["cond"] = cond
+
+    my_id = threading.get_ident()
+    owned = False
+
+    def _coverage_t0() -> int:
+        cid = int(m0_pipeline_ref["rendered_chunks"])
+        return int(origin_ms + cid * chunk_len_ms)
+
+    try:
+        with cond:
+            while True:
+                t0_ms = _coverage_t0()
+                if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
+                    return result
+                owner = m0_pipeline_ref.get("worker_owner")
+                if owner is not None and owner != my_id:
+                    cond.wait(timeout=0.05)
+                    obj = mouth_obj_ref.get("obj")
+                    if not isinstance(obj, dict):
+                        return result
+                    continue
+                # Acquire exclusive worker ownership for this advance call.
+                m0_pipeline_ref["worker_owner"] = my_id
+                owned = True
+                break
+
         while int(result["chunks_rendered"]) < int(max_chunks):
-            cid = int(m0_pipeline_ref["rendered_chunks"])
-            t0_ms = int(origin_ms + cid * chunk_len_ms)
-            t1_ms = int(t0_ms + chunk_len_ms)
-
-            if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
-                break
-
-            needed_frames = int(t1_ms // step_ms)
-            mouth_frames = _as_frames(obj)
-
-            if len(mouth_frames) < needed_frames:
-                break
+            with cond:
+                cid = int(m0_pipeline_ref["rendered_chunks"])
+                t0_ms = int(origin_ms + cid * chunk_len_ms)
+                t1_ms = int(t0_ms + chunk_len_ms)
+                if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
+                    break
+                needed_frames = int(t1_ms // step_ms)
+                mouth_frames = _as_frames(obj)
+                if len(mouth_frames) < needed_frames:
+                    break
 
             global_f0, global_f1 = _m0_pipeline_global_frame_range(
                 m0_pipeline_ref=m0_pipeline_ref,
@@ -1087,6 +1149,7 @@ def _m0_pipeline_advance_sync(
             chunk_ok = True
             copied = 0
             m0_ms = 0.0
+            # State lock released: slice / disk / png_wait (peers may observe commits).
             try:
                 copied, hung, m0_ms = _m0_pipeline_render_with_hang_guard(
                     m0_pipeline_ref=m0_pipeline_ref,
@@ -1139,10 +1202,6 @@ def _m0_pipeline_advance_sync(
                             result["hang_chunks"] = int(result["hang_chunks"]) + 1
                     except BaseException:
                         copied = 0
-            elif int(copied) > 0:
-                m0_pipeline_ref["total_frames"] = int(
-                    m0_pipeline_ref.get("total_frames", 0)
-                ) + int(copied)
 
             t_verify0 = time.perf_counter()
             if not _m0_pipeline_verify_pngs_exist(
@@ -1157,11 +1216,29 @@ def _m0_pipeline_advance_sync(
                     f"global_range=[{int(global_f0)},{int(global_f1)})",
                     flush=True,
                 )
-            _m0_timing_add(timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0)
+            _m0_timing_add(
+                timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0
+            )
 
-            m0_pipeline_ref["rendered_chunks"] = int(cid) + 1
-            result["chunks_rendered"] = int(result["chunks_rendered"]) + 1
+            with cond:
+                if (not hung and chunk_ok) and int(copied) > 0:
+                    m0_pipeline_ref["total_frames"] = int(
+                        m0_pipeline_ref.get("total_frames", 0)
+                    ) + int(copied)
+                m0_pipeline_ref["rendered_chunks"] = int(cid) + 1
+                result["chunks_rendered"] = int(result["chunks_rendered"]) + 1
+                # Wake covered peers so they can enqueue while we keep worker_owner.
+                cond.notify_all()
+
             obj = mouth_obj_ref.get("obj")
+            if not isinstance(obj, dict):
+                break
+    finally:
+        if owned:
+            with cond:
+                if m0_pipeline_ref.get("worker_owner") == my_id:
+                    m0_pipeline_ref["worker_owner"] = None
+                cond.notify_all()
 
     return result
 

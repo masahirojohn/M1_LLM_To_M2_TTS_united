@@ -121,6 +121,25 @@ def main() -> int:
     print(f"max_underrun_count={max(und) if und else 0}")
     print(f"max_rebuffer_count={max(reb) if reb else 0}")
 
+    # Phase 8: lock vs png_wait (Phase 9 defer evidence when lock ≈ peer png_wait).
+    lock_vals = [float(r["m0_lock_ms"]) for r in rows if r.get("m0_lock_ms") is not None]
+    png_vals = [float(r["m0_png_wait_ms"]) for r in rows if r.get("m0_png_wait_ms") is not None]
+    slice_vals = [float(r["m0_slice_ms"]) for r in rows if r.get("m0_slice_ms") is not None]
+    lock_sum = sum(lock_vals)
+    png_sum = sum(png_vals)
+    slice_sum = sum(slice_vals)
+    m0_sum = sum(float(r["m0_ms"]) for r in rows if r.get("m0_ms") is not None)
+    print(f"sum_m0_ms={m0_sum:.1f}")
+    print(f"sum_m0_lock_ms={lock_sum:.1f}")
+    print(f"sum_m0_png_wait_ms={png_sum:.1f}")
+    print(f"sum_m0_slice_ms={slice_sum:.1f}")
+    if png_sum > 1.0:
+        print(f"lock_over_png_wait={lock_sum / png_sum:.2f}")
+    if m0_sum > 1.0:
+        print(f"lock_frac_of_m0={lock_sum / m0_sum:.2f}")
+        print(f"png_wait_frac_of_m0={png_sum / m0_sum:.2f}")
+        print(f"slice_frac_of_m0={slice_sum / m0_sum:.4f}")
+
     # VirtualCam freeze signal: longest run of identical displayed_frame on SSOT_WAIT.
     wait_disp = [
         int(x)
