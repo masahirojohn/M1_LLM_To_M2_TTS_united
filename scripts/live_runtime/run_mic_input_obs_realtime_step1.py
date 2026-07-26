@@ -21,6 +21,31 @@ RESPONSE_PREFIX = "__M0_WORKER_RESPONSE__ "
 # Phase 2: abnormal M0 hang only (normal ~250ms/chunk must not be cut short).
 _M0_PIPELINE_HANG_TIMEOUT_MS = 3000
 
+# Phase 6 observability: m0_ms breakdown keys (sum ≈ wall-clock m0_ms).
+# wait_mouth: coverage wait in session_loop; lock: m0_pipeline lock / advance overhead;
+# slice: timeline slice; disk: json/yaml IO; req_send: worker request send;
+# png_wait: worker response (= PNG gen+arrive); verify: post PNG exist + pipeline verify;
+# other: remainder at log time.
+_M0_BREAKDOWN_KEYS = (
+    "m0_wait_mouth_ms",
+    "m0_lock_ms",
+    "m0_slice_ms",
+    "m0_disk_ms",
+    "m0_req_send_ms",
+    "m0_png_wait_ms",
+    "m0_verify_ms",
+)
+
+
+def _m0_timing_add(acc: dict[str, float] | None, key: str, ms: float) -> None:
+    if acc is None:
+        return
+    acc[key] = float(acc.get(key, 0.0)) + float(ms)
+
+
+def _m0_timing_empty() -> dict[str, float]:
+    return {k: 0.0 for k in _M0_BREAKDOWN_KEYS}
+
 
 def _run(cmd: list[str], *, cwd: Path, env: dict[str, str]) -> None:
     print("[RUN]", " ".join(cmd), flush=True)
@@ -113,16 +138,21 @@ def _run_m0_worker_render_tcp(
     host: str,
     port: int,
     cfg_path: Path,
+    timing_acc: dict[str, float] | None = None,
 ) -> None:
     req = {
         "cmd": "render",
         "config": str(cfg_path.resolve()),
     }
 
+    t_send0 = time.perf_counter()
     with socket.create_connection((host, port), timeout=30.0) as sock:
         sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        _m0_timing_add(timing_acc, "m0_req_send_ms", (time.perf_counter() - t_send0) * 1000.0)
+        t_wait0 = time.perf_counter()
         f = sock.makefile("r", encoding="utf-8", newline="\n")
         line = f.readline()
+        _m0_timing_add(timing_acc, "m0_png_wait_ms", (time.perf_counter() - t_wait0) * 1000.0)
 
     if not line:
         raise RuntimeError("empty response from m0 tcp worker")
@@ -136,6 +166,7 @@ def _run_m0_worker_render(
     *,
     m0_worker_proc: subprocess.Popen,
     cfg_path: Path,
+    timing_acc: dict[str, float] | None = None,
 ) -> None:
     if m0_worker_proc.poll() is not None:
         raise RuntimeError(f"m0 persistent worker already exited: rc={m0_worker_proc.returncode}")
@@ -148,9 +179,12 @@ def _run_m0_worker_render(
         "config": str(cfg_path.resolve()),
     }
 
+    t_send0 = time.perf_counter()
     m0_worker_proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
     m0_worker_proc.stdin.flush()
+    _m0_timing_add(timing_acc, "m0_req_send_ms", (time.perf_counter() - t_send0) * 1000.0)
 
+    t_wait0 = time.perf_counter()
     while True:
         line = m0_worker_proc.stdout.readline()
         if not line:
@@ -160,6 +194,7 @@ def _run_m0_worker_render(
 
         if line.startswith(RESPONSE_PREFIX):
             res = json.loads(line[len(RESPONSE_PREFIX):])
+            _m0_timing_add(timing_acc, "m0_png_wait_ms", (time.perf_counter() - t_wait0) * 1000.0)
             if not res.get("ok"):
                 raise RuntimeError(res)
             return
@@ -183,6 +218,7 @@ def _run_m0_one_chunk(
     m0_worker_proc: subprocess.Popen | None,
     m0_worker_host: str,
     m0_worker_port: int | None,
+    timing_acc: dict[str, float] | None = None,
 ) -> int:
     t_chunk0 = time.perf_counter()
     cid = int(chunk["chunk_id"])
@@ -199,6 +235,7 @@ def _run_m0_one_chunk(
 
     local_fg_dir.mkdir(parents=True, exist_ok=True)
 
+    t_disk0 = time.perf_counter()
     cfg = json.loads(json.dumps(base_cfg))
     cfg.setdefault("io", {})
     cfg.setdefault("video", {})
@@ -228,9 +265,14 @@ def _run_m0_one_chunk(
 
     cfg_path = run_dir / "m0_chunk_config.yaml"
     _write_yaml(cfg_path, cfg)
+    _m0_timing_add(timing_acc, "m0_disk_ms", (time.perf_counter() - t_disk0) * 1000.0)
 
     t_render0 = time.perf_counter()
     if m0_worker_proc is None and m0_worker_port is None:
+        t_send0 = time.perf_counter()
+        # Subprocess path: request send ≈ 0; whole run is PNG wait.
+        _m0_timing_add(timing_acc, "m0_req_send_ms", (time.perf_counter() - t_send0) * 1000.0)
+        t_wait0 = time.perf_counter()
         _run(
             [
                 str(py),
@@ -241,25 +283,30 @@ def _run_m0_one_chunk(
             cwd=m0_repo,
             env=env,
         )
+        _m0_timing_add(timing_acc, "m0_png_wait_ms", (time.perf_counter() - t_wait0) * 1000.0)
     elif m0_worker_port is not None:
         _run_m0_worker_render_tcp(
             host=m0_worker_host,
             port=int(m0_worker_port),
             cfg_path=cfg_path,
+            timing_acc=timing_acc,
         )
     else:
         _run_m0_worker_render(
             m0_worker_proc=m0_worker_proc,
             cfg_path=cfg_path,
+            timing_acc=timing_acc,
         )
     m0_render_sec = time.perf_counter() - t_render0
     
 
+    t_verify0 = time.perf_counter()
     missing = []
     for i in range(expected_frames):
         p = local_fg_dir / f"{frame_offset + frame0 + i:08d}.png"
         if not p.exists():
             missing.append(str(p))
+    _m0_timing_add(timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0)
 
     if missing:
         raise RuntimeError(
@@ -800,6 +847,7 @@ def _m0_pipeline_render_one_chunk_sync(
     t1_ms: int,
     live_emo_id_getter: Callable[[], str | None] | None = None,
     live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None = None,
+    timing_acc: dict[str, float] | None = None,
 ) -> int:
     step_ms = int(m0_pipeline_ref["step_ms"])
     frame0 = int(t0_ms // step_ms)
@@ -812,6 +860,7 @@ def _m0_pipeline_render_one_chunk_sync(
     mouth_chunk_json = cdir / "mouth.chunk.json"
     expr_chunk_json = cdir / "expr.chunk.json"
 
+    t_slice0 = time.perf_counter()
     pose_chunk = _slice_shift_timeline(m0_pipeline_ref["pose_obj"], t0_ms, t1_ms)
     mouth_chunk = _slice_shift_timeline(mouth_obj, t0_ms, t1_ms)
 
@@ -846,7 +895,9 @@ def _m0_pipeline_render_one_chunk_sync(
             step_ms=step_ms,
             inline_emo_id=effective_emo_id,
         )
+    _m0_timing_add(timing_acc, "m0_slice_ms", (time.perf_counter() - t_slice0) * 1000.0)
 
+    t_disk0 = time.perf_counter()
     pose_chunk_json.write_text(
         json.dumps(pose_chunk, ensure_ascii=False, indent=2),
         encoding="utf-8",
@@ -859,6 +910,7 @@ def _m0_pipeline_render_one_chunk_sync(
         json.dumps(expr_chunk, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _m0_timing_add(timing_acc, "m0_disk_ms", (time.perf_counter() - t_disk0) * 1000.0)
 
     ch = {
         "chunk_id": int(cid),
@@ -891,6 +943,7 @@ def _m0_pipeline_render_one_chunk_sync(
         m0_worker_proc=m0_pipeline_ref["m0_worker_proc"],
         m0_worker_host=str(m0_pipeline_ref["m0_worker_host"]),
         m0_worker_port=m0_pipeline_ref["m0_worker_port"],
+        timing_acc=timing_acc,
     )
     return int(copied)
 
@@ -905,6 +958,7 @@ def _m0_pipeline_render_with_hang_guard(
     live_emo_id_getter: Callable[[], str | None] | None,
     live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None,
     hang_timeout_ms: int = _M0_PIPELINE_HANG_TIMEOUT_MS,
+    timing_acc: dict[str, float] | None = None,
 ) -> tuple[int, bool, float]:
     """Normal path blocks until M0 completes. Hang guard only on abnormal stall."""
     if int(hang_timeout_ms) <= 0:
@@ -917,10 +971,15 @@ def _m0_pipeline_render_with_hang_guard(
             t1_ms=int(t1_ms),
             live_emo_id_getter=live_emo_id_getter,
             live_emo_events_getter=live_emo_events_getter,
+            timing_acc=timing_acc,
         )
         return int(copied), False, (time.perf_counter() - t0) * 1000.0
 
-    render_box: dict[str, Any] = {"copied": 0, "error": None}
+    render_box: dict[str, Any] = {
+        "copied": 0,
+        "error": None,
+        "timing": _m0_timing_empty() if timing_acc is not None else None,
+    }
 
     def _target() -> None:
         try:
@@ -932,6 +991,7 @@ def _m0_pipeline_render_with_hang_guard(
                 t1_ms=int(t1_ms),
                 live_emo_id_getter=live_emo_id_getter,
                 live_emo_events_getter=live_emo_events_getter,
+                timing_acc=render_box["timing"],
             )
         except BaseException as e:
             render_box["error"] = e
@@ -951,7 +1011,14 @@ def _m0_pipeline_render_with_hang_guard(
             f"wait_ms={wait_ms:.0f}",
             flush=True,
         )
+        # Hang: wall wait has no completed breakdown; attribute to png_wait.
+        _m0_timing_add(timing_acc, "m0_png_wait_ms", float(wait_ms))
         return 0, True, float(wait_ms)
+
+    thread_timing = render_box.get("timing")
+    if isinstance(thread_timing, dict) and timing_acc is not None:
+        for k in _M0_BREAKDOWN_KEYS:
+            _m0_timing_add(timing_acc, k, float(thread_timing.get(k, 0.0)))
 
     if render_box["error"] is not None:
         raise render_box["error"]
@@ -978,7 +1045,9 @@ def _m0_pipeline_advance_sync(
         "last_cid": -1,
         "last_global_frame1": -1,
         "png_verified": True,
+        "m0_breakdown": _m0_timing_empty(),
     }
+    timing_acc = result["m0_breakdown"]
 
     obj = mouth_obj_ref.get("obj")
     if not isinstance(obj, dict):
@@ -1028,6 +1097,7 @@ def _m0_pipeline_advance_sync(
                     live_emo_id_getter=live_emo_id_getter,
                     live_emo_events_getter=live_emo_events_getter,
                     hang_timeout_ms=int(hang_timeout_ms),
+                    timing_acc=timing_acc,
                 )
             except BaseException:
                 chunk_ok = False
@@ -1060,6 +1130,7 @@ def _m0_pipeline_advance_sync(
                             live_emo_id_getter=live_emo_id_getter,
                             live_emo_events_getter=live_emo_events_getter,
                             hang_timeout_ms=int(hang_timeout_ms),
+                            timing_acc=timing_acc,
                         )
                         result["m0_ms_total"] = (
                             float(result["m0_ms_total"]) + float(dummy_ms)
@@ -1073,6 +1144,7 @@ def _m0_pipeline_advance_sync(
                     m0_pipeline_ref.get("total_frames", 0)
                 ) + int(copied)
 
+            t_verify0 = time.perf_counter()
             if not _m0_pipeline_verify_pngs_exist(
                 m0_pipeline_ref=m0_pipeline_ref,
                 global_frame0=int(global_f0),
@@ -1085,6 +1157,7 @@ def _m0_pipeline_advance_sync(
                     f"global_range=[{int(global_f0)},{int(global_f1)})",
                     flush=True,
                 )
+            _m0_timing_add(timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0)
 
             m0_pipeline_ref["rendered_chunks"] = int(cid) + 1
             result["chunks_rendered"] = int(result["chunks_rendered"]) + 1

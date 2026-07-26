@@ -52,6 +52,8 @@ from run_mic_input_obs_realtime_step1 import (
     _m0_pipeline_enqueue_timeline_end_ms,
     _m0_pipeline_rendered_end_ms,
     _m0_pipeline_verify_pngs_exist,
+    _m0_timing_add,
+    _m0_timing_empty,
     _start_audio_player,
     _stop_audio_player,
     _send_audio_chunk,
@@ -2297,6 +2299,7 @@ class _PipelineEnqueueItem:
     t_pipeline0: float
     stage_knn_done_ms: float
     stage_m0_done_ms: float
+    m0_breakdown: dict[str, float] | None = None
 
 
 def _pipeline_inflight_inc(turn_state: dict[str, Any]) -> int:
@@ -2570,6 +2573,10 @@ def _process_audio_chunk_m0_sync(
     covered = int(rendered_end) >= int(enqueue_timeline_end_ms) if enqueue_timeline_end_ms > 0 else True
     enqueue_blocked = bool(effective_playback and (not png_verified or not covered))
 
+    breakdown = m0_result.get("m0_breakdown")
+    if not isinstance(breakdown, dict):
+        breakdown = _m0_timing_empty()
+
     return {
         "m0_ms": float(m0_result.get("m0_ms_total", 0.0)),
         "hang_used": bool(m0_result.get("hang_used", False)),
@@ -2581,6 +2588,7 @@ def _process_audio_chunk_m0_sync(
         "enqueue_timeline_end_ms": int(enqueue_timeline_end_ms),
         "covered": bool(covered),
         "rendered_end_ms": int(rendered_end),
+        "m0_breakdown": breakdown,
     }
 
 
@@ -2621,6 +2629,28 @@ def _enqueue_playback_audio_sync(
     )
 
 
+def _finalize_m0_breakdown(
+    *,
+    m0_ms: float,
+    breakdown: dict[str, float] | None,
+) -> dict[str, float]:
+    out = _m0_timing_empty()
+    if isinstance(breakdown, dict):
+        for k in out:
+            out[k] = float(breakdown.get(k, 0.0) or 0.0)
+    parts = (
+        out["m0_wait_mouth_ms"]
+        + out["m0_lock_ms"]
+        + out["m0_slice_ms"]
+        + out["m0_disk_ms"]
+        + out["m0_req_send_ms"]
+        + out["m0_png_wait_ms"]
+        + out["m0_verify_ms"]
+    )
+    out["m0_other_ms"] = max(0.0, float(m0_ms) - float(parts))
+    return out
+
+
 def _log_pipeline_chunk_result(
     *,
     job: _AudioPipelineJob,
@@ -2641,7 +2671,9 @@ def _log_pipeline_chunk_result(
     queue_wait_ms: float = 0.0,
     stage_knn_done_ms: float = 0.0,
     stage_m0_done_ms: float = 0.0,
+    m0_breakdown: dict[str, float] | None = None,
 ) -> None:
+    bd = _finalize_m0_breakdown(m0_ms=float(m0_ms), breakdown=m0_breakdown)
     print(
         "[sync][pipeline_chunk]",
         f"pipeline_seq={int(pipeline_seq)}",
@@ -2661,6 +2693,28 @@ def _log_pipeline_chunk_result(
         f"enqueue_timeline_end_ms={int(enqueue_timeline_end_ms)}",
         f"m0_last_cid={int(m0_last_cid)}",
         f"m0_last_global_frame1={int(m0_last_global)}",
+        f"m0_wait_mouth_ms={bd['m0_wait_mouth_ms']:.1f}",
+        f"m0_lock_ms={bd['m0_lock_ms']:.1f}",
+        f"m0_slice_ms={bd['m0_slice_ms']:.1f}",
+        f"m0_disk_ms={bd['m0_disk_ms']:.1f}",
+        f"m0_req_send_ms={bd['m0_req_send_ms']:.1f}",
+        f"m0_png_wait_ms={bd['m0_png_wait_ms']:.1f}",
+        f"m0_verify_ms={bd['m0_verify_ms']:.1f}",
+        f"m0_other_ms={bd['m0_other_ms']:.1f}",
+        flush=True,
+    )
+    print(
+        "[sync][pipeline_chunk][m0_breakdown]",
+        f"chunk_idx={int(job.playback_chunk_idx)}",
+        f"m0_ms={m0_ms:.1f}",
+        f"wait_mouth={bd['m0_wait_mouth_ms']:.1f}",
+        f"lock={bd['m0_lock_ms']:.1f}",
+        f"slice={bd['m0_slice_ms']:.1f}",
+        f"disk={bd['m0_disk_ms']:.1f}",
+        f"req_send={bd['m0_req_send_ms']:.1f}",
+        f"png_wait={bd['m0_png_wait_ms']:.1f}",
+        f"verify={bd['m0_verify_ms']:.1f}",
+        f"other={bd['m0_other_ms']:.1f}",
         flush=True,
     )
 
@@ -2714,6 +2768,7 @@ async def _process_pipeline_chunk_task(
         png_verified = True
         enqueue_blocked = False
         stage_m0_done_ms = stage_knn_done_ms
+        m0_breakdown = _m0_timing_empty()
 
         if (
             effective_playback
@@ -2723,6 +2778,7 @@ async def _process_pipeline_chunk_task(
             t_m0 = time.perf_counter()
             covered = False
             while not stop_event.is_set():
+                t_adv0 = time.perf_counter()
                 m0_result = await asyncio.to_thread(
                     _process_audio_chunk_m0_sync,
                     job=job,
@@ -2732,7 +2788,22 @@ async def _process_pipeline_chunk_task(
                     m0_max_chunks=8,
                     until_t1_ms=int(enqueue_timeline_end_ms),
                 )
-                m0_ms = (time.perf_counter() - t_m0) * 1000.0
+                adv_wall_ms = (time.perf_counter() - t_adv0) * 1000.0
+                part = m0_result.get("m0_breakdown")
+                part_sum = 0.0
+                if isinstance(part, dict):
+                    for k in m0_breakdown:
+                        if k == "m0_wait_mouth_ms" or k == "m0_lock_ms":
+                            continue
+                        v = float(part.get(k, 0.0) or 0.0)
+                        _m0_timing_add(m0_breakdown, k, v)
+                        part_sum += v
+                # Wall time in advance not explained by instrumented work ≈ lock contention.
+                _m0_timing_add(
+                    m0_breakdown,
+                    "m0_lock_ms",
+                    max(0.0, float(adv_wall_ms) - float(part_sum)),
+                )
                 hang_used = hang_used or bool(m0_result.get("hang_used", False))
                 m0_chunks += int(m0_result.get("m0_chunks", 0))
                 m0_last_cid = int(m0_result.get("m0_last_cid", -1))
@@ -2743,6 +2814,7 @@ async def _process_pipeline_chunk_task(
 
                 if covered and png_verified:
                     enqueue_blocked = False
+                    m0_ms = (time.perf_counter() - t_m0) * 1000.0
                     print(
                         "[sync][pipeline_chunk][m0_done]",
                         f"chunk_idx={int(job.playback_chunk_idx)}",
@@ -2755,6 +2827,7 @@ async def _process_pipeline_chunk_task(
 
                 if hang_used and not covered:
                     enqueue_blocked = True
+                    m0_ms = (time.perf_counter() - t_m0) * 1000.0
                     print(
                         "[sync][pipeline_chunk][m0_hang_uncovered]",
                         f"chunk_idx={int(job.playback_chunk_idx)}",
@@ -2763,6 +2836,7 @@ async def _process_pipeline_chunk_task(
                     )
                     break
 
+                t_wait0 = time.perf_counter()
                 ev = turn_state.get("mouth_frames_async_event")
                 if isinstance(ev, asyncio.Event):
                     ev.clear()
@@ -2772,6 +2846,12 @@ async def _process_pipeline_chunk_task(
                         pass
                 else:
                     await asyncio.sleep(0.02)
+                _m0_timing_add(
+                    m0_breakdown,
+                    "m0_wait_mouth_ms",
+                    (time.perf_counter() - t_wait0) * 1000.0,
+                )
+            m0_ms = (time.perf_counter() - t_m0) * 1000.0
             stage_m0_done_ms = (time.perf_counter() - t_pipeline0) * 1000.0
         elif effective_playback and m0_pipeline_ref is None:
             enqueue_blocked = True
@@ -2807,6 +2887,7 @@ async def _process_pipeline_chunk_task(
             t_pipeline0=float(t_pipeline0),
             stage_knn_done_ms=float(stage_knn_done_ms),
             stage_m0_done_ms=float(stage_m0_done_ms),
+            m0_breakdown=dict(m0_breakdown),
         )
         enqueue_queue.put_nowait(item)
     except asyncio.CancelledError:
@@ -2950,6 +3031,7 @@ async def _pipeline_enqueue_dispatcher_loop(
                 queue_wait_ms=float(queue_wait_ms),
                 stage_knn_done_ms=float(item.stage_knn_done_ms),
                 stage_m0_done_ms=float(item.stage_m0_done_ms),
+                m0_breakdown=item.m0_breakdown,
             )
 
     while True:
