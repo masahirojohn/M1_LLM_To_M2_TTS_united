@@ -68,7 +68,17 @@ def _write_yaml(path: Path, obj: Any) -> None:
 
 
 def _count_pngs(path: Path) -> int:
-    return len(list(path.glob("*.png"))) if path.exists() else 0
+    if not path.exists():
+        return 0
+    # Phase 9: raw .bgra or legacy .png
+    n_bgra = len(list(path.glob("*.bgra")))
+    n_png = len(list(path.glob("*.png")))
+    return max(n_bgra, n_png)
+
+
+def _fg_frame_exists(fg_dir: Path, frame_idx: int) -> bool:
+    idx = int(frame_idx)
+    return (fg_dir / f"{idx:08d}.bgra").exists() or (fg_dir / f"{idx:08d}.png").exists()
 
 
 def _safe_clean_dir(path: Path, *, required_parent: Path) -> None:
@@ -255,6 +265,8 @@ def _run_m0_one_chunk(
     cfg["render"]["fg_png_dir"] = str(local_fg_dir.resolve())
     cfg["render"]["fg_frame_offset"] = int(frame_offset + frame0)
     cfg["render"]["write_mp4"] = False
+    # Phase 9: raw BGRA FG (~1ms/frame) — VirtualCam reads .bgra (PNG fallback kept).
+    cfg["render"]["fg_format"] = "bgra"
 
     cfg["atlas"]["atlas_json"] = str((m0_repo / "assets" / "atlas.min.json").resolve())
     cfg["atlas"]["affine_points_yaml"] = str((m0_repo / "configs" / "affine_points.yaml").resolve())
@@ -304,9 +316,9 @@ def _run_m0_one_chunk(
     t_verify0 = time.perf_counter()
     missing = []
     for i in range(expected_frames):
-        p = local_fg_dir / f"{frame_offset + frame0 + i:08d}.png"
-        if not p.exists():
-            missing.append(str(p))
+        idx = int(frame_offset + frame0 + i)
+        if not _fg_frame_exists(local_fg_dir, idx):
+            missing.append(str(local_fg_dir / f"{idx:08d}.bgra|.png"))
     _m0_timing_add(timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0)
 
     if missing:
@@ -726,8 +738,7 @@ def _m0_pipeline_verify_pngs_exist(
     if int(global_frame1) <= int(global_frame0):
         return False
     for i in range(int(global_frame1) - int(global_frame0)):
-        p = watch_fg_dir / f"{int(global_frame0) + i:08d}.png"
-        if not p.exists():
+        if not _fg_frame_exists(watch_fg_dir, int(global_frame0) + i):
             return False
     return True
 

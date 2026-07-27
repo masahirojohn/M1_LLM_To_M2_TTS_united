@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
 import time
 from pathlib import Path
 
@@ -18,6 +19,27 @@ def _read_bgra_png(path: Path) -> np.ndarray:
     if img.ndim != 3 or img.shape[2] != 4:
         raise RuntimeError(f"FG must be BGRA png: {path} shape={img.shape}")
     return img
+
+
+def _read_bgra_raw(path: Path) -> np.ndarray:
+    """Phase 9 raw FG: magic 'M0BG' + uint32 w/h LE + BGRA bytes."""
+    data = Path(path).read_bytes()
+    if len(data) < 12:
+        raise RuntimeError(f"fg bgra too short: {path}")
+    magic, w, h = struct.unpack_from("<4sII", data, 0)
+    if magic != b"M0BG":
+        raise RuntimeError(f"fg bgra bad magic: {path} magic={magic!r}")
+    need = 12 + int(w) * int(h) * 4
+    if len(data) < need:
+        raise RuntimeError(f"fg bgra truncated: {path} have={len(data)} need={need}")
+    arr = np.frombuffer(data, dtype=np.uint8, offset=12, count=int(w) * int(h) * 4)
+    return arr.reshape((int(h), int(w), 4)).copy()
+
+
+def _read_fg_frame(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".bgra":
+        return _read_bgra_raw(path)
+    return _read_bgra_png(path)
 
 
 def _overlay(bg_bgr: np.ndarray, fg_bgra: np.ndarray) -> np.ndarray:
@@ -137,8 +159,16 @@ def _resolve_ssot_target(
     }
 
 
-def _fg_png_path(fg_dir: Path, frame_idx: int) -> Path:
-    return fg_dir / f"{int(frame_idx):08d}.png"
+def _fg_frame_path(fg_dir: Path, frame_idx: int) -> Path | None:
+    """Prefer Phase9 raw .bgra, fall back to .png (disk FG boundary)."""
+    idx = int(frame_idx)
+    bgra = fg_dir / f"{idx:08d}.bgra"
+    if bgra.exists():
+        return bgra
+    png = fg_dir / f"{idx:08d}.png"
+    if png.exists():
+        return png
+    return None
 
 
 def _find_latest_fg_at_or_before(
@@ -148,7 +178,7 @@ def _find_latest_fg_at_or_before(
     hint_frame: int | None,
     max_scan: int = 256,
 ) -> tuple[Path, int] | None:
-    """Latest existing PNG with index <= target_frame (never ahead of audio_ms).
+    """Latest existing FG (.bgra/.png) with index <= target_frame (never ahead of audio_ms).
 
     Phase7 Hotfix: avoid idle_hold freeze on missing exact target by catching up
     to the newest ready frame at/before audio. hint_frame accelerates the scan.
@@ -161,15 +191,15 @@ def _find_latest_fg_at_or_before(
     if hint_frame is not None:
         hint = int(hint_frame)
         if 0 <= hint <= hi:
-            p = _fg_png_path(fg_dir, hint)
-            if p.exists():
+            p = _fg_frame_path(fg_dir, hint)
+            if p is not None:
                 # Try to walk forward from hint toward target (small gap catch-up).
                 best_i = hint
                 best_p = p
                 fwd_lim = min(hi, hint + max(1, int(max_scan)))
                 for i in range(hint + 1, fwd_lim + 1):
-                    cand = _fg_png_path(fg_dir, i)
-                    if cand.exists():
+                    cand = _fg_frame_path(fg_dir, i)
+                    if cand is not None:
                         best_i = i
                         best_p = cand
                     else:
@@ -178,8 +208,8 @@ def _find_latest_fg_at_or_before(
 
     lo = max(0, hi - max(0, int(max_scan)) + 1)
     for i in range(hi, lo - 1, -1):
-        p = _fg_png_path(fg_dir, i)
-        if p.exists():
+        p = _fg_frame_path(fg_dir, i)
+        if p is not None:
             return p, int(i)
     return None
 
@@ -403,8 +433,8 @@ def main() -> int:
                 # Follow audio only while actually playing; hold otherwise.
                 if str(target["state"]) == "PLAYING":
                     target_i = int(target["target_frame"])
-                    cand = _fg_png_path(fg_dir, target_i)
-                    if cand.exists():
+                    cand = _fg_frame_path(fg_dir, target_i)
+                    if cand is not None:
                         fg_path = cand
                         display_frame_idx = target_i
                         max_existing_frame = (
@@ -413,7 +443,7 @@ def main() -> int:
                             else max(int(max_existing_frame), target_i)
                         )
                     else:
-                        # Phase7 Hotfix: catch up to newest PNG <= audio target.
+                        # Phase7 Hotfix: catch up to newest FG <= audio target.
                         # Never select a frame ahead of audio_ms (Sync SSOT preserved).
                         missing_png = True
                         hint = max_existing_frame
@@ -488,7 +518,7 @@ def main() -> int:
 
             for _ in range(5):
                 try:
-                    fg = _read_bgra_png(fg_path)
+                    fg = _read_fg_frame(fg_path)
                     break
                 except RuntimeError as e:
                     last_err = e
