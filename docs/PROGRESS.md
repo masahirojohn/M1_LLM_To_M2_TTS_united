@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` / `phase3-pass` / `phase4-pass` / `phase5-pass` / `phase6-pass` / `phase5b-pass` / `phase7-pass` / `phase8-pass` |
+| マイルストーン tag | `phase2-pass` … `phase8-pass` / `phase9-pass`（任意） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -30,6 +30,10 @@
 | 7 | 性能（O(N²)/lock/供給）（任意） | `pass` | 2026-07-26（Pass-with-defer） |
 | 8 | 品質・供給遅延（任意） | `pass` | 2026-07-26（Pass-with-defer） |
 | 9 | M0 latency（任意） | `pass` | 2026-07-27 |
+| 10 | 供給ストレス / inmemory ON ゲート | `pass` | 2026-07-27（Pass-with-defer） |
+| 11 | battle / event 方式2 回帰（予約） | `pending` | —（今やる） |
+| 12 | 待機モーション再配線（予約） | `pending` | — |
+| 13 | マルチ M0（予約・将来 Go） | `pending` | —（11/12 後。今は未着手） |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
 
@@ -334,6 +338,71 @@
 - After: m0_frame p50≈9.5ms、png_wait p90 658→~380–392、REBUFFERING 14→3。Cable `135832`＋実mic `141053` 主観ほぼ正常。
 - lock 影は残るが絶対値追随。マルチ M0 なし。残 REBUFFERING=3 / 末尾 ENQUEUE_BLOCKED は軽微。
 - **Pass（2026-07-27）。Keep All 可。**
+- 次ライン: Phase 10（供給ストレス / inmemory ON ゲート）→ 11/12 は予約
+
+---
+
+## Phase 10: 供給ストレス / inmemory ON ゲート
+
+**前提:** Phase 0–9 完了。目的は **マルチプロセス実装ではなく要否判断のための定量データ**。
+
+**注意:** 旧「Phase10 STEP1」ベースライン（tag `phase10-local-vad-baseline`）とは別物。本 Phase は新規の供給ストレステスト。
+
+**スコープ決定（2026-07-27）:**
+- 順序固定: **(1) `--fast_inmemory` ON 同ボリューム再ベース → (2) 長文（縦）→ (3) 多ターン耐久（横）**
+- 比較軸: Phase9 OFF（例: `sess_phase1_client_vad_20260727_141053`）を残す。ON は M1 I/O 層（`png_wait` ゼロ前提にしない）
+- 負荷再現: Live の「文数」は保証されない → `voice_s` / 固定シナリオ等で負荷を再現可能にする
+- **禁止:** マルチ M0 実装、音声先行 enqueue、clear 隠蔽、図A/方式2/SSOT 破壊。無理な Hotfix で Pass しない
+
+**Pass 基準:**
+- [x] **Step1（ON 同ボリューム）:** Phase9 と同程度の負荷で `--fast_inmemory` ON。disk/queue_wait/後半 lock ドミノの改善または説明。不変条件維持
+- [x] **Step2（長文・縦）:** REBUFFERING/UNDERRUN・png_wait/m0_ms の単調悪化を報告 → **マルチ M0 Go/No-Go を子が提案、親が承認**（実装は含めない）
+- [x] **Step3（多ターン・横）:** 目安 10 ターンでターン間蓄積なし（または蓄積理由を記録）。マルチ判断とは分離可
+- [x] 全 Step で不変条件維持（AUDIO_BEFORE_M0 実 enqueue 0、SSOT_WAIT 回帰なし、通常 clear 0、方式2、図A）
+
+**子チャット報告:**
+- 本番 `live_runtime/` コード変更なし。計測ヘルパ `tools/phase10_*` のみ。
+- Step1 ON: knn/queue_wait/lock は P9 OFF 並み〜改善。png_wait は残（別レイヤ）。不変条件 OK。主観も概ね正常・末尾途切れ軽微。
+- Step2: knn/m0/lock 単調悪化、後半描画停滞→AUDIO_BEFORE_M0 block（enqueue せず）。Live 長尺再現は弱いが固定台本で縦飽和は定量化。
+- Step3: turns=10、ターン間 queue_wait 蓄積なし。
+- 子マルチ提案: Conditional。**親確定（2026-07-27）: 将来 Go（運用で AI 2–3文以上想定）・今は未着手。実装順は Phase11→12→13。**
+- **Pass-with-defer。Keep All 可（計測ヘルパ）。**
+
+**運用判断（親）:**
+- マルチ M0 実装は本 Phase に含めない → **Phase 13（予約）**
+- 次: Phase 11（battle/event）→ Phase 12（待機モーション）→ Phase 13（マルチ M0）
+
+---
+
+## Phase 11: battle / event 方式2 回帰
+
+**前提:** Phase 10 Pass。単一 Worker のまま機能・SSOT・割り込みを固める（マルチより先）。
+
+**参照:** `docs/battle_runtime_talkover_ops.md` / `docs/event_runtime_ops.md`
+**想定:** Phase4 talkover は一部済み。本番の主導権・event 動画・battle 経路を方式2（activity_start/end、通常 clear 禁止）で通し確認・必要最小修正。
+
+**Pass 基準（骨子）:**
+- [ ] battle / talkover / interrupt が方式2 で通し Pass（通常ターン clear 0、割り込み時のみ clear）
+- [ ] event 動画経路が現行パイプラインで破綻しない（詳細は子プロンプト）
+- [ ] 図A / Sync SSOT / jitter / Phase9–10 成果を壊さない
+- [ ] マルチ M0 を導入しない
+
+**子チャット報告:** （ここにサマリーを貼る）
+
+---
+
+## Phase 12: 待機モーション再配線（予約）
+
+**状態:** 予約。Phase 11 後。
+**想定:** 旧 Phase10 STEP2 idle silent PCM 相当を方式2 に再配線。相手発話中の BGV 停止を解消。Sync SSOT / jitter / VAD に触る。
+
+---
+
+## Phase 13: マルチ M0（予約・将来 Go）
+
+**状態:** 予約。**要否は Go（将来必須）・今は未着手。** Phase 11/12 完了後に親が詳細プロンプトを定義。
+**根拠（Phase10）:** 短〜中・多ターンは単一で実用可。連続長尺（単ターン実 M0 20+ chunk / 音声 8–10s 超、運用上は AI 2–3文以上）では単一 Worker が縦飽和。
+**禁止（今）:** Phase 10–12 にマルチ実装を混ぜない。
 
 ---
 
@@ -366,3 +435,5 @@
 | 2026-07-26 | `phase8-pass` tag。Phase 9（M0 latency）Pass 基準定義・子プロンプト投下 |
 | 2026-07-26 | Phase 9 追記: FGは受け口セット、ffmpeg非本命、計測分解ファースト |
 | 2026-07-27 | Phase 9 Pass。m0_frame/png_wait/REBUFFERING 改善。BGRA+VirtualCam セット。Keep All 可 |
+| 2026-07-27 | Phase 10–12 追加。Phase 10=供給ストレス/inmemory ON ゲート（今やる）。11/12 予約 |
+| 2026-07-27 | Phase 10 Pass-with-defer。マルチ=将来Go・未着手→Phase13。次=Phase11 |

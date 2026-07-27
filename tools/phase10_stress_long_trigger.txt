@@ -1,0 +1,8 @@
+[STRESS FIXED SCRIPT] Do NOT answer briefly. Speak continuously for at least 90 seconds in Japanese.
+Cover these topics in order, 5-8 sentences each, without stopping:
+1) weather and how your body feels
+2) breakfast details and taste
+3) a long summary of a funny video
+4) a favorite walking route and scenery
+5) tonight plans and why
+End with a 2-sentence recap. Call set_emotion once before speaking.
