@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` … `phase8-pass` / `phase9-pass`（任意） / `phase10-pass`（`7cd325e`） |
+| マイルストーン tag | `phase2-pass` … `phase8-pass` / `phase9-pass`（任意） / `phase10-pass`（`7cd325e`） / `phase11-pass`（`0a140da`） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -32,8 +32,8 @@
 | 9 | M0 latency（任意） | `pass` | 2026-07-27 |
 | 10 | 供給ストレス / inmemory ON ゲート | `pass` | 2026-07-27（Pass-with-defer） |
 | 11 | battle / event 方式2 回帰 | `pass` | 2026-07-28 |
-| 12 | 待機モーション再配線（予約） | `pending` | —（今やる） |
-| 13 | マルチ M0（予約・将来 Go） | `pending` | —（11/12 後。今は未着手） |
+| 12 | 待機モーション再配線 | `pass` | 2026-07-28（Pass-with-defer） |
+| 13 | マルチ M0（予約・将来 Go） | `pending` | —（今やる・親プロンプト投下） |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
 
@@ -395,6 +395,7 @@
 - 主観 UI: `sess_phase11_subj_20260728_144019` — 割り込み×2＋evt_001、音声・口形破綻なし。主導権は未実施（API 1007 教訓でスキップ→後続可）。
 - 申し送り: ops docs が旧 soft cut-in のまま（親が更新可）。event clear は player のみで chunk cancel なし（今回破綻なし）。
 - **Pass（2026-07-28）。Keep All 可（任意ヘルパ）。次=Phase 12。**
+- tag: `phase11-pass`（commit `0a140da`）付与済み（2026-07-28）。
 
 ---
 
@@ -410,20 +411,32 @@
 - **禁止:** マルチ M0、音声先行 enqueue、clear 隠蔽、図A 破壊
 
 **Pass 基準（骨子）:**
-- [ ] 待機中に BGV／待機モーションが意図どおり動く（相手発話中の固着解消または仕様どおりの挙動をログ＋主観で説明）
-- [ ] ターン開始／割り込み／event と衝突しない（idle 解除が正しい）
-- [ ] Sync SSOT（audio_ms）を壊さない。通常 clear 0
-- [ ] 方式2 / 図A / Phase11 battle・event を回帰させない
+- [x] 待機中に BGV／待機モーションが意図どおり動く（相手発話中の固着解消または仕様どおりの挙動をログ＋主観で説明）
+- [x] ターン開始／割り込み／event と衝突しない（idle 解除が正しい）
+- [x] Sync SSOT（audio_ms）を壊さない。通常 clear 0
+- [x] 方式2 / 図A / Phase11 battle・event を回帰させない
 
-**子チャット報告:** （ここにサマリーを貼る）
+**子チャット報告:**
+- idle silent PCM を図A（KNN→M0→enqueue）＋ just-in-time。VirtualCam は非 PLAYING 時も BG＋last FG（`IDLE_BG_ADVANCE`）。
+- ログ: idle2 / talkover。主観: `212320`（待機中 M0+BGV）、`213108`（talkover/event 整合）。通常 clear 0、AUDIO_BEFORE 0、SSOT_WAIT 0。
+- defer: 待機中に稀に FG 抜け（単一 M0 vs idle 40ms）。致命ではない → 間隔緩和 or Phase13。
+- **Pass-with-defer（2026-07-28）。Keep All 可。次=Phase 13。**
 
 ---
 
-## Phase 13: マルチ M0（予約・将来 Go）
+## Phase 13: マルチ M0
 
-**状態:** 予約。**要否は Go（将来必須）・今は未着手。** Phase 11/12 完了後に親が詳細プロンプトを定義。
-**根拠（Phase10）:** 短〜中・多ターンは単一で実用可。連続長尺（単ターン実 M0 20+ chunk / 音声 8–10s 超、運用上は AI 2–3文以上）では単一 Worker が縦飽和。
-**禁止（今）:** Phase 10–12 にマルチ実装を混ぜない。
+**前提:** Phase 12 Pass-with-defer。要否は Phase10 で **将来 Go** 確定。単一 Worker の縦飽和・idle 供給を容量で緩和する。
+
+**目的:** 単一 M0 Worker 瓶颈を、不変条件を壊さず並列化（または同等の容量拡張）で緩和する。
+
+**Pass 基準（骨子・詳細は子プロンプト）:**
+- [ ] 長尺／高 chunk 負荷で png_wait・m0_lock・REBUFFERING（または idle FG 抜け）が単一比で改善
+- [ ] 図A（到着順 enqueue、AUDIO_BEFORE 実 enqueue 0）、方式2、SSOT、idle/talkover/event を壊さない
+- [ ] 設計・実装前に境界を守り、無断の音声先行／短タイムアウト／clear 隠蔽をしない
+- [ ] 残件は defer 可（無理な Hotfix で Pass しない）
+
+**子チャット報告:** （ここにサマリーを貼る）
 
 ---
 
@@ -460,3 +473,5 @@
 | 2026-07-27 | Phase 10 Pass-with-defer。マルチ=将来Go・未着手→Phase13。次=Phase11 |
 | 2026-07-28 | `phase10-pass` tag（`7cd325e`）付与確認 |
 | 2026-07-28 | Phase 11 Pass。talkover/event 方式2 通し。次=Phase12 待機モーション |
+| 2026-07-28 | `phase11-pass` tag（`0a140da`）付与確認 |
+| 2026-07-28 | Phase 12 Pass-with-defer。idle silent 図A再配線。次=Phase13 マルチ M0 |

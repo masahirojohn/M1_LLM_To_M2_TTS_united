@@ -503,12 +503,34 @@ def main() -> int:
                                 last_logged_target = log_key
 
             if fg_path is None:
-                if args.idle_hold and last_rgb is not None:
-                    cam.send(last_rgb)
+                if args.idle_hold and (last_fg is not None or last_rgb is not None):
+                    # Phase12: do not re-send frozen last_rgb composite.
+                    # Advance BGV; hold last FG (or BG-only) while player is not PLAYING
+                    # / SSOT target FG is missing. Lip-sync SSOT still only selects FG
+                    # while state==PLAYING above.
+                    try:
+                        if last_fg is not None:
+                            comp_bgr = _overlay(bg, last_fg)
+                            comp_rgb = cv2.cvtColor(comp_bgr, cv2.COLOR_BGR2RGB)
+                        else:
+                            comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
+                        cam.send(comp_rgb)
+                        last_rgb = comp_rgb
+                    except Exception:
+                        if last_rgb is not None:
+                            cam.send(last_rgb)
                     cam.sleep_until_next_frame()
                     sent += 1
                     if sent % 25 == 0:
                         print(f"[virtualcam_persistent] sent={sent}", flush=True)
+                        if target is not None and str(target.get("state")) != "PLAYING":
+                            print(
+                                "[sync][virtualcam][IDLE_BG_ADVANCE]",
+                                f"state={target.get('state')}",
+                                f"audio_ms={int(target.get('audio_ms', 0) or 0)}",
+                                f"sent={sent}",
+                                flush=True,
+                            )
                     continue
                 time.sleep(float(args.poll_s))
                 continue

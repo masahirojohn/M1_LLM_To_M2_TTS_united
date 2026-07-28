@@ -1151,6 +1151,15 @@ async def _apply_user_interrupt_clear(
 
     turn_state["interrupt_clear_in_progress"] = True
     try:
+        idle_stop = turn_state.get("idle_silent_stop_event")
+        if isinstance(idle_stop, asyncio.Event) and not idle_stop.is_set():
+            idle_stop.set()
+            print(
+                "[idle_silent_pcm][STOP_ON_INTERRUPT]",
+                f"reason={reason}",
+                flush=True,
+            )
+
         min_seq = int(turn_state.get("pipeline_next_seq", 0) or 0)
         turn_state["pipeline_interrupt_min_seq"] = min_seq
 
@@ -2482,6 +2491,7 @@ class _AudioPipelineJob:
     mouth_obj_ref: dict[str, Any] | None
     fast_inmemory: bool
     skip_archive_pcm: bool
+    is_idle_silent: bool = False
 
 
 @dataclass
@@ -3235,6 +3245,18 @@ async def _pipeline_enqueue_dispatcher_loop(
                         turn_state=turn_state,
                         effective_playback=item.effective_playback,
                     )
+                    if bool(getattr(item.job, "is_idle_silent", False)):
+                        n = int(turn_state.get("idle_silent_enqueue_n", 0) or 0) + 1
+                        turn_state["idle_silent_enqueue_n"] = n
+                        if n == 1 or (n % 25) == 0:
+                            print(
+                                "[idle_silent_pcm][enqueue]",
+                                f"n={n}",
+                                f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                                f"pipeline_seq={int(item.pipeline_seq)}",
+                                f"bytes={len(item.effective_playback)}",
+                                flush=True,
+                            )
             elif item.effective_playback and item.enqueue_blocked:
                 print(
                     "[sync][pipeline_chunk][ENQUEUE_BLOCKED]",
@@ -3346,6 +3368,253 @@ async def _pipeline_enqueue_dispatcher_loop(
             break
 
 
+def _read_player_buffer_snapshot(
+    turn_state: dict[str, Any],
+) -> tuple[float, str, int]:
+    """Return (pending_ms, state, initial_buffer_ms)."""
+    pending_ms = 0.0
+    state = "UNKNOWN"
+    initial_buffer_ms = 0
+    path = turn_state.get("playback_state_file")
+    if path is not None:
+        try:
+            p = Path(path)
+            if p.exists():
+                obj = json.loads(p.read_text(encoding="utf-8-sig"))
+                if isinstance(obj, dict):
+                    state = str(obj.get("state", "UNKNOWN") or "UNKNOWN")
+                    pending_ms = float(obj.get("pending_ms", 0.0) or 0.0)
+                    initial_buffer_ms = int(obj.get("initial_buffer_ms", 0) or 0)
+                    return float(pending_ms), state, int(initial_buffer_ms)
+        except Exception:
+            pass
+    ref = turn_state.get("audio_playback_state_ref")
+    if isinstance(ref, dict):
+        try:
+            with ref["lock"]:
+                pending_ms = float(ref.get("pending_ms", 0.0) or 0.0)
+        except Exception:
+            pending_ms = 0.0
+    return float(pending_ms), state, int(initial_buffer_ms)
+
+
+async def _alloc_pipeline_slot(
+    turn_state: dict[str, Any],
+    *,
+    advance_playback_idx: bool,
+) -> tuple[int, int]:
+    """Allocate (pipeline_seq, playback_chunk_idx) under shared lock."""
+    lock = turn_state.get("pipeline_alloc_lock")
+    if not isinstance(lock, asyncio.Lock):
+        lock = asyncio.Lock()
+        turn_state["pipeline_alloc_lock"] = lock
+    async with lock:
+        seq = int(turn_state.get("pipeline_next_seq", 0) or 0)
+        turn_state["pipeline_next_seq"] = int(seq) + 1
+        pb_idx = int(turn_state.get("pipeline_playback_chunk_idx", 0) or 0)
+        if advance_playback_idx:
+            turn_state["pipeline_playback_chunk_idx"] = int(pb_idx) + 1
+        return int(seq), int(pb_idx)
+
+
+async def _idle_silent_pcm_loop(
+    *,
+    stop_event: asyncio.Event,
+    ai_audio_started_event: asyncio.Event | None,
+    turn_state: dict[str, Any],
+    pcm_stream_chunks_dir: Path,
+    audio_response_pcm: Path,
+    mouth_streamer: MouthStreamerOC,
+    mouth_streamer_json: Path,
+    mouth_raw_json: Path,
+    mouth_json: Path,
+    knn_script: Path,
+    gt_glob: str,
+    step_ms: int,
+    mouth_obj_ref: dict[str, Any] | None,
+    knn_inmemory: bool,
+    m0_inmemory: bool,
+    fast_inmemory: bool,
+    interval_ms: int,
+    pending_target_ms: int,
+) -> None:
+    """Phase12: feed silent PCM through 図A (KNN→M0→enqueue) while waiting.
+
+    Keeps player PLAYING / audio_ms advancing so VirtualCam BGV + idle mouth move.
+    Just-in-time: only inject when pending_ms < pending_target_ms to limit residual
+    silence ahead of real AI audio (no normal-turn clear_queue).
+    """
+    input_sr = 24000
+    samples_per_chunk = max(1, int(round(input_sr * int(interval_ms) / 1000.0)))
+    silent_pcm = bytes(samples_per_chunk * 2)
+    target_pending = max(int(interval_ms), int(pending_target_ms))
+
+    i = 0
+    injected = 0
+    t0 = time.perf_counter()
+    print(
+        "[idle_silent_pcm][START]",
+        f"input_sr={input_sr}",
+        f"interval_ms={int(interval_ms)}",
+        f"samples={samples_per_chunk}",
+        f"bytes={len(silent_pcm)}",
+        f"pending_target_ms={int(target_pending)}",
+        flush=True,
+    )
+
+    try:
+        # Wait until receive_loop enables 図A pipeline.
+        while not stop_event.is_set():
+            if ai_audio_started_event is not None and ai_audio_started_event.is_set():
+                print(
+                    "[idle_silent_pcm][STOP_ON_REAL_AUDIO]",
+                    "phase=wait_pipeline",
+                    flush=True,
+                )
+                return
+            if turn_state.get("pipeline_enqueue_queue_ref") is not None:
+                break
+            await asyncio.sleep(0.02)
+
+        while not stop_event.is_set():
+            if ai_audio_started_event is not None and ai_audio_started_event.is_set():
+                print(
+                    "[idle_silent_pcm][STOP_ON_REAL_AUDIO]",
+                    f"i={i}",
+                    f"injected={injected}",
+                    f"elapsed_s={time.perf_counter() - t0:.3f}",
+                    flush=True,
+                )
+                break
+
+            pending_ms, player_state, initial_buffer_ms = _read_player_buffer_snapshot(
+                turn_state
+            )
+            effective_target = max(int(target_pending), int(initial_buffer_ms))
+            # Maintain a shallow buffer so handoff residual stays small.
+            # While BUFFERING, fill at least initial_buffer so PLAYING can start.
+            if float(pending_ms) >= float(effective_target) and str(player_state) in (
+                "PLAYING",
+                "BUFFERING",
+            ):
+                i += 1
+                await asyncio.sleep(max(0.001, float(interval_ms) / 1000.0))
+                continue
+
+            enqueue_queue = turn_state.get("pipeline_enqueue_queue_ref")
+            inflight_sem = turn_state.get("pipeline_inflight_sem")
+            pipeline_io_ref = turn_state.get("pipeline_io_ref")
+            m0_pipeline_ref = turn_state.get("m0_pipeline_ref")
+            active_tasks = turn_state.get("pipeline_active_tasks_ref")
+            if (
+                enqueue_queue is None
+                or inflight_sem is None
+                or not isinstance(pipeline_io_ref, dict)
+                or not isinstance(active_tasks, list)
+            ):
+                await asyncio.sleep(0.02)
+                continue
+
+            # Avoid unbounded tasks waiting on inflight_sem (interrupt cancel spam).
+            alive_n = len([t for t in active_tasks if t is not None and not t.done()])
+            if int(alive_n) >= int(_PIPELINE_MAX_INFLIGHT):
+                i += 1
+                await asyncio.sleep(max(0.001, float(interval_ms) / 1000.0))
+                continue
+
+            lock = turn_state.get("pipeline_alloc_lock")
+            if not isinstance(lock, asyncio.Lock):
+                lock = asyncio.Lock()
+                turn_state["pipeline_alloc_lock"] = lock
+
+            async with lock:
+                if (
+                    ai_audio_started_event is not None
+                    and ai_audio_started_event.is_set()
+                ):
+                    print(
+                        "[idle_silent_pcm][STOP_ON_REAL_AUDIO]",
+                        f"i={i}",
+                        f"injected={injected}",
+                        f"elapsed_s={time.perf_counter() - t0:.3f}",
+                        flush=True,
+                    )
+                    break
+                if stop_event.is_set():
+                    break
+                seq = int(turn_state.get("pipeline_next_seq", 0) or 0)
+                turn_state["pipeline_next_seq"] = int(seq) + 1
+                pb_idx = int(turn_state.get("pipeline_playback_chunk_idx", 0) or 0)
+                turn_state["pipeline_playback_chunk_idx"] = int(pb_idx) + 1
+
+            job = _AudioPipelineJob(
+                ctx_id="turn",
+                playback_chunk_idx=int(pb_idx),
+                playback_epoch=int(
+                    turn_state.get(
+                        "audio_playback_accept_epoch",
+                        _AUDIO_PLAYBACK_EPOCH_GAP,
+                    )
+                ),
+                audio=silent_pcm,
+                playback_audio=silent_pcm,
+                pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                audio_response_pcm=audio_response_pcm,
+                mouth_streamer=mouth_streamer,
+                mouth_streamer_json=mouth_streamer_json,
+                mouth_raw_json=mouth_raw_json,
+                mouth_json=mouth_json,
+                knn_script=knn_script,
+                gt_glob=gt_glob,
+                step_ms=int(step_ms),
+                knn_inmemory=bool(knn_inmemory),
+                m0_inmemory=bool(m0_inmemory),
+                mouth_obj_ref=mouth_obj_ref,
+                fast_inmemory=bool(fast_inmemory),
+                # Idle silence: skip archive I/O; still enqueues to player for SSOT.
+                skip_archive_pcm=True,
+                is_idle_silent=True,
+            )
+            task = asyncio.create_task(
+                _process_pipeline_chunk_task(
+                    job=job,
+                    pipeline_seq=int(seq),
+                    m0_pipeline_ref=m0_pipeline_ref,
+                    enqueue_queue=enqueue_queue,
+                    turn_state=turn_state,
+                    pipeline_io_ref=pipeline_io_ref,
+                    inflight_sem=inflight_sem,
+                    stop_event=stop_event,
+                ),
+                name=f"idle_silent_chunk_{seq}",
+            )
+            active_tasks.append(task)
+            active_tasks[:] = [t for t in active_tasks if not t.done()]
+            injected += 1
+            if injected == 1 or (injected % 25) == 0:
+                print(
+                    "[idle_silent_pcm][inject]",
+                    f"i={i}",
+                    f"injected={injected}",
+                    f"pipeline_seq={int(seq)}",
+                    f"chunk_idx={int(pb_idx)}",
+                    f"pending_ms={float(pending_ms):.1f}",
+                    f"state={player_state}",
+                    f"elapsed_s={time.perf_counter() - t0:.3f}",
+                    flush=True,
+                )
+            i += 1
+            await asyncio.sleep(max(0.001, float(interval_ms) / 1000.0))
+    finally:
+        print(
+            "[idle_silent_pcm][STOP]",
+            f"chunks_loop={i}",
+            f"injected={injected}",
+            f"elapsed_s={time.perf_counter() - t0:.3f}",
+            flush=True,
+        )
+
+
 async def _receive_loop(
     *,
     session: Any,
@@ -3370,12 +3639,12 @@ async def _receive_loop(
     m0_inmemory: bool = False,
     fast_inmemory: bool = False,
     skip_archive_pcm: bool = False,
+    ai_audio_started_event: asyncio.Event | None = None,
 ) -> None:
     audio_response_pcm.parent.mkdir(parents=True, exist_ok=True)
     pcm_stream_chunks_dir.mkdir(parents=True, exist_ok=True)
 
     audio_chunk_idx = 0
-    playback_chunk_idx = 0
     drop_initial_audio_bytes_remaining = max(
         0,
         int(round(24000 * 2 * int(drop_initial_audio_ms) / 1000.0)),
@@ -3389,12 +3658,14 @@ async def _receive_loop(
     pipeline_enqueue_queue: asyncio.Queue | None = None
     pipeline_enqueue_dispatcher_task: asyncio.Task | None = None
     pipeline_inflight_sem: asyncio.Semaphore | None = None
-    pipeline_seq = 0
     pipeline_active_tasks: list[asyncio.Task[None]] = []
     m0_pipeline_ref = turn_state.get("m0_pipeline_ref")
     turn_state["pipeline_active_tasks_ref"] = pipeline_active_tasks
     turn_state["pipeline_next_seq"] = 0
+    turn_state["pipeline_playback_chunk_idx"] = 0
     turn_state["pipeline_interrupt_min_seq"] = 0
+    turn_state["pipeline_alloc_lock"] = asyncio.Lock()
+    turn_state["pipeline_io_ref"] = pipeline_io_ref
     if mouth_obj_ref is not None:
         turn_state["mouth_obj_ref"] = mouth_obj_ref
 
@@ -3406,6 +3677,7 @@ async def _receive_loop(
         pipeline_enqueue_queue = asyncio.Queue()
         turn_state["pipeline_enqueue_queue_ref"] = pipeline_enqueue_queue
         pipeline_inflight_sem = asyncio.Semaphore(_PIPELINE_MAX_INFLIGHT)
+        turn_state["pipeline_inflight_sem"] = pipeline_inflight_sem
         pipeline_enqueue_dispatcher_task = asyncio.create_task(
             _pipeline_enqueue_dispatcher_loop(
                 enqueue_queue=pipeline_enqueue_queue,
@@ -3585,6 +3857,17 @@ async def _receive_loop(
                         )
 
                     if audio:
+                        if (
+                            ai_audio_started_event is not None
+                            and not ai_audio_started_event.is_set()
+                        ):
+                            ai_audio_started_event.set()
+                            print(
+                                "[idle_silent_pcm][real_audio_started]",
+                                f"active_turn={turn_state.get('active_turn')}",
+                                flush=True,
+                            )
+
                         now = time.perf_counter()
                         turn_state["last_audio_perf"] = now
 
@@ -3643,6 +3926,11 @@ async def _receive_loop(
                             and pipeline_inflight_sem is not None
                         ):
                             # 図A: PCM到着で非同期フォーク。KNN+M0はタスク内、enqueueはdispatcher。
+                            # Shared alloc with idle_silent so seq/chunk_idx stay ordered.
+                            pipeline_seq, playback_chunk_idx = await _alloc_pipeline_slot(
+                                turn_state,
+                                advance_playback_idx=bool(playback_audio),
+                            )
                             job = _AudioPipelineJob(
                                 ctx_id="turn",
                                 playback_chunk_idx=int(playback_chunk_idx),
@@ -3668,11 +3956,9 @@ async def _receive_loop(
                                 mouth_obj_ref=mouth_obj_ref,
                                 fast_inmemory=bool(fast_inmemory),
                                 skip_archive_pcm=bool(skip_archive_pcm),
+                                is_idle_silent=False,
                             )
-                            if playback_audio:
-                                playback_chunk_idx += 1
                             audio_chunk_idx += 1
-                            turn_state["pipeline_next_seq"] = int(pipeline_seq) + 1
                             task = asyncio.create_task(
                                 _process_pipeline_chunk_task(
                                     job=job,
@@ -3690,9 +3976,11 @@ async def _receive_loop(
                             pipeline_active_tasks[:] = [
                                 t for t in pipeline_active_tasks if not t.done()
                             ]
-                            pipeline_seq += 1
                         else:
                             # Legacy Phase10 file-watch path (pipeline_sync=False).
+                            playback_chunk_idx = int(
+                                turn_state.get("pipeline_playback_chunk_idx", 0) or 0
+                            )
                             if audio_f_legacy is not None:
                                 audio_f_legacy.write(audio)
                                 audio_f_legacy.flush()
@@ -3703,7 +3991,9 @@ async def _receive_loop(
                                     / f"chunk_{playback_chunk_idx:06d}.pcm"
                                 )
                                 chunk_path.write_bytes(playback_audio)
-                                playback_chunk_idx += 1
+                                turn_state["pipeline_playback_chunk_idx"] = (
+                                    int(playback_chunk_idx) + 1
+                                )
 
                             audio_chunk_idx += 1
 
@@ -3809,6 +4099,8 @@ async def _receive_loop(
 
             turn_state.pop("pipeline_enqueue_order", None)
             turn_state.pop("pipeline_enqueue_queue_ref", None)
+            turn_state.pop("pipeline_inflight_sem", None)
+            turn_state.pop("pipeline_io_ref", None)
             turn_state.pop("mouth_frames_async_event", None)
 
         # Close archive PCM only after pipeline tasks + dispatcher drain.
@@ -4714,6 +5006,7 @@ async def _run(args: argparse.Namespace) -> int:
             turn_state["audio_player_proc"] = audio_player_proc
             turn_state["ai_audio_output_device"] = str(args.ai_audio_output_device)
             turn_state["audio_playback_state_ref"] = _make_audio_playback_state_ref()
+            turn_state["playback_state_file"] = playback_state_file
             turn_state["fast_inmemory"] = bool(getattr(args, "fast_inmemory", False))
             turn_state["skip_archive_pcm"] = bool(
                 getattr(args, "fast_inmemory", False)
@@ -4782,6 +5075,9 @@ async def _run(args: argparse.Namespace) -> int:
             turn_audio_stop_event = Event()
             recv_stop = asyncio.Event()
             recv_task: asyncio.Task | None = None
+            idle_silent_stop: asyncio.Event | None = None
+            ai_audio_started_event: asyncio.Event | None = None
+            idle_silent_task: asyncio.Task | None = None
 
             turn_state["active_turn"] = turn_no
             turn_state["turn_start_perf"] = time.perf_counter()
@@ -4840,6 +5136,17 @@ async def _run(args: argparse.Namespace) -> int:
                     stop_event=turn_audio_stop_event,
                 )
 
+            if bool(getattr(args, "idle_silent_pcm_enabled", False)) and bool(
+                pipeline_sync
+            ):
+                ai_audio_started_event = asyncio.Event()
+                idle_silent_stop = asyncio.Event()
+                turn_state["ai_audio_started_event"] = ai_audio_started_event
+                turn_state["idle_silent_stop_event"] = idle_silent_stop
+            else:
+                turn_state.pop("ai_audio_started_event", None)
+                turn_state.pop("idle_silent_stop_event", None)
+
             recv_task = asyncio.create_task(
                 _receive_loop(
                     session=session,
@@ -4864,8 +5171,41 @@ async def _run(args: argparse.Namespace) -> int:
                     m0_inmemory=bool(m0_inmemory),
                     fast_inmemory=bool(fast_inmemory),
                     skip_archive_pcm=bool(skip_archive_pcm),
+                    ai_audio_started_event=ai_audio_started_event,
                 )
             )
+
+            if idle_silent_stop is not None and ai_audio_started_event is not None:
+                idle_silent_task = asyncio.create_task(
+                    _idle_silent_pcm_loop(
+                        stop_event=idle_silent_stop,
+                        ai_audio_started_event=ai_audio_started_event,
+                        turn_state=turn_state,
+                        pcm_stream_chunks_dir=pcm_stream_chunks_dir,
+                        audio_response_pcm=audio_response_pcm,
+                        mouth_streamer=mouth_streamer,
+                        mouth_streamer_json=mouth_streamer_json,
+                        mouth_raw_json=mouth_raw_json,
+                        mouth_json=mouth_json,
+                        knn_script=knn_script,
+                        gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                        step_ms=int(args.step_ms),
+                        mouth_obj_ref=mouth_obj_ref,
+                        knn_inmemory=bool(knn_inmemory),
+                        m0_inmemory=bool(m0_inmemory),
+                        fast_inmemory=bool(fast_inmemory),
+                        interval_ms=int(args.idle_silent_pcm_interval_ms),
+                        pending_target_ms=int(args.idle_silent_pcm_pending_target_ms),
+                    ),
+                    name=f"idle_silent_pcm_turn_{turn_no}",
+                )
+                print(
+                    "[idle_silent_pcm][ready]",
+                    f"turn={turn_no}",
+                    f"interval_ms={int(args.idle_silent_pcm_interval_ms)}",
+                    f"pending_target_ms={int(args.idle_silent_pcm_pending_target_ms)}",
+                    flush=True,
+                )
 
             print(
                 "[session_loop][receive_before_mic_ready]",
@@ -5248,6 +5588,17 @@ async def _run(args: argparse.Namespace) -> int:
                     break
 
                 await asyncio.sleep(0.05)
+
+            if idle_silent_stop is not None:
+                idle_silent_stop.set()
+            if idle_silent_task is not None:
+                await _cancel_tasks_safely(
+                    [idle_silent_task],
+                    tag=f"idle_silent_pcm_turn_{turn_no}",
+                )
+                idle_silent_task = None
+            turn_state.pop("idle_silent_stop_event", None)
+            turn_state.pop("ai_audio_started_event", None)
 
             recv_stop.set()
             await _cancel_tasks_safely(
@@ -5715,6 +6066,34 @@ def main() -> int:
         "--mic_vad_debug",
         action="store_true",
         help="Verbose client mic VAD logs.",
+    )
+
+    # --- Phase 12: idle silent PCM (waiting motion via 図A + Sync SSOT) ---
+    ap.add_argument(
+        "--idle_silent_pcm_enabled",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Inject silent PCM through KNN→M0→player while waiting for AI audio "
+            "(default True). Keeps audio_ms / BGV / idle mouth advancing. "
+            "Use --no-idle_silent_pcm_enabled to disable."
+        ),
+    )
+    ap.add_argument(
+        "--idle_silent_pcm_interval_ms",
+        type=int,
+        default=40,
+        help="Silent PCM chunk interval for idle waiting motion (default 40).",
+    )
+    ap.add_argument(
+        "--idle_silent_pcm_pending_target_ms",
+        type=int,
+        default=200,
+        help=(
+            "Soft cap for player pending_ms while idle-injecting. "
+            "Effective target is max(this, player initial_buffer_ms) so PLAYING can start; "
+            "keeps residual silence before real AI audio small."
+        ),
     )
 
     # --- [ADD] Live API warmup before production turns ---
