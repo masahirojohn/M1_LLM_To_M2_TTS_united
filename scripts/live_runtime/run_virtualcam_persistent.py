@@ -501,13 +501,47 @@ def main() -> int:
                                     flush=True,
                                 )
                                 last_logged_target = log_key
-
+                elif args.idle_hold:
+                    # Phase 14: non-PLAYING (REBUFFERING/BUFFERING) still prefer FG
+                    # at frozen audio_ms / last FG over IDLE_BG-only. Does not
+                    # advance audio clock — display order 2 only.
+                    target_i = int(target["target_frame"])
+                    cand = _fg_frame_path(fg_dir, target_i)
+                    if cand is not None:
+                        fg_path = cand
+                        display_frame_idx = target_i
+                        max_existing_frame = (
+                            target_i
+                            if max_existing_frame is None
+                            else max(int(max_existing_frame), target_i)
+                        )
+                    else:
+                        hint = max_existing_frame
+                        if last_displayed_frame is not None:
+                            hint = (
+                                int(last_displayed_frame)
+                                if hint is None
+                                else max(int(hint), int(last_displayed_frame))
+                            )
+                        fb = _find_latest_fg_at_or_before(
+                            fg_dir=fg_dir,
+                            target_frame=target_i,
+                            hint_frame=hint,
+                        )
+                        if fb is not None:
+                            fg_path, fb_i = fb
+                            display_frame_idx = int(fb_i)
+                            max_existing_frame = (
+                                int(fb_i)
+                                if max_existing_frame is None
+                                else max(int(max_existing_frame), int(fb_i))
+                            )
             if fg_path is None:
                 if args.idle_hold and (last_fg is not None or last_rgb is not None):
-                    # Phase12: do not re-send frozen last_rgb composite.
-                    # Advance BGV; hold last FG (or BG-only) while player is not PLAYING
-                    # / SSOT target FG is missing. Lip-sync SSOT still only selects FG
-                    # while state==PLAYING above.
+                    # Phase12/14: do not re-send frozen last_rgb composite.
+                    # Advance BGV; hold last FG (or BG-only) only when no FG exists
+                    # at/before frozen audio_ms. Non-PLAYING may still select FG
+                    # via the branch above (Phase 14 last-FG preference).
                     try:
                         if last_fg is not None:
                             comp_bgr = _overlay(bg, last_fg)
@@ -524,13 +558,21 @@ def main() -> int:
                     if sent % 25 == 0:
                         print(f"[virtualcam_persistent] sent={sent}", flush=True)
                         if target is not None and str(target.get("state")) != "PLAYING":
-                            print(
-                                "[sync][virtualcam][IDLE_BG_ADVANCE]",
-                                f"state={target.get('state')}",
-                                f"audio_ms={int(target.get('audio_ms', 0) or 0)}",
-                                f"sent={sent}",
-                                flush=True,
+                            # Phase 14: log once per frozen audio_ms (avoid same-ms spam).
+                            idle_key = (
+                                "idle_bg",
+                                int(target.get("audio_ms", 0) or 0),
+                                str(target.get("state")),
                             )
+                            if last_logged_target != idle_key:
+                                print(
+                                    "[sync][virtualcam][IDLE_BG_ADVANCE]",
+                                    f"state={target.get('state')}",
+                                    f"audio_ms={int(target.get('audio_ms', 0) or 0)}",
+                                    f"sent={sent}",
+                                    flush=True,
+                                )
+                                last_logged_target = idle_key
                     continue
                 time.sleep(float(args.poll_s))
                 continue
