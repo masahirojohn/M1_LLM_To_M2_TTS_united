@@ -1252,8 +1252,12 @@ def _m0_pipeline_advance_sync(
                     until_t1_ms is None or int(t0_ms) < int(until_t1_ms)
                 )
                 mouth_frames = _as_frames(obj)
-                needed_frames = int(t1_ms // step_ms)
-                mouth_ready = len(mouth_frames) >= needed_frames
+                # Prefer last t_ms so sparse / non-dense frame lists still gate correctly.
+                if mouth_frames:
+                    last_t = int(mouth_frames[-1].get("t_ms", 0) or 0)
+                    mouth_ready = last_t + int(step_ms) >= int(t1_ms)
+                else:
+                    mouth_ready = False
                 pool_free = m0_pipeline_ref["pool_free"]
                 in_flight = int(m0_pipeline_ref["next_claim_cid"]) > int(
                     m0_pipeline_ref["rendered_chunks"]
@@ -1298,6 +1302,8 @@ def _m0_pipeline_advance_sync(
                     _advance_watermark_locked()
                     continue
 
+                # need_more + mouth_ready + pool_free but claims_this_call hit max:
+                # return so caller retries (do not silently drop coverage).
                 return result
 
         if not claimed or worker_idx is None:

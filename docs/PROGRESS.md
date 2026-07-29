@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` … `phase11-pass`（`0a140da`） / `phase12-pass`（`ce903b9`） |
+| マイルストーン tag | `phase2-pass` … `phase12-pass`（`ce903b9`） / `phase13-pass`（`7d314af`） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -33,8 +33,9 @@
 | 10 | 供給ストレス / inmemory ON ゲート | `pass` | 2026-07-27（Pass-with-defer） |
 | 11 | battle / event 方式2 回帰 | `pass` | 2026-07-28 |
 | 12 | 待機モーション再配線 | `pass` | 2026-07-28（Pass-with-defer） |
-| 13 | マルチ M0 | `pass` | 2026-07-29（Pass-with-defer・Hotfix 待ち） |
-| 14 | IDLE_BG / FG 欠落見え方（予約） | `pending` | —（13 Hotfix で足りなければ昇格） |
+| 13 | マルチ M0 | `pass` | 2026-07-29（Pass-with-defer） |
+| 13hf | claim/coverage Hotfix | `pass` | 2026-07-29（Pass-with-defer） |
+| 14 | 中盤供給 / 末尾 IDLE_BG（任意） | `pending` | —（今やる） |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
 
@@ -451,15 +452,55 @@
 - 常駐プール N=2（clamp 1..4）、chunk claim、watermark、TCP reset、parent_pid teardown。N=1 フォールバック。
 - A/B: lock/REB/CATCHUP 改善。長尺 N=2 主観は口フリーズ・IDLE_BG 増（N=1 より悪化寄り）。多ターンはメトリクス改善・主観「もう一息」。
 - **Pass-with-defer（2026-07-29）。Keep All 可。N=3〜4 即スケール保留。**
-- 残件: IDLE_BG（欠落時口 FG）／FG 供給見え方／多ターン SSOT_CATCHUP → **Phase 13 Hotfix（新子）**。足りなければ Phase 14。
+- tag: `phase13-pass`（M1 commit `7d314af`）付与済み。M0 連携 commit `142aa82`（reset / parent_pid、M0 側 tag なし）。
+- 残件: IDLE_BG／FG 供給／SSOT_CATCHUP。**実装 Hotfix の前に分析専用子で N1/N2 切り分け** → 親が Hotfix/Phase14 を発行。
 
 ---
 
-## Phase 13 Hotfix / Phase 14 候補: IDLE_BG・FG 欠落見え方
+## Phase 13 分析（実装なし・ゲート）
 
-**目的:** マルチ M0 導入後に顕在化した、FG 欠落時の口フリーズ／IDLE_BG 張り付き／過剰 CATCHUP を、N を増やさずに改善する。
-**禁止:** N=3〜4 即スケール、6コア全振り、音声先行 enqueue、clear 隠蔽。
-**詳細:** 下記子プロンプト。
+**目的:** 長尺 N=1 vs N=2 から FG 供給不足の主因レイヤを特定し、N増 Go/No-Go と Hotfix 対象を提案する。コード変更禁止。
+
+**子チャット報告（受理 2026-07-29）:**
+- N=2 は両 Worker 実効並列。lock / late m0 / CATCHUP は改善。
+- 長尺主観悪化の主因: **末尾 claim/coverage 停止 → `rendered_end` 固定 → AUDIO_BEFORE 増 → REBUFFERING → IDLE_BG 連打**（N2 IDLE_BG 5→13、AUDIO_BEFORE 2→18）。
+- **N増: 保留**。次手: Phase13 Hotfix（先に claim/coverage、その後必要なら IDLE_BG 表示）。表示だけで供給穴を隠さない。
+
+---
+
+## Phase 13 Hotfix: claim/coverage → IDLE_BG
+
+**前提:** Phase13 Keep All / `phase13-pass` 済み。分析受理済み。
+**順序:** (1) 末尾 claim/coverage 停止の修正 (2) 必要なら IDLE_BG 表示。供給穴を表示で隠さない。
+**禁止:** 音声先行 enqueue、N=3〜4、clear／短タイムアウト隠蔽、6コア全振り。
+
+**Pass 基準:**
+- [x] 長尺 N2: AUDIO_BEFORE 大幅減、`rendered_end` 不当固定の解消（18→1、claims 114→149、rendered ~17880）
+- [x] 修正順序遵守（claim 先、IDLE_BG 表示未実施）
+- [x] 実 enqueue 先行 0 / 通常 clear 0 / SSOT_WAIT 0 / プール非破壊
+- [ ] 長尺主観口フリーズ完全解消 → **未達・defer**（多ターン≒2文は実用レベル）
+
+**子チャット報告:**
+- mouth_ready を t_ms ベースに。coverage wait を stop_event 即打ち切り廃止＋ inflight 一時解放＋ dispatcher catch-up。
+- After 長尺 `180454` / 多ターン `180926`。多ターン主観ほぼ正常・CATCHUP 119→1。
+- defer: 長尺 2–3文目フリーズ感（中盤 REB）、末尾 m0_tail_uncovered + IDLE_BG ~180ms、表示順2、微 AUDIO_BEFORE。
+- **Pass-with-defer（2026-07-29）。Keep All 可。N↑保留。残件→Phase 14（新子）。**
+
+---
+
+## Phase 14: 中盤供給 / 末尾 IDLE_BG（任意）
+
+**前提:** Phase13 Hotfix Pass-with-defer。N=2 維持。N=3〜4 まだしない。
+**目的:** 長尺中盤 REBUFFERING／口フリーズ残差と、末尾短ギャップ IDLE_BG 連打を改善する。表示は供給を隠さない範囲で順2可。
+**運用目安:** 短〜中尺（〜2文/ターン）は N=2 で実務可。長尺（4–5文）は残差あり。
+
+**Pass 基準（骨子）:**
+- [ ] 長尺 N2 中盤の口フリーズ／REBUFFERING が Hotfix After（`180454`）比で改善、または主因を計測で閉じる
+- [ ] 末尾 IDLE_BG 同一 audio_ms 連打が改善（表示順2可。供給穴を隠して Pass しない）
+- [ ] 不変条件維持。N↑なし
+- [ ] 多ターン非回帰
+
+**子チャット報告:** （ここにサマリーを貼る）
 
 ---
 
@@ -501,3 +542,7 @@
 | 2026-07-28 | `phase12-pass` tag（`ce903b9`）付与確認 |
 | 2026-07-28 | Phase 13 追記: N=2 default・6コア全振り禁止・常駐プール・非回帰上位制約 |
 | 2026-07-29 | Phase 13 Pass-with-defer。プール達成・長尺主観未達→Hotfix(IDLE_BG)。N↑保留 |
+| 2026-07-29 | `phase13-pass` tag（M1 `7d314af`）。M0 `142aa82` 連携。Hotfix 新子へ |
+| 2026-07-29 | Phase13 分析専用子を先に投下（Hotfix 実装は分析受理後） |
+| 2026-07-29 | 分析受理: 主因=末尾 claim/coverage。Hotfix 順序=claim先→IDLE_BG |
+| 2026-07-29 | Phase13 Hotfix Pass-with-defer。AUDIO_BEFORE大穴解消。残=中盤REB/末尾IDLE→Phase14 |

@@ -3022,23 +3022,37 @@ async def _process_pipeline_chunk_task(
         m0_last_global = -1
         png_verified = True
         enqueue_blocked = False
+        covered = False
         stage_m0_done_ms = stage_knn_done_ms
         m0_breakdown = _m0_timing_empty()
 
-        if (
-            effective_playback
-            and m0_pipeline_ref is not None
-            and job.mouth_obj_ref is not None
-        ):
+        # Always resolve live refs (turn_state SSOT); do not trust a stale closure.
+        m0_ref = turn_state.get("m0_pipeline_ref")
+        if m0_ref is None:
+            m0_ref = m0_pipeline_ref
+        mouth_ref = job.mouth_obj_ref
+        if mouth_ref is None:
+            mouth_ref = turn_state.get("mouth_obj_ref")
+
+        if effective_playback and m0_ref is not None and mouth_ref is not None:
+            if job.mouth_obj_ref is None:
+                job.mouth_obj_ref = mouth_ref
             t_m0 = time.perf_counter()
             covered = False
-            while not stop_event.is_set():
+            no_progress_rounds = 0
+            # Coverage wait must not abort immediately on recv_stop: turn-end stop
+            # fires while tail chunks still need claim/watermark. Interrupt cancels
+            # the task (CancelledError). After stop, allow a short no-progress budget.
+            while True:
                 t_adv0 = time.perf_counter()
+                rendered_before = _m0_pipeline_rendered_end_ms(
+                    m0_ref, turn_state.get("audio_playback_state_ref")
+                )
                 m0_result = await asyncio.to_thread(
                     _process_audio_chunk_m0_sync,
                     job=job,
                     turn_state=turn_state,
-                    m0_pipeline_ref=m0_pipeline_ref,
+                    m0_pipeline_ref=m0_ref,
                     effective_playback=effective_playback,
                     m0_max_chunks=8,
                     until_t1_ms=int(enqueue_timeline_end_ms),
@@ -3060,12 +3074,25 @@ async def _process_pipeline_chunk_task(
                     max(0.0, float(adv_wall_ms) - float(part_sum)),
                 )
                 hang_used = hang_used or bool(m0_result.get("hang_used", False))
-                m0_chunks += int(m0_result.get("m0_chunks", 0))
-                m0_last_cid = int(m0_result.get("m0_last_cid", -1))
-                m0_last_global = int(m0_result.get("m0_last_global", -1))
+                chunk_n = int(m0_result.get("m0_chunks", 0))
+                m0_chunks += chunk_n
+                if int(m0_result.get("m0_last_cid", -1)) >= 0:
+                    m0_last_cid = int(m0_result.get("m0_last_cid", -1))
+                if int(m0_result.get("m0_last_global", -1)) >= 0:
+                    m0_last_global = int(m0_result.get("m0_last_global", -1))
                 png_verified = bool(m0_result.get("png_verified", True))
                 covered = bool(m0_result.get("covered", False))
                 enqueue_blocked = bool(m0_result.get("enqueue_blocked", False))
+                rendered_after = int(m0_result.get("rendered_end_ms", 0) or 0)
+                if rendered_after <= 0:
+                    rendered_after = _m0_pipeline_rendered_end_ms(
+                        m0_ref, turn_state.get("audio_playback_state_ref")
+                    )
+                progressed = chunk_n > 0 or int(rendered_after) > int(rendered_before)
+                if progressed:
+                    no_progress_rounds = 0
+                else:
+                    no_progress_rounds += 1
 
                 if covered and png_verified:
                     enqueue_blocked = False
@@ -3091,16 +3118,40 @@ async def _process_pipeline_chunk_task(
                     )
                     break
 
+                # recv_stop set and mouth/claim stalled: give up (still block enqueue).
+                if stop_event.is_set() and no_progress_rounds >= 40:
+                    enqueue_blocked = True
+                    m0_ms = (time.perf_counter() - t_m0) * 1000.0
+                    print(
+                        "[sync][pipeline_chunk][m0_tail_uncovered]",
+                        f"chunk_idx={int(job.playback_chunk_idx)}",
+                        f"until_t1_ms={int(enqueue_timeline_end_ms)}",
+                        f"rendered_end_ms={int(rendered_after)}",
+                        f"no_progress_rounds={int(no_progress_rounds)}",
+                        flush=True,
+                    )
+                    break
+
                 t_wait0 = time.perf_counter()
-                ev = turn_state.get("mouth_frames_async_event")
-                if isinstance(ev, asyncio.Event):
-                    ev.clear()
-                    try:
-                        await asyncio.wait_for(ev.wait(), timeout=0.05)
-                    except asyncio.TimeoutError:
-                        pass
-                else:
-                    await asyncio.sleep(0.02)
+                # Release inflight slot while waiting for mouth so later chunks can
+                # KNN and grow frames (otherwise all slots can stall on coverage).
+                mouth_wait_released = False
+                if chunk_n <= 0 and not covered:
+                    inflight_sem.release()
+                    mouth_wait_released = True
+                try:
+                    ev = turn_state.get("mouth_frames_async_event")
+                    if isinstance(ev, asyncio.Event):
+                        ev.clear()
+                        try:
+                            await asyncio.wait_for(ev.wait(), timeout=0.05)
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(0.02)
+                finally:
+                    if mouth_wait_released:
+                        await inflight_sem.acquire()
                 _m0_timing_add(
                     m0_breakdown,
                     "m0_wait_mouth_ms",
@@ -3108,9 +3159,26 @@ async def _process_pipeline_chunk_task(
                 )
             m0_ms = (time.perf_counter() - t_m0) * 1000.0
             stage_m0_done_ms = (time.perf_counter() - t_pipeline0) * 1000.0
-        elif effective_playback and m0_pipeline_ref is None:
+            if effective_playback and not covered:
+                enqueue_blocked = True
+        elif effective_playback and m0_ref is None:
             enqueue_blocked = True
             png_verified = False
+            print(
+                "[sync][pipeline_chunk][m0_skip]",
+                f"chunk_idx={int(job.playback_chunk_idx)}",
+                "reason=m0_pipeline_ref_none",
+                flush=True,
+            )
+        elif effective_playback and mouth_ref is None:
+            enqueue_blocked = True
+            png_verified = False
+            print(
+                "[sync][pipeline_chunk][m0_skip]",
+                f"chunk_idx={int(job.playback_chunk_idx)}",
+                "reason=mouth_obj_ref_none",
+                flush=True,
+            )
 
         # Drop stale work cancelled/superseded by user interrupt clear.
         min_keep = int(turn_state.get("pipeline_interrupt_min_seq", 0) or 0)
@@ -3222,12 +3290,71 @@ async def _pipeline_enqueue_dispatcher_loop(
         order = _ensure_pipeline_enqueue_order(turn_state)
         t_enqueue0 = time.perf_counter()
         try:
-            if item.effective_playback and not item.enqueue_blocked:
-                # Final guard: corresponding M0 PNG must exist at enqueue time.
+            if item.effective_playback:
+                # Final guard + late catch-up: M0 coverage must reach until_t1
+                # before player enqueue (図A). Runs even when chunk task left
+                # enqueue_blocked after a stalled claim/watermark.
                 m0_ref = turn_state.get("m0_pipeline_ref")
                 playback_ref = turn_state.get("audio_playback_state_ref")
-                if m0_ref is not None:
+                if m0_ref is not None and int(item.enqueue_timeline_end_ms) > 0:
                     rendered_end = _m0_pipeline_rendered_end_ms(m0_ref, playback_ref)
+                    catch_rounds = 0
+                    while (
+                        int(rendered_end) < int(item.enqueue_timeline_end_ms)
+                        and catch_rounds < 8
+                    ):
+                        catch_rounds += 1
+                        mouth_ref = getattr(item.job, "mouth_obj_ref", None)
+                        if mouth_ref is None:
+                            mouth_ref = turn_state.get("mouth_obj_ref")
+                        if mouth_ref is None:
+                            break
+                        try:
+                            catch = await asyncio.to_thread(
+                                _m0_pipeline_advance_sync,
+                                m0_pipeline_ref=m0_ref,
+                                mouth_obj_ref=mouth_ref,
+                                audio_playback_state_ref=playback_ref,
+                                live_emo_id_getter=turn_state.get(
+                                    "live_emo_id_getter"
+                                ),
+                                live_emo_events_getter=turn_state.get(
+                                    "live_emo_events_getter"
+                                ),
+                                hang_timeout_ms=int(_M0_PIPELINE_HANG_TIMEOUT_MS),
+                                max_chunks=8,
+                                until_t1_ms=int(item.enqueue_timeline_end_ms),
+                            )
+                        except BaseException as e:
+                            print(
+                                "[sync][pipeline_chunk][m0_catchup_error]",
+                                f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                                f"type={type(e).__name__}",
+                                f"detail={e}",
+                                flush=True,
+                            )
+                            break
+                        rendered_end = _m0_pipeline_rendered_end_ms(
+                            m0_ref, playback_ref
+                        )
+                        n_catch = int(catch.get("chunks_rendered", 0) or 0)
+                        if n_catch > 0:
+                            print(
+                                "[sync][pipeline_chunk][m0_catchup]",
+                                f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                                f"m0_chunks={n_catch}",
+                                f"rendered_end_ms={int(rendered_end)}",
+                                f"until_t1_ms={int(item.enqueue_timeline_end_ms)}",
+                                flush=True,
+                            )
+                        if int(rendered_end) >= int(item.enqueue_timeline_end_ms):
+                            item.enqueue_blocked = False
+                            item.png_verified = True
+                            break
+                        if n_catch <= 0:
+                            # Mouth not ready yet for next cid; stop spinning here.
+                            break
+
                     if int(rendered_end) < int(item.enqueue_timeline_end_ms):
                         print(
                             "[sync][pipeline_chunk][AUDIO_BEFORE_M0]",
@@ -3258,15 +3385,15 @@ async def _pipeline_enqueue_dispatcher_loop(
                                 f"bytes={len(item.effective_playback)}",
                                 flush=True,
                             )
-            elif item.effective_playback and item.enqueue_blocked:
-                print(
-                    "[sync][pipeline_chunk][ENQUEUE_BLOCKED]",
-                    f"chunk_idx={int(item.job.playback_chunk_idx)}",
-                    f"pipeline_seq={int(item.pipeline_seq)}",
-                    f"reason=m0_png_missing",
-                    f"enqueue_timeline_end_ms={int(item.enqueue_timeline_end_ms)}",
-                    flush=True,
-                )
+                else:
+                    print(
+                        "[sync][pipeline_chunk][ENQUEUE_BLOCKED]",
+                        f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                        f"pipeline_seq={int(item.pipeline_seq)}",
+                        f"reason=m0_png_missing",
+                        f"enqueue_timeline_end_ms={int(item.enqueue_timeline_end_ms)}",
+                        flush=True,
+                    )
         finally:
             cond: asyncio.Condition = order["cond"]
             async with cond:
