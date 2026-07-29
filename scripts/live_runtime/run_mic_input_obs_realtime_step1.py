@@ -23,10 +23,11 @@ _M0_PIPELINE_HANG_TIMEOUT_MS = 3000
 
 # Phase 6 observability: m0_ms breakdown keys (sum ≈ wall-clock m0_ms).
 # wait_mouth: coverage wait in session_loop;
-# lock: advance wall residual (peer worker_owner wait / cond); often ≈ peer png_wait;
+# lock: advance wall residual (peer pool wait / cond); often ≈ peer png_wait when N=1;
 # slice: timeline slice (bisect; suspicion B); disk: json/yaml IO; req_send: worker send;
 # png_wait: worker response (= PNG gen+arrive; Phase 9 if dominant);
 # verify: post PNG exist + pipeline verify; other: remainder at log time.
+# Phase 13: multi-M0 pool (chunk/job dispatch). Distinct from legacy fast/slow workers.
 _M0_BREAKDOWN_KEYS = (
     "m0_wait_mouth_ms",
     "m0_lock_ms",
@@ -142,6 +143,47 @@ def _play_audio_async(
     th = threading.Thread(target=_target, daemon=True)
     th.start()
     return th
+
+
+def _m0_worker_tcp_request(
+    *,
+    host: str,
+    port: int,
+    req: dict[str, Any],
+    timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    with socket.create_connection((host, int(port)), timeout=float(timeout_s)) as sock:
+        sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        f = sock.makefile("r", encoding="utf-8", newline="\n")
+        line = f.readline()
+    if not line:
+        raise RuntimeError(f"empty response from m0 tcp worker {host}:{port}")
+    res = json.loads(line)
+    if not res.get("ok"):
+        raise RuntimeError(res)
+    return res
+
+
+def _m0_pool_reset_tcp(*, host: str, ports: list[int]) -> None:
+    """Phase 13: turn-boundary flush/reset on every local-VAD turn."""
+    for port in ports:
+        try:
+            _m0_worker_tcp_request(
+                host=str(host),
+                port=int(port),
+                req={"cmd": "reset"},
+                timeout_s=3.0,
+            )
+            print(
+                f"[m0_pool][reset_ok] host={host} port={int(port)}",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"[m0_pool][reset_error] host={host} port={int(port)} "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
 
 
 def _run_m0_worker_render_tcp(
@@ -815,6 +857,18 @@ def _attach_mouth_closed_dummy_frames(
     return int(added)
 
 
+def _normalize_m0_worker_ports(
+    *,
+    m0_worker_port: int | None,
+    m0_worker_ports: list[int] | None,
+) -> list[int]:
+    if m0_worker_ports:
+        return [int(p) for p in m0_worker_ports]
+    if m0_worker_port is not None:
+        return [int(m0_worker_port)]
+    return []
+
+
 def _create_m0_pipeline_ref(
     *,
     py: Path,
@@ -834,19 +888,34 @@ def _create_m0_pipeline_ref(
     m0_worker_proc: subprocess.Popen | None,
     m0_worker_host: str,
     m0_worker_port: int | None,
+    m0_worker_ports: list[int] | None = None,
     inline_emo_id: str | None = None,
     close_mouth_id: int = 0,
 ) -> dict[str, Any]:
     chunks_root = work_dir / "stream_chunks"
     chunks_root.mkdir(parents=True, exist_ok=True)
 
+    ports = _normalize_m0_worker_ports(
+        m0_worker_port=m0_worker_port,
+        m0_worker_ports=m0_worker_ports,
+    )
+    n_workers = max(1, len(ports)) if ports else 1
+    # Phase 13: free worker indices for chunk/job dispatch (N=1 ≡ legacy serial).
+    pool_free = set(range(len(ports))) if ports else set()
+
     lock = threading.Lock()
     return {
         "lock": lock,
         "cond": threading.Condition(lock),
-        # Exclusive M0 worker owner (threading.get_ident). None = free.
+        # Legacy single-owner field kept for N=1 introspection; pool supersedes it.
         "worker_owner": None,
         "rendered_chunks": 0,
+        "next_claim_cid": 0,
+        "completed_cids": set(),
+        "completed_meta": {},
+        "m0_worker_ports": ports,
+        "m0_worker_n": int(n_workers),
+        "pool_free": pool_free,
         "total_frames": 0,
         "py": py,
         "m0_repo": m0_repo,
@@ -865,7 +934,8 @@ def _create_m0_pipeline_ref(
         "chunks_root": chunks_root,
         "m0_worker_proc": m0_worker_proc,
         "m0_worker_host": str(m0_worker_host),
-        "m0_worker_port": m0_worker_port,
+        # Primary/base port (compat); render uses claimed port from pool.
+        "m0_worker_port": (int(ports[0]) if ports else m0_worker_port),
         "inline_emo_id": inline_emo_id,
         "close_mouth_id": int(close_mouth_id),
     }
@@ -881,6 +951,7 @@ def _m0_pipeline_render_one_chunk_sync(
     live_emo_id_getter: Callable[[], str | None] | None = None,
     live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None = None,
     timing_acc: dict[str, float] | None = None,
+    m0_worker_port: int | None = None,
 ) -> int:
     step_ms = int(m0_pipeline_ref["step_ms"])
     frame0 = int(t0_ms // step_ms)
@@ -963,6 +1034,10 @@ def _m0_pipeline_render_one_chunk_sync(
         "chunk_len_ms": int(m0_pipeline_ref["chunk_len_ms"]),
     }
 
+    port = m0_worker_port
+    if port is None:
+        port = m0_pipeline_ref.get("m0_worker_port")
+
     copied = _run_m0_one_chunk(
         py=m0_pipeline_ref["py"],
         m0_repo=m0_pipeline_ref["m0_repo"],
@@ -977,7 +1052,7 @@ def _m0_pipeline_render_one_chunk_sync(
         frame_offset=int(m0_pipeline_ref["frame_offset"]),
         m0_worker_proc=m0_pipeline_ref["m0_worker_proc"],
         m0_worker_host=str(m0_pipeline_ref["m0_worker_host"]),
-        m0_worker_port=m0_pipeline_ref["m0_worker_port"],
+        m0_worker_port=port,
         timing_acc=timing_acc,
     )
     return int(copied)
@@ -994,6 +1069,7 @@ def _m0_pipeline_render_with_hang_guard(
     live_emo_events_getter: Callable[[], list[dict[str, Any]] | None] | None,
     hang_timeout_ms: int = _M0_PIPELINE_HANG_TIMEOUT_MS,
     timing_acc: dict[str, float] | None = None,
+    m0_worker_port: int | None = None,
 ) -> tuple[int, bool, float]:
     """Normal path blocks until M0 completes. Hang guard only on abnormal stall."""
     if int(hang_timeout_ms) <= 0:
@@ -1007,6 +1083,7 @@ def _m0_pipeline_render_with_hang_guard(
             live_emo_id_getter=live_emo_id_getter,
             live_emo_events_getter=live_emo_events_getter,
             timing_acc=timing_acc,
+            m0_worker_port=m0_worker_port,
         )
         return int(copied), False, (time.perf_counter() - t0) * 1000.0
 
@@ -1027,6 +1104,7 @@ def _m0_pipeline_render_with_hang_guard(
                 live_emo_id_getter=live_emo_id_getter,
                 live_emo_events_getter=live_emo_events_getter,
                 timing_acc=render_box["timing"],
+                m0_worker_port=m0_worker_port,
             )
         except BaseException as e:
             render_box["error"] = e
@@ -1074,13 +1152,12 @@ def _m0_pipeline_advance_sync(
 ) -> dict[str, Any]:
     """Advance M0 render coverage up to until_t1_ms.
 
-    Phase 8 lock policy (M1 only):
-    - One thread owns the single M0 worker for the duration of this advance
-      (`worker_owner`), so render stays a tight loop (no peer steal mid-run).
-    - State lock is released during slice/disk/png_wait; after each cid commit
-      peers that are already covered can return and enqueue early.
-    - Peers that still need coverage wait for worker_owner without holding the
-      lock across png_wait (lock ≈ peer png_wait → Phase 9 if dominant).
+    Phase 13 lock policy (multi-M0 pool, chunk/job dispatch):
+    - Up to N workers render distinct cids in parallel (ports from pool_free).
+    - Contiguous watermark `rendered_chunks` advances only in cid order so
+      peers can enqueue when their until_t1_ms is covered.
+    - N=1 reduces to legacy serial behavior (one free slot).
+    - State lock is released during slice/disk/png_wait.
     """
     result = {
         "chunks_rendered": 0,
@@ -1113,65 +1190,159 @@ def _m0_pipeline_advance_sync(
         cond = threading.Condition(lock)
         m0_pipeline_ref["cond"] = cond
 
-    my_id = threading.get_ident()
-    owned = False
+    ports = list(m0_pipeline_ref.get("m0_worker_ports") or [])
+    if not ports and m0_pipeline_ref.get("m0_worker_port") is not None:
+        ports = [int(m0_pipeline_ref["m0_worker_port"])]
+        m0_pipeline_ref["m0_worker_ports"] = ports
+    if "pool_free" not in m0_pipeline_ref or m0_pipeline_ref["pool_free"] is None:
+        m0_pipeline_ref["pool_free"] = set(range(len(ports)))
+    if "completed_cids" not in m0_pipeline_ref or m0_pipeline_ref["completed_cids"] is None:
+        m0_pipeline_ref["completed_cids"] = set()
+    if "completed_meta" not in m0_pipeline_ref or m0_pipeline_ref["completed_meta"] is None:
+        m0_pipeline_ref["completed_meta"] = {}
+    if "next_claim_cid" not in m0_pipeline_ref:
+        m0_pipeline_ref["next_claim_cid"] = int(m0_pipeline_ref.get("rendered_chunks", 0) or 0)
+
+    # stdio single-proc fallback: treat as one logical slot (no TCP ports).
+    use_stdio = bool(m0_pipeline_ref.get("m0_worker_proc") is not None and not ports)
+    if use_stdio and not m0_pipeline_ref["pool_free"]:
+        m0_pipeline_ref["pool_free"] = {0}
 
     def _coverage_t0() -> int:
         cid = int(m0_pipeline_ref["rendered_chunks"])
         return int(origin_ms + cid * chunk_len_ms)
 
-    try:
+    def _advance_watermark_locked() -> None:
+        completed_cids = m0_pipeline_ref["completed_cids"]
+        completed_meta = m0_pipeline_ref["completed_meta"]
+        while int(m0_pipeline_ref["rendered_chunks"]) in completed_cids:
+            cid_done = int(m0_pipeline_ref["rendered_chunks"])
+            completed_cids.discard(cid_done)
+            meta = completed_meta.pop(cid_done, {}) or {}
+            copied = int(meta.get("copied", 0) or 0)
+            if copied > 0 and bool(meta.get("ok", False)):
+                m0_pipeline_ref["total_frames"] = int(
+                    m0_pipeline_ref.get("total_frames", 0)
+                ) + int(copied)
+            m0_pipeline_ref["rendered_chunks"] = int(cid_done) + 1
+
+    claims_this_call = 0
+
+    while int(claims_this_call) < int(max_chunks):
+        worker_idx: int | None = None
+        claim_cid = -1
+        t0_ms = 0
+        t1_ms = 0
+        claimed = False
+
         with cond:
             while True:
-                t0_ms = _coverage_t0()
-                if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
+                t0_cov = _coverage_t0()
+                if until_t1_ms is not None and int(t0_cov) >= int(until_t1_ms):
                     return result
-                owner = m0_pipeline_ref.get("worker_owner")
-                if owner is not None and owner != my_id:
-                    cond.wait(timeout=0.05)
-                    obj = mouth_obj_ref.get("obj")
-                    if not isinstance(obj, dict):
-                        return result
-                    continue
-                # Acquire exclusive worker ownership for this advance call.
-                m0_pipeline_ref["worker_owner"] = my_id
-                owned = True
-                break
 
-        while int(result["chunks_rendered"]) < int(max_chunks):
-            with cond:
-                cid = int(m0_pipeline_ref["rendered_chunks"])
-                t0_ms = int(origin_ms + cid * chunk_len_ms)
+                obj = mouth_obj_ref.get("obj")
+                if not isinstance(obj, dict):
+                    return result
+
+                claim_cid = int(m0_pipeline_ref["next_claim_cid"])
+                t0_ms = int(origin_ms + claim_cid * chunk_len_ms)
                 t1_ms = int(t0_ms + chunk_len_ms)
-                if until_t1_ms is not None and int(t0_ms) >= int(until_t1_ms):
-                    break
-                needed_frames = int(t1_ms // step_ms)
+                need_more_claims = (
+                    until_t1_ms is None or int(t0_ms) < int(until_t1_ms)
+                )
                 mouth_frames = _as_frames(obj)
-                if len(mouth_frames) < needed_frames:
+                needed_frames = int(t1_ms // step_ms)
+                mouth_ready = len(mouth_frames) >= needed_frames
+                pool_free = m0_pipeline_ref["pool_free"]
+                in_flight = int(m0_pipeline_ref["next_claim_cid"]) > int(
+                    m0_pipeline_ref["rendered_chunks"]
+                )
+
+                if (
+                    need_more_claims
+                    and mouth_ready
+                    and pool_free
+                    and int(claims_this_call) < int(max_chunks)
+                ):
+                    worker_idx = int(pool_free.pop())
+                    m0_pipeline_ref["next_claim_cid"] = int(claim_cid) + 1
+                    # Legacy introspection: any holder of a slot.
+                    m0_pipeline_ref["worker_owner"] = threading.get_ident()
+                    claimed = True
                     break
 
+                # Covered by peers finishing while we waited.
+                _advance_watermark_locked()
+                t0_cov = _coverage_t0()
+                if until_t1_ms is not None and int(t0_cov) >= int(until_t1_ms):
+                    return result
+
+                if not need_more_claims and in_flight:
+                    cond.wait(timeout=0.05)
+                    _advance_watermark_locked()
+                    continue
+
+                if not mouth_ready and not in_flight:
+                    # session_loop will wait_mouth and retry.
+                    return result
+
+                if in_flight or (need_more_claims and mouth_ready and not pool_free):
+                    cond.wait(timeout=0.05)
+                    _advance_watermark_locked()
+                    continue
+
+                # Mouth not ready but peers may still complete our range.
+                if not mouth_ready and in_flight:
+                    cond.wait(timeout=0.05)
+                    _advance_watermark_locked()
+                    continue
+
+                return result
+
+        if not claimed or worker_idx is None:
+            break
+
+        claims_this_call += 1
+        port: int | None
+        if ports:
+            port = int(ports[int(worker_idx)])
+        else:
+            port = m0_pipeline_ref.get("m0_worker_port")
+
+        hung = False
+        chunk_ok = True
+        copied = 0
+        m0_ms = 0.0
+        global_f0 = 0
+        global_f1 = 0
+        print(
+            "[m0_pool][claim]",
+            f"cid={int(claim_cid)}",
+            f"worker_idx={int(worker_idx)}",
+            f"port={port}",
+            f"n={int(m0_pipeline_ref.get('m0_worker_n', 1) or 1)}",
+            flush=True,
+        )
+        try:
             global_f0, global_f1 = _m0_pipeline_global_frame_range(
                 m0_pipeline_ref=m0_pipeline_ref,
                 t0_ms=int(t0_ms),
                 t1_ms=int(t1_ms),
             )
 
-            hung = False
-            chunk_ok = True
-            copied = 0
-            m0_ms = 0.0
-            # State lock released: slice / disk / png_wait (peers may observe commits).
             try:
                 copied, hung, m0_ms = _m0_pipeline_render_with_hang_guard(
                     m0_pipeline_ref=m0_pipeline_ref,
                     mouth_obj=obj,
-                    cid=int(cid),
+                    cid=int(claim_cid),
                     t0_ms=int(t0_ms),
                     t1_ms=int(t1_ms),
                     live_emo_id_getter=live_emo_id_getter,
                     live_emo_events_getter=live_emo_events_getter,
                     hang_timeout_ms=int(hang_timeout_ms),
                     timing_acc=timing_acc,
+                    m0_worker_port=port,
                 )
             except BaseException:
                 chunk_ok = False
@@ -1179,7 +1350,7 @@ def _m0_pipeline_advance_sync(
                 m0_ms = 0.0
 
             result["m0_ms_total"] = float(result["m0_ms_total"]) + float(m0_ms)
-            result["last_cid"] = int(cid)
+            result["last_cid"] = int(claim_cid)
             result["last_global_frame1"] = int(global_f1)
 
             if hung or not chunk_ok:
@@ -1198,19 +1369,23 @@ def _m0_pipeline_advance_sync(
                         copied, hung2, dummy_ms = _m0_pipeline_render_with_hang_guard(
                             m0_pipeline_ref=m0_pipeline_ref,
                             mouth_obj=obj,
-                            cid=int(cid),
+                            cid=int(claim_cid),
                             t0_ms=int(t0_ms),
                             t1_ms=int(t1_ms),
                             live_emo_id_getter=live_emo_id_getter,
                             live_emo_events_getter=live_emo_events_getter,
                             hang_timeout_ms=int(hang_timeout_ms),
                             timing_acc=timing_acc,
+                            m0_worker_port=port,
                         )
                         result["m0_ms_total"] = (
                             float(result["m0_ms_total"]) + float(dummy_ms)
                         )
                         if hung2:
                             result["hang_chunks"] = int(result["hang_chunks"]) + 1
+                        else:
+                            hung = False
+                            chunk_ok = True
                     except BaseException:
                         copied = 0
 
@@ -1223,33 +1398,31 @@ def _m0_pipeline_advance_sync(
                 result["png_verified"] = False
                 print(
                     "[sync][pipeline_chunk][PNG_MISSING]",
-                    f"cid={int(cid)}",
+                    f"cid={int(claim_cid)}",
                     f"global_range=[{int(global_f0)},{int(global_f1)})",
                     flush=True,
                 )
             _m0_timing_add(
                 timing_acc, "m0_verify_ms", (time.perf_counter() - t_verify0) * 1000.0
             )
-
+        finally:
             with cond:
-                if (not hung and chunk_ok) and int(copied) > 0:
-                    m0_pipeline_ref["total_frames"] = int(
-                        m0_pipeline_ref.get("total_frames", 0)
-                    ) + int(copied)
-                m0_pipeline_ref["rendered_chunks"] = int(cid) + 1
-                result["chunks_rendered"] = int(result["chunks_rendered"]) + 1
-                # Wake covered peers so they can enqueue while we keep worker_owner.
-                cond.notify_all()
-
-            obj = mouth_obj_ref.get("obj")
-            if not isinstance(obj, dict):
-                break
-    finally:
-        if owned:
-            with cond:
-                if m0_pipeline_ref.get("worker_owner") == my_id:
+                m0_pipeline_ref["completed_cids"].add(int(claim_cid))
+                m0_pipeline_ref["completed_meta"][int(claim_cid)] = {
+                    "copied": int(copied),
+                    "ok": bool((not hung) and chunk_ok and int(copied) > 0),
+                }
+                m0_pipeline_ref["pool_free"].add(int(worker_idx))
+                n_workers = int(m0_pipeline_ref.get("m0_worker_n", 1) or 1)
+                if len(m0_pipeline_ref["pool_free"]) >= n_workers:
                     m0_pipeline_ref["worker_owner"] = None
+                _advance_watermark_locked()
+                result["chunks_rendered"] = int(result["chunks_rendered"]) + 1
                 cond.notify_all()
+
+        obj = mouth_obj_ref.get("obj")
+        if not isinstance(obj, dict):
+            break
 
     return result
 

@@ -53,6 +53,7 @@ from run_mic_input_obs_realtime_step1 import (
     _m0_pipeline_enqueue_timeline_end_ms,
     _m0_pipeline_rendered_end_ms,
     _m0_pipeline_verify_pngs_exist,
+    _m0_pool_reset_tcp,
     _m0_timing_add,
     _m0_timing_empty,
     _start_audio_player,
@@ -4250,6 +4251,29 @@ def _start_virtualcam(
     )
 
 
+def _clamp_m0_worker_n(n: int) -> int:
+    """Phase 13: default 2; hard cap 4 (cores-2 on 6-core). Never 6-all."""
+    try:
+        v = int(n)
+    except Exception:
+        v = 2
+    if v < 1:
+        v = 1
+    if v > 4:
+        print(
+            f"[m0_pool][clamp] requested_n={int(n)} -> 4 (max; leave headroom for OBS/player/Live/OS)",
+            flush=True,
+        )
+        v = 4
+    return int(v)
+
+
+def _m0_worker_ports_for_n(*, base_port: int, n: int) -> list[int]:
+    n = _clamp_m0_worker_n(n)
+    base = int(base_port)
+    return [base + i for i in range(int(n))]
+
+
 def _start_m0_worker_tcp(
     *,
     py: Path,
@@ -4257,24 +4281,56 @@ def _start_m0_worker_tcp(
     host: str,
     port: int,
     env: dict[str, str],
+    parent_pid: int | None = None,
 ) -> subprocess.Popen:
     worker_script = m0_repo / "src" / "m0_persistent_worker.py"
     if not worker_script.exists():
         raise FileNotFoundError(f"missing m0 worker: {worker_script}")
 
+    cmd = [
+        str(py),
+        str(worker_script),
+        "--tcp",
+        "--host",
+        str(host),
+        "--port",
+        str(int(port)),
+    ]
+    if parent_pid is not None and int(parent_pid) > 0:
+        cmd.extend(["--parent_pid", str(int(parent_pid))])
+
     return subprocess.Popen(
-        [
-            str(py),
-            str(worker_script),
-            "--tcp",
-            "--host",
-            str(host),
-            "--port",
-            str(int(port)),
-        ],
+        cmd,
         cwd=str(m0_repo),
         env=env,
     )
+
+
+def _start_m0_worker_pool_tcp(
+    *,
+    py: Path,
+    m0_repo: Path,
+    host: str,
+    ports: list[int],
+    env: dict[str, str],
+    parent_pid: int | None = None,
+) -> list[subprocess.Popen]:
+    procs: list[subprocess.Popen] = []
+    for port in ports:
+        proc = _start_m0_worker_tcp(
+            py=py,
+            m0_repo=m0_repo,
+            host=str(host),
+            port=int(port),
+            env=env,
+            parent_pid=parent_pid,
+        )
+        procs.append(proc)
+        print(
+            f"[m0_pool][spawn] port={int(port)} pid={proc.pid} parent_pid={parent_pid}",
+            flush=True,
+        )
+    return procs
 
 
 def _stop_m0_worker_tcp(proc: subprocess.Popen | None, host: str, port: int) -> None:
@@ -4287,6 +4343,92 @@ def _stop_m0_worker_tcp(proc: subprocess.Popen | None, host: str, port: int) -> 
         proc.wait(timeout=5)
     except Exception:
         proc.kill()
+
+
+def _stop_m0_worker_pool_tcp(
+    procs: list[subprocess.Popen] | None,
+    host: str,
+    ports: list[int],
+) -> None:
+    if not procs:
+        return
+    for proc, port in zip(procs, ports):
+        _stop_m0_worker_tcp(proc, str(host), int(port))
+
+
+def _rss_mb_for_pids(pids: list[int]) -> dict[str, float]:
+    """Best-effort RSS (MB) for worker PIDs; used in Phase 13 Before/After."""
+    out: dict[str, float] = {"sum_mb": 0.0, "n": 0.0}
+    if not pids:
+        return out
+    try:
+        import psutil  # type: ignore
+
+        total = 0.0
+        alive = 0
+        for pid in pids:
+            try:
+                p = psutil.Process(int(pid))
+                rss = float(p.memory_info().rss) / (1024.0 * 1024.0)
+                total += rss
+                alive += 1
+                out[f"pid_{int(pid)}_mb"] = rss
+            except Exception:
+                continue
+        out["sum_mb"] = total
+        out["n"] = float(alive)
+        return out
+    except Exception:
+        pass
+    # Windows fallback without psutil.
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        psapi = ctypes.WinDLL("psapi")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        GetProcessMemoryInfo = psapi.GetProcessMemoryInfo
+        OpenProcess = kernel32.OpenProcess
+        CloseHandle = kernel32.CloseHandle
+        PROCESS_QUERY_INFORMATION = 0x0400
+        PROCESS_VM_READ = 0x0010
+
+        total = 0.0
+        alive = 0
+        for pid in pids:
+            h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, int(pid))
+            if not h:
+                continue
+            try:
+                counters = PROCESS_MEMORY_COUNTERS()
+                counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+                if GetProcessMemoryInfo(h, ctypes.byref(counters), counters.cb):
+                    rss = float(counters.WorkingSetSize) / (1024.0 * 1024.0)
+                    total += rss
+                    alive += 1
+                    out[f"pid_{int(pid)}_mb"] = rss
+            finally:
+                CloseHandle(h)
+        out["sum_mb"] = total
+        out["n"] = float(alive)
+    except Exception:
+        pass
+    return out
 
 
 def _call_watch_stream_mouth_and_render_m0(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -4384,7 +4526,8 @@ async def _run(args: argparse.Namespace) -> int:
     env = os.environ.copy()
 
     cam_proc = None
-    m0_proc = None
+    m0_procs: list[subprocess.Popen] = []
+    m0_worker_ports: list[int] = []
     audio_player_proc = None
     # turnごとに作るため、ここでは初期化しない
     audio_stop_event: Event | None = None
@@ -4412,16 +4555,35 @@ async def _run(args: argparse.Namespace) -> int:
             frame_offset=0,
         )
 
-        print("[session_loop] start m0 tcp worker", flush=True)
-        m0_proc = _start_m0_worker_tcp(
+        m0_n = _clamp_m0_worker_n(int(getattr(args, "m0_worker_n", 2)))
+        m0_worker_ports = _m0_worker_ports_for_n(
+            base_port=int(args.m0_worker_port),
+            n=int(m0_n),
+        )
+        print(
+            "[session_loop] start m0 tcp worker pool",
+            f"n={int(m0_n)}",
+            f"ports={m0_worker_ports}",
+            f"host={args.m0_worker_host}",
+            flush=True,
+        )
+        m0_procs = _start_m0_worker_pool_tcp(
             py=py,
             m0_repo=m0_repo,
             host=str(args.m0_worker_host),
-            port=int(args.m0_worker_port),
+            ports=m0_worker_ports,
             env=env,
+            parent_pid=int(os.getpid()),
         )
-
         time.sleep(1.0)
+        rss0 = _rss_mb_for_pids([int(p.pid) for p in m0_procs if p.pid])
+        print(
+            "[m0_pool][rss_after_spawn]",
+            f"n={len(m0_procs)}",
+            f"sum_mb={float(rss0.get('sum_mb', 0.0)):.1f}",
+            f"detail={ {k: round(v, 1) for k, v in rss0.items() if k.startswith('pid_')} }",
+            flush=True,
+        )
 
         print("[session_loop] start audio player", flush=True)
         print(
@@ -4556,7 +4718,7 @@ async def _run(args: argparse.Namespace) -> int:
                     ),
                     m0_worker_proc=None,
                     m0_worker_host=str(args.m0_worker_host),
-                    m0_worker_port=int(args.m0_worker_port),
+                    m0_worker_port=int(m0_worker_ports[0]) if m0_worker_ports else int(args.m0_worker_port),
                 )
                 m0_result_box["result"] = _call_watch_stream_mouth_and_render_m0(kwargs)
             except BaseException as e:
@@ -5093,6 +5255,11 @@ async def _run(args: argparse.Namespace) -> int:
 
             m0_pipeline_ref = None
             if pipeline_sync:
+                # Phase 13: turn-boundary Worker flush/reset (local VAD turn).
+                _m0_pool_reset_tcp(
+                    host=str(args.m0_worker_host),
+                    ports=list(m0_worker_ports),
+                )
                 m0_pipeline_ref = _create_m0_pipeline_ref(
                     py=py,
                     m0_repo=m0_repo,
@@ -5110,7 +5277,8 @@ async def _run(args: argparse.Namespace) -> int:
                     fps=int(args.fps),
                     m0_worker_proc=None,
                     m0_worker_host=str(args.m0_worker_host),
-                    m0_worker_port=int(args.m0_worker_port),
+                    m0_worker_port=int(m0_worker_ports[0]) if m0_worker_ports else int(args.m0_worker_port),
+                    m0_worker_ports=list(m0_worker_ports),
                     inline_emo_id=(
                         str(inline_emo_id_current)
                         if bool(args.inline_emo_tag_mode)
@@ -5119,6 +5287,13 @@ async def _run(args: argparse.Namespace) -> int:
                     close_mouth_id=int(args.mouth_close_id),
                 )
                 turn_state["m0_pipeline_ref"] = m0_pipeline_ref
+                print(
+                    "[m0_pool][turn_ready]",
+                    f"turn={int(turn_no)}",
+                    f"n={int(m0_pipeline_ref.get('m0_worker_n', 1))}",
+                    f"ports={m0_pipeline_ref.get('m0_worker_ports')}",
+                    flush=True,
+                )
             else:
                 turn_state["m0_pipeline_ref"] = None
 
@@ -5991,7 +6166,11 @@ async def _run(args: argparse.Namespace) -> int:
         if audio_player_proc is not None:
             _stop_audio_player(audio_player_proc)
 
-        _stop_m0_worker_tcp(m0_proc, str(args.m0_worker_host), int(args.m0_worker_port))
+        _stop_m0_worker_pool_tcp(
+            m0_procs,
+            str(args.m0_worker_host),
+            list(m0_worker_ports) if m0_worker_ports else [int(args.m0_worker_port)],
+        )
 
         if cam_proc is not None and cam_proc.poll() is None:
             cam_proc.terminate()
@@ -6444,6 +6623,15 @@ def main() -> int:
 
     ap.add_argument("--m0_worker_host", default="127.0.0.1")
     ap.add_argument("--m0_worker_port", type=int, default=39390)
+    ap.add_argument(
+        "--m0_worker_n",
+        type=int,
+        default=2,
+        help=(
+            "Phase 13: resident M0 worker pool size (default 2). "
+            "Clamped to 1..4 (never 6-all on 6-core). N=1 restores serial."
+        ),
+    )
     ap.add_argument("--m0_base_config", default=None)
 
     ap.add_argument("--mouth_window_ms", type=int, default=240)

@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` … `phase8-pass` / `phase9-pass`（任意） / `phase10-pass`（`7cd325e`） / `phase11-pass`（`0a140da`） |
+| マイルストーン tag | `phase2-pass` … `phase11-pass`（`0a140da`） / `phase12-pass`（`ce903b9`） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -33,7 +33,8 @@
 | 10 | 供給ストレス / inmemory ON ゲート | `pass` | 2026-07-27（Pass-with-defer） |
 | 11 | battle / event 方式2 回帰 | `pass` | 2026-07-28 |
 | 12 | 待機モーション再配線 | `pass` | 2026-07-28（Pass-with-defer） |
-| 13 | マルチ M0（予約・将来 Go） | `pending` | —（今やる・親プロンプト投下） |
+| 13 | マルチ M0 | `pass` | 2026-07-29（Pass-with-defer・Hotfix 待ち） |
+| 14 | IDLE_BG / FG 欠落見え方（予約） | `pending` | —（13 Hotfix で足りなければ昇格） |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
 
@@ -421,6 +422,7 @@
 - ログ: idle2 / talkover。主観: `212320`（待機中 M0+BGV）、`213108`（talkover/event 整合）。通常 clear 0、AUDIO_BEFORE 0、SSOT_WAIT 0。
 - defer: 待機中に稀に FG 抜け（単一 M0 vs idle 40ms）。致命ではない → 間隔緩和 or Phase13。
 - **Pass-with-defer（2026-07-28）。Keep All 可。次=Phase 13。**
+- tag: `phase12-pass`（commit `ce903b9`）付与済み（2026-07-28）。
 
 ---
 
@@ -428,15 +430,36 @@
 
 **前提:** Phase 12 Pass-with-defer。要否は Phase10 で **将来 Go** 確定。単一 Worker の縦飽和・idle 供給を容量で緩和する。
 
+**ハード目安（2026-07-28）:** 開発機 CPU **6コア**。default **N=2**（CLI 可変）。**6コア全振り禁止**。N 増加は計測根拠付き。初期上限目安 **3〜4**（例: cores-2）。メモリ（Worker×スプライトキャッシュ）を報告。
+
+**最重要（Pass 上位制約）:**
+1. マルチ化で単一 Worker より遅くなる経路を作らない（重いコピー／シリアライズ／ディスク往復の増加を避ける）
+2. メモリ枯渇させない（N 増加時の RSS を Before/After で報告）
+
+**必須原則:** 常駐プール（ターン毎 spawn 禁止）／VAD ターンに合わせ Worker flush・リセット／親死亡で子が残らない teardown（talkover cancel 整合）／巨大フレームコピー回避（共有メモリは任意）／図A＋enqueue 到着順／参考 RR→並べ替え構成は必須採用しない（chunk/job ディスパッチ可）
+
 **目的:** 単一 M0 Worker 瓶颈を、不変条件を壊さず並列化（または同等の容量拡張）で緩和する。
 
-**Pass 基準（骨子・詳細は子プロンプト）:**
-- [ ] 長尺／高 chunk 負荷で png_wait・m0_lock・REBUFFERING（または idle FG 抜け）が単一比で改善
-- [ ] 図A（到着順 enqueue、AUDIO_BEFORE 実 enqueue 0）、方式2、SSOT、idle/talkover/event を壊さない
-- [ ] 設計・実装前に境界を守り、無断の音声先行／短タイムアウト／clear 隠蔽をしない
-- [ ] 残件は defer 可（無理な Hotfix で Pass しない）
+**Pass 基準（骨子）:**
+- [x] 長尺／高 chunk 負荷で png_wait・m0_lock・REBUFFERING（または idle FG 抜け）が単一比で改善 → lock max / late m0 / REB・多ターン CATCHUP は改善。**長尺主観リップは未達**
+- [x] 単一比で悪化する経路がない（レイテンシ／I/O／RSS）→ メトリクス上は非回帰。主観口は N=2 長尺で悪化寄り → Hotfix
+- [x] 図A / 方式2 / SSOT / idle・talkover 骨格維持
+- [x] 常駐プール・ターンリセット・親死亡 teardown
+- [x] 残件 defer 可
 
-**子チャット報告:** （ここにサマリーを貼る）
+**子チャット報告:**
+- 常駐プール N=2（clamp 1..4）、chunk claim、watermark、TCP reset、parent_pid teardown。N=1 フォールバック。
+- A/B: lock/REB/CATCHUP 改善。長尺 N=2 主観は口フリーズ・IDLE_BG 増（N=1 より悪化寄り）。多ターンはメトリクス改善・主観「もう一息」。
+- **Pass-with-defer（2026-07-29）。Keep All 可。N=3〜4 即スケール保留。**
+- 残件: IDLE_BG（欠落時口 FG）／FG 供給見え方／多ターン SSOT_CATCHUP → **Phase 13 Hotfix（新子）**。足りなければ Phase 14。
+
+---
+
+## Phase 13 Hotfix / Phase 14 候補: IDLE_BG・FG 欠落見え方
+
+**目的:** マルチ M0 導入後に顕在化した、FG 欠落時の口フリーズ／IDLE_BG 張り付き／過剰 CATCHUP を、N を増やさずに改善する。
+**禁止:** N=3〜4 即スケール、6コア全振り、音声先行 enqueue、clear 隠蔽。
+**詳細:** 下記子プロンプト。
 
 ---
 
@@ -475,3 +498,6 @@
 | 2026-07-28 | Phase 11 Pass。talkover/event 方式2 通し。次=Phase12 待機モーション |
 | 2026-07-28 | `phase11-pass` tag（`0a140da`）付与確認 |
 | 2026-07-28 | Phase 12 Pass-with-defer。idle silent 図A再配線。次=Phase13 マルチ M0 |
+| 2026-07-28 | `phase12-pass` tag（`ce903b9`）付与確認 |
+| 2026-07-28 | Phase 13 追記: N=2 default・6コア全振り禁止・常駐プール・非回帰上位制約 |
+| 2026-07-29 | Phase 13 Pass-with-defer。プール達成・長尺主観未達→Hotfix(IDLE_BG)。N↑保留 |
