@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` … `phase12-pass`（`ce903b9`） / `phase13-pass`（`7d314af`） |
+| マイルストーン tag | `phase2-pass` … `phase14-idle-bg`（`cf8ec05`） / `phase16-pass`（`6fc6507`） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -35,7 +35,11 @@
 | 12 | 待機モーション再配線 | `pass` | 2026-07-28（Pass-with-defer） |
 | 13 | マルチ M0 | `pass` | 2026-07-29（Pass-with-defer） |
 | 13hf | claim/coverage Hotfix | `pass` | 2026-07-29（Pass-with-defer） |
-| 14 | 中盤供給 / 末尾 IDLE_BG（任意） | `pending` | —（今やる） |
+| 14 | 中盤供給 / 末尾 IDLE_BG（任意） | `pass` | 2026-07-30（部分: IDLE_BGのみ。中盤 Fail→リバート） |
+| 15 | wait_mouth（mouth×claim）（任意） | `pass` | 2026-07-30（Pass-with-defer。レース revert） |
+| 16 | N スケール計測 A/B（任意） | `pass` | 2026-07-30（Pass-with-defer。N↑効果なし→default N=2） |
+| 17 | mouth×claim 前線切り分け（任意） | `pass` | 2026-07-30（A=M3。本番 Fix なし） |
+| 18 | M3 mouth 前線先行（任意） | `in_progress` | — |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
 
@@ -485,22 +489,195 @@
 - After 長尺 `180454` / 多ターン `180926`。多ターン主観ほぼ正常・CATCHUP 119→1。
 - defer: 長尺 2–3文目フリーズ感（中盤 REB）、末尾 m0_tail_uncovered + IDLE_BG ~180ms、表示順2、微 AUDIO_BEFORE。
 - **Pass-with-defer（2026-07-29）。Keep All 可。N↑保留。残件→Phase 14（新子）。**
+- tag: `phase13-hotfix`（commit `d1a881b`）付与済み（2026-07-29）。
 
 ---
 
 ## Phase 14: 中盤供給 / 末尾 IDLE_BG（任意）
 
-**前提:** Phase13 Hotfix Pass-with-defer。N=2 維持。N=3〜4 まだしない。
-**目的:** 長尺中盤 REBUFFERING／口フリーズ残差と、末尾短ギャップ IDLE_BG 連打を改善する。表示は供給を隠さない範囲で順2可。
-**運用目安:** 短〜中尺（〜2文/ターン）は N=2 で実務可。長尺（4–5文）は残差あり。
+**前提:** Phase13 Hotfix Pass-with-defer。N=2 維持。N=3〜4 は無断ではしない（計測オプション・親エスカレーション）。
+**目的:** 長尺中盤 REBUFFERING／口フリーズ残差と、末尾短ギャップ IDLE_BG 連打を改善する。
+**運用目安:** 〜2文/ターンは N=2 で実務可。長尺 4–5文は残差あり。
+
+**任意分析（受理 2026-07-29）:** 長尺 `180454`、中盤 player≈2.5–7.6s。
+- 全 REB で **player == rendered_end（gap=0）** → coverage 穴ではなく **pending 枯渇**
+- inflight 6–7 常時 → N=2 稼働だが完了が再生に負け
+- 中盤 m0: **lock≈48% / wait_mouth≈41% / png_wait≈9%**。claim 欠番なし
+- **主因:** M0 前進スループット負け（残差本体は `m0_lock_ms`＝cond/pool 待ち、次いで wait_mouth）
+- 供給リードしばしば 40–80ms（rebuffer_target=240 未満）→ underrun
+
+**修正順（確定）:** (1) 中盤＝lock/cond・mouth 待ちの最小改善 (2) 末尾 IDLE_BG。表示で中盤を隠さない。
 
 **Pass 基準（骨子）:**
-- [ ] 長尺 N2 中盤の口フリーズ／REBUFFERING が Hotfix After（`180454`）比で改善、または主因を計測で閉じる
-- [ ] 末尾 IDLE_BG 同一 audio_ms 連打が改善（表示順2可。供給穴を隠して Pass しない）
-- [ ] 不変条件維持。N↑なし
-- [ ] 多ターン非回帰
+- [ ] 長尺 N2 中盤の口フリーズ／REBUFFERING が `180454` 比で改善、または主因を計測で閉じる → **Fail**（主観未改善。REB 15→12 微減のみ。lock↓／wait_mouth↑＝付け替え）
+- [x] 末尾 IDLE_BG 同一 audio_ms 連打が改善（11→0）— **部分達成**
+- [x] 不変条件維持（AUDIO_BEFORE/SSOT/clear）。無断 N↑なし
+- [x] 多ターン: Turn2以降非回帰寄り。Turn1 無音は API/session（Phase14 劣化にしない）
 
-**子チャット報告:** （ここにサマリーを貼る）
+**子チャット報告:**
+- 実装: cond 即 return＋常時 inflight 解放＋ catch-up sleep／virtualcam IDLE_BG。
+- After 長尺 `223938` / 多ターン `224458`。
+- **親判定 2026-07-29: 中盤 Fail。方針 (A) — 中盤差分をリバートし IDLE_BG のみ残す。Keep All はリバート後。N↑しない。**
+- 次ライン（wait_mouth 本体 or N=3 計測）は **新親チャット**へ。
+
+**子チャット報告（リバート後・受理）:**
+- step1 / session_loop → `d1a881b`（phase13-hotfix）へ復帰。
+- virtualcam のみ Phase14 IDLE_BG 残存。
+- **Keep All 可（virtualcam のみ）。** 中盤は Fail のまま。Phase14 部分成果＝末尾 IDLE_BG。
+- tag: `phase14-idle-bg`（commit `cf8ec05`）付与済み（2026-07-30）。
+
+---
+
+## Phase 15: wait_mouth（mouth 準備 × M0 claim）（任意）
+
+**前提:** Phase14 (A) 完了。作業ベース = tag `phase14-idle-bg`（`cf8ec05`）。中盤リバート済み・IDLE_BG のみ残存。**Phase14 中盤再実装・リバートやり直しは禁止。**
+
+**目的:** 長尺中盤の残差本体である **`wait_mouth`（mouth 準備と M0 claim の噛み合わせ）** を改善する。N↑より先。
+
+**運用目安（継続）:** N=2 で 〜2文/ターンは実務可。長尺中盤 REBUFFERING／口フリーズが残課題。
+
+**スコープ:**
+- 主対象: mouth 準備タイミングと M0 claim／coverage 待ちの噛み合わせ（`wait_mouth` 支配の削減または説明可能な閉鎖）
+- 主テスト: **`--no-fast_inmemory`・N=2**。多ターン非回帰は短確認
+- Before 比較:
+  - Hotfix 後長尺 N2: `logs/sess_phase10_step2_subj_20260729_180454`（中盤残差の基準）
+  - Phase14 Fail（反面教師）: `logs/sess_phase10_step2_subj_20260729_223938`（lock↓／wait_mouth↑＝付け替え失敗。同型禁止）
+- **任意・後段（親承認後のみ）:** N=3 計測 A/B。default 据え置き・6コア全振り禁止。無断 N↑禁止
+- Phase14 IDLE_BG（virtualcam）は維持・破壊禁止
+
+**禁止（継続）:**
+- 音声先行 enqueue / clear 隠蔽 / 正常 M0 短タイムアウト打ち切り / 固定 sleep で隠す
+- 旧 fast_worker/slow_worker 分離の復活
+- 図A・方式2・Sync SSOT・jitter・idle silent・talkover/event の破壊
+- lock↔wait_mouth の付け替えだけで「改善」と称すること（total／供給リードも見る）
+- 6コア全振り／根拠なし N 拡大／default N 変更
+
+**Pass 基準（骨子）:**
+- [x] 長尺 N2 で中盤 REBUFFERING／口フリーズが Before（`180454`）比で改善、**または** wait_mouth を計測で閉じた上で次手段を提案 → **後者**（主観未達・計測閉鎖）
+- [x] wait_mouth 改善が lock への付け替えだけで終わっていない → レース単体は付け替え型ではないが **効果なし**。coalesce は付け替え＋悪化で破棄
+- [x] 不変条件概ね維持（SSOT_WAIT=0、通常 clear 0、到着順、方式2、N=2／N=1）。AUDIO_BEFORE 末尾微増は尾部残差
+- [x] 無断 N↑なし。残件 defer
+
+**子チャット報告（受理 2026-07-30）:**
+- 仮説レース（mouth event clear→wait 空待ち）修正を試行。オフラインで空待ち減は確認。実機長尺は効き痕跡 0。
+- coalesce 試行は lock↓／wait↑（Phase14 同型）→破棄。
+- 主観 `sess_phase10_step2_subj_20260730_131822`: 2文目途中〜末尾口フリーズ。REB 15→15、wait/lock/m0 横ばい。**改善なし**。
+- IDLE_BG=0 は Phase14 維持。
+
+**親判定（2026-07-30）:**
+- **Pass-with-defer**（主観未達で閉じる。wait_mouth 小修正では天井超え不可と計測閉鎖）。
+- **Keep All: レース修正は revert**（効き無し。「正しさのみ」も残さない。ベースを `phase14-idle-bg` に戻す）。
+- coalesce／cond 付け替え系は再禁止。
+- 次: **Phase 16 = N スケール計測 A/B**（N↑本線解禁。default は計測完了まで N=2 据え置き）。
+
+---
+
+## Phase 16: N スケール計測 A/B（任意）
+
+**前提:** Phase15 Pass-with-defer。作業ベース = tag `phase14-idle-bg`（`cf8ec05`）相当（Phase15 レース差分は revert 済み想定）。プールの N 可変は既存。**図A破壊・default N 無断変更禁止。**
+
+**目的:** 長尺中盤の供給負けが **N 増加で緩和されるか** を同一台本で定量 A/B し、default 変更の Go/No-Go を親に提案する。**本 Phase は計測が主。default を N=3/4 に上げる実装判断は親が A/B 後に行う。**
+
+**スコープ:**
+- 同一長尺台本・`--no-fast_inmemory` で **N=2（基準）→ N=3 → N=4**
+- 既存プール CLI の N 指定を使う。必要なら CLI 上限を **4 まで**許可（6コア全振り禁止は維持）
+- 見る指標: 中盤 REBUFFERING／供給リード／wait_mouth・lock・m0 p50／主観口フリーズ／RSS（Worker×キャッシュ）
+- Before 比較: Phase13hf 長尺 `logs/sess_phase10_step2_subj_20260729_180454` および本 Phase の N=2 再計測
+- OBS GPU 割り当ては運用メモとして可（必須 Pass 条件にしない）
+
+**禁止（継続）:**
+- 音声先行 enqueue／clear 隠蔽／正常 M0 短タイムアウト／固定 sleep
+- coalesce／cond 付け替え再燃、旧 fast/slow 分離
+- 図A・方式2・SSOT・jitter・idle／talkover／event・Phase14 IDLE_BG 破壊
+- **計測完了前に default N を変えない**
+- 6コア全振り（N>4 や全コア占有）禁止
+
+**Pass 基準（骨子）:**
+- [x] N=2/3/4 の同一台本表（REB・供給リード・wait/lock/m0・主観・RSS）を報告
+- [x] default 据え置きのまま。N↑の Go/No-Go を親へ提案 → **No-Go（default=N=2 維持）**
+- [x] 不変条件維持
+- [x] 無理な Hotfix なし（計測＋主観閉鎖）
+
+**子チャット報告（受理 2026-07-30）:**
+- Phase15 レース revert 済。本番コード差分なし。計測ヘルパ `phase16_n_scale_probe.py` のみ。
+- 長尺ストレス N=2/3/4: REB・wait/lock/m0・供給リードは横ばい。Worker 均等稼働（遊休ではない）。RSS は N にほぼ線形。
+- 主観長尺 N=4 `sess_phase10_step2_subj_20260730_140150`（Before 同等尺）: 2文目途中〜末尾口フリーズ・**改善なし**（REB 15→15）。
+- CLI 上限 1..4 既存のまま。default 未変更。
+
+**親判定（2026-07-30）:**
+- **Pass-with-defer**。N↑では中盤供給負けは閉じない（計測＋主観で閉鎖）。
+- **default = N=2 維持**（N=3 推奨せず。N=4 は CLI 上限のみ）。N スケールは本線から外す。
+- Keep All 可（計測ヘルパのみ）。
+- tag: `phase16-pass`（commit `6fc6507`、ヘルパ `phase16_n_scale_probe.py`）付与済み（2026-07-30）。
+- 次: **Phase 17 = mouth×claim 前線切り分け**（先に計測。実装は親承認後）。
+
+---
+
+## Phase 17: mouth×claim 前線切り分け（任意・分析優先）
+
+**前提:** Phase16 Pass-with-defer。作業ベース = `phase14-idle-bg`（`cf8ec05`）相当。default **N=2**。N↑は本線外。
+
+**目的:** 長尺中盤の供給負けが **「口（mouth/KNN）が本当に遅い」** のか **「口はあるのに claim 側で待たされている」** のかを計測で切り分け、次の実装対象（M3 or M1）を親に提案する。
+
+**スコープ（本 Phase = 切り分けが主）:**
+- 長尺中盤で時系列比較: mouth 最新 `t_ms` vs claim が欲しい `until_ms` vs `knn_ms` / `wait_mouth`（必要なら供給リード・player audio_ms）
+- 判定ルール（親確定）:
+  - **口が本当に遅い**（mouth 前線が claim/再生に追いつかない）→ M3（mouth_streamer / KNN）分析・改善を次候補
+  - **口はあるのに待たされている**（mouth は先行／十分だが wait_mouth や claim が進まない）→ M1 の mouth↔claim 前進を次候補
+- 主テスト: `--no-fast_inmemory`・N=2。Before 尺または実務近い長尺でよい
+- 観測用の最小ログ／計測ヘルパは可。**本番の挙動変更・「改善」実装は親が切り分け受理後に別指示**（本 Phase で勝手に Fix しない）
+- OBS→GPU は任意運用メモ（N↑の代替にしない・Pass 必須条件にしない）
+
+**禁止（継続）:**
+- 音声先行 enqueue／clear 隠蔽／短タイムアウト／固定 sleep／後続遅れをジッタで隠す
+- coalesce／cond 付け替え、旧 fast/slow、無断 N↑、default N 変更、6コア全振り
+- 図A・到着順 enqueue・方式2・SSOT・Phase14 IDLE_BG 破壊
+
+**Pass 基準（骨子）:**
+- [x] 中盤帯の mouth vs claim vs knn/wait の表または時系列要約
+- [x] **A（M3）** を根拠付きで提案（B 未検出）
+- [x] 不変条件維持（本番 Fix なし・計測ヘルパ＋観測ログのみ）
+- [x] 次 Phase 実装スコープ案を親承認待ちと明記
+
+**子チャット報告（受理 2026-07-30）:**
+- ヘルパ `phase17_mouth_claim_frontier_probe.py`＋観測 `mouth_claim_frontier`（挙動非変更）。
+- 中盤: knn 完了時 mouth は until に対し常時 ~80ms、claim_t1 に対し 80–160ms 遅れ。claim_ahead（B）=0。
+- knn_ms は軽い → ボトルネックは streamer／窓／emit の口タイムライン供給。
+- vs player は薄い先行＋時々負。high_wait はすべて claim_behind。
+
+**親判定（2026-07-30）:**
+- **Pass**。切り分け **A（M3）** 確定。本線は M3 mouth 前線先行。
+- 「M1 緩める」はゲート定義の設計論のみ可。口形捨て／mouth_closed 埋めで wait を消すのは禁止。
+- Keep All 可（ヘルパ＋観測ログ）。任意長尺で frontier 再確認は Phase18 で可。
+- 次: **Phase 18 = M3 mouth 前線先行**。
+
+---
+
+## Phase 18: M3 mouth 前線先行（任意）
+
+**前提:** Phase17 Pass。作業ベース = `phase16-pass`（`6fc6507`）＋ Phase17 Keep（ヘルパ／観測）。default **N=2**。N↑本線外。
+
+**目的:** mouth_streamer／formant 窓／KNN emit が PCM／claim より **2–4 frame（約 80–160ms）先行**できるよう、計測→最小改善する。目標: knn 時点で `claim_gap≤0` 比率↑、中盤 `wait_mouth`↓、長尺中盤口フリーズ改善。
+
+**スコープ:**
+- 主対象: M3（mouth_streamer / formant 窓 / KNN emit）。M1 は観測・配線の最小のみ（図A・ゲートの口形要件を捨てない）
+- 主テスト: `--no-fast_inmemory`・N=2。Before: `180454`／Phase16 N2。frontier ログで gap を再確認可
+- 順序: **計測で遅れ箇所を特定 → 最小改善 → Before 比**
+
+**禁止（継続＋本 Phase 強調）:**
+- 初期ジッター延長で中盤 REB を「直した」ことにする（初期ジッタは開始前のみ）
+- 直列補給負けモデルで設計する／口形一致を捨てる／mouth_closed 埋めで wait_mouth を消す
+- 根拠なし N↑、coalesce／付け替え、音声先行 enqueue、clear 隠蔽、短タイムアウト
+- 図A・到着順 enqueue・方式2・SSOT・Phase14 IDLE_BG 破壊
+- `.cursorrules` §2 時間軸図・誤解禁止に反する説明で Pass しない
+
+**Pass 基準（骨子）:**
+- [ ] knn 時点の mouth vs until/claim_gap が Before 比で改善（claim_gap≤0 比率↑ または 構造的 +80ms の縮小）
+- [ ] 中盤 wait_mouth↓、または主観（中盤口フリーズ）改善。未達なら計測で次手段を提案（Pass-with-defer 可）
+- [ ] 不変条件維持（AUDIO_BEFORE 実 enqueue 0 目安、SSOT_WAIT、通常 clear 0、到着順、方式2、N=2）
+- [ ] 付け替え・ジッタ隠蔽・口形捨てでないこと
+
+**親メモ:** 子は `docs/PROGRESS.md` を編集しない。
 
 ---
 
@@ -546,3 +723,17 @@
 | 2026-07-29 | Phase13 分析専用子を先に投下（Hotfix 実装は分析受理後） |
 | 2026-07-29 | 分析受理: 主因=末尾 claim/coverage。Hotfix 順序=claim先→IDLE_BG |
 | 2026-07-29 | Phase13 Hotfix Pass-with-defer。AUDIO_BEFORE大穴解消。残=中盤REB/末尾IDLE→Phase14 |
+| 2026-07-29 | `phase13-hotfix` tag（`d1a881b`）付与確認 |
+| 2026-07-29 | Phase14 分析受理: 中盤REB主因=lock/cond+wait_mouth（gap=0）。実装 Go |
+| 2026-07-29 | Phase14 中盤 Fail。方針(A) 中盤リバート＋IDLE_BGのみ。次=新親 |
+| 2026-07-30 | Phase14 (A) 完了。virtualcam IDLE_BG のみ Keep。中盤は hotfix 復帰 |
+| 2026-07-30 | `phase14-idle-bg` tag（`cf8ec05`）。本親クローズ。次=新親（wait_mouth） |
+| 2026-07-30 | 新親着手。Phase15=`wait_mouth`（mouth×claim）定義・子プロンプト発行。N↑は後段・親承認後 |
+| 2026-07-30 | Phase15 Pass-with-defer。主観未達・wait_mouth 計測閉鎖。レース revert。N↑本線→Phase16 |
+| 2026-07-30 | Phase16=N=2/3/4 計測 A/B 定義・子プロンプト発行。default 据え置き・上限4・6全振り禁止 |
+| 2026-07-30 | Phase16 Pass-with-defer。N↑効果なし（計測＋主観）。default=N=2 確定。N本線外 |
+| 2026-07-30 | `phase16-pass` tag（`6fc6507`、計測ヘルパのみ）付与確認 |
+| 2026-07-30 | Phase17=mouth×claim 前線切り分け定義・子プロンプト発行（分析優先・Fixは親承認後） |
+| 2026-07-30 | `.cursorrules` §2: 時間軸図・直列補給負け誤解禁止・中盤第一疑いを復元追記 |
+| 2026-07-30 | Phase17 Pass。切り分け A=M3。Keep=ヘルパ＋観測。本線=M3 前線先行 |
+| 2026-07-30 | Phase18=M3 mouth 前線先行定義・子プロンプト発行 |

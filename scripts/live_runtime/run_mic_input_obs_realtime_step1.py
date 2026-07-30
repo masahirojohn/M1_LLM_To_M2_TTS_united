@@ -1289,6 +1289,26 @@ def _m0_pipeline_advance_sync(
 
                 if not mouth_ready and not in_flight:
                     # session_loop will wait_mouth and retry.
+                    # Phase17 observability only (no behavior change): mouth vs claim gate.
+                    _last_t = int(last_t) if mouth_frames else -1
+                    mouth_cov_ms = (_last_t + int(step_ms)) if _last_t >= 0 else 0
+                    gap_ms = int(t1_ms) - int(mouth_cov_ms)
+                    # Always log B-suspect (gap<=0); else ~every 8th A sample.
+                    _fc = int(m0_pipeline_ref.get("_p17_frontier_log_i", 0) or 0) + 1
+                    m0_pipeline_ref["_p17_frontier_log_i"] = _fc
+                    if gap_ms <= 0 or (_fc % 8) == 1:
+                        print(
+                            "[sync][pipeline_chunk][mouth_claim_frontier]",
+                            f"mouth_last_t_ms={_last_t}",
+                            f"mouth_cov_ms={int(mouth_cov_ms)}",
+                            f"next_claim_t1_ms={int(t1_ms)}",
+                            f"until_ms={int(until_t1_ms) if until_t1_ms is not None else -1}",
+                            f"rendered_end_ms={int(t0_cov)}",
+                            f"gap_ms={int(gap_ms)}",
+                            f"mouth_ready={1 if mouth_ready else 0}",
+                            f"need_more={1 if need_more_claims else 0}",
+                            flush=True,
+                        )
                     return result
 
                 if in_flight or (need_more_claims and mouth_ready and not pool_free):
