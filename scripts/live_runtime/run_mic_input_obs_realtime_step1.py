@@ -857,6 +857,46 @@ def _attach_mouth_closed_dummy_frames(
     return int(added)
 
 
+def _mouth_obj_with_hold_extend(
+    mouth_obj: dict[str, Any],
+    *,
+    t1_ms: int,
+    step_ms: int,
+) -> tuple[dict[str, Any], int]:
+    """Return a shallow mouth copy with last mouth_id held up to t1 (render-only).
+
+    Phase22: M0 claim windows are chunk_len (default 120ms) while playback until
+    advances on ~40ms PCM. Gating mouth_ready on full t1 forces wait_mouth on
+    future PCM and collapses player pending. Hold-extend covers only the
+    claim overhang beyond current until for this render; does not mutate the
+    live mouth_obj_ref and does not use mouth_closed fill.
+    """
+    mouth_frames = list(_as_frames(mouth_obj))
+    if not mouth_frames:
+        return mouth_obj, 0
+    step = max(1, int(step_ms))
+    frame1 = int(t1_ms // step)
+    last = mouth_frames[-1]
+    last_t = int(last.get("t_ms", 0) or 0)
+    last_id = int(last.get("mouth_id", 0) or 0)
+    # Next index after last dense-or-sparse frame time.
+    next_i = int(last_t // step) + 1
+    added = 0
+    out = list(mouth_frames)
+    for i in range(max(next_i, 0), frame1):
+        out.append(
+            {
+                "t_ms": int(i * step),
+                "mouth_id": int(last_id),
+                "src": "mouth_hold_extend",
+            }
+        )
+        added += 1
+    if added <= 0:
+        return mouth_obj, 0
+    return _wrap_like(mouth_obj, out), int(added)
+
+
 def _normalize_m0_worker_ports(
     *,
     m0_worker_port: int | None,
@@ -1253,10 +1293,20 @@ def _m0_pipeline_advance_sync(
                 )
                 mouth_frames = _as_frames(obj)
                 # Prefer last t_ms so sparse / non-dense frame lists still gate correctly.
+                # Phase22: when until falls inside (t0,t1), gate on until — not full t1
+                # overhang — so equal-rate enqueue does not wait on future PCM.
+                mouth_need_t1 = int(t1_ms)
+                if (
+                    until_t1_ms is not None
+                    and int(until_t1_ms) > int(t0_ms)
+                    and int(until_t1_ms) < int(t1_ms)
+                ):
+                    mouth_need_t1 = int(until_t1_ms)
                 if mouth_frames:
                     last_t = int(mouth_frames[-1].get("t_ms", 0) or 0)
-                    mouth_ready = last_t + int(step_ms) >= int(t1_ms)
+                    mouth_ready = last_t + int(step_ms) >= int(mouth_need_t1)
                 else:
+                    last_t = -1
                     mouth_ready = False
                 pool_free = m0_pipeline_ref["pool_free"]
                 in_flight = int(m0_pipeline_ref["next_claim_cid"]) > int(
@@ -1292,7 +1342,7 @@ def _m0_pipeline_advance_sync(
                     # Phase17 observability only (no behavior change): mouth vs claim gate.
                     _last_t = int(last_t) if mouth_frames else -1
                     mouth_cov_ms = (_last_t + int(step_ms)) if _last_t >= 0 else 0
-                    gap_ms = int(t1_ms) - int(mouth_cov_ms)
+                    gap_ms = int(mouth_need_t1) - int(mouth_cov_ms)
                     # Always log B-suspect (gap<=0); else ~every 8th A sample.
                     _fc = int(m0_pipeline_ref.get("_p17_frontier_log_i", 0) or 0) + 1
                     m0_pipeline_ref["_p17_frontier_log_i"] = _fc
@@ -1302,6 +1352,7 @@ def _m0_pipeline_advance_sync(
                             f"mouth_last_t_ms={_last_t}",
                             f"mouth_cov_ms={int(mouth_cov_ms)}",
                             f"next_claim_t1_ms={int(t1_ms)}",
+                            f"mouth_need_t1_ms={int(mouth_need_t1)}",
                             f"until_ms={int(until_t1_ms) if until_t1_ms is not None else -1}",
                             f"rendered_end_ms={int(t0_cov)}",
                             f"gap_ms={int(gap_ms)}",
@@ -1357,10 +1408,31 @@ def _m0_pipeline_advance_sync(
                 t1_ms=int(t1_ms),
             )
 
+            render_obj = obj
+            hold_added = 0
+            _mf = _as_frames(obj)
+            if _mf:
+                _last_t = int(_mf[-1].get("t_ms", 0) or 0)
+                if _last_t + int(step_ms) < int(t1_ms):
+                    render_obj, hold_added = _mouth_obj_with_hold_extend(
+                        obj, t1_ms=int(t1_ms), step_ms=int(step_ms)
+                    )
+                    if hold_added > 0:
+                        print(
+                            "[sync][pipeline_chunk][mouth_hold_extend]",
+                            f"cid={int(claim_cid)}",
+                            f"t0_ms={int(t0_ms)}",
+                            f"t1_ms={int(t1_ms)}",
+                            f"until_ms={int(until_t1_ms) if until_t1_ms is not None else -1}",
+                            f"mouth_last_t_ms={int(_last_t)}",
+                            f"hold_frames={int(hold_added)}",
+                            flush=True,
+                        )
+
             try:
                 copied, hung, m0_ms = _m0_pipeline_render_with_hang_guard(
                     m0_pipeline_ref=m0_pipeline_ref,
-                    mouth_obj=obj,
+                    mouth_obj=render_obj,
                     cid=int(claim_cid),
                     t0_ms=int(t0_ms),
                     t1_ms=int(t1_ms),
