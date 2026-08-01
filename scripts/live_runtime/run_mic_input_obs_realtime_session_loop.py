@@ -2741,15 +2741,14 @@ def _process_audio_chunk_push_knn_sync(
             chunk_path.write_bytes(effective_playback)
 
     emitted = job.mouth_streamer.push_pcm16_mono(job.audio, input_sr=24000)
+    # Phase24: KNN always projects from in-memory streamer frames (avoid
+    # flush→full JSON read spikes). Disk archive flush remains for
+    # --no-fast_inmemory (hot path omits debug_frames; finalize keeps them).
     if not bool(job.fast_inmemory):
-        job.mouth_streamer.flush()
+        job.mouth_streamer.flush(include_debug=False)
 
     if int(emitted) > 0:
-        if bool(job.fast_inmemory):
-            # Skip flush I/O; project from in-memory streamer frames.
-            raw_obj = _project_streamer_obj_to_raw(job.mouth_streamer)
-        else:
-            raw_obj = _project_streamer_to_raw(job.mouth_streamer_json)
+        raw_obj = _project_streamer_obj_to_raw(job.mouth_streamer)
 
         frames_n = _process_audio_chunk_knn_sync(
             raw_obj=raw_obj,
@@ -4128,11 +4127,15 @@ async def _receive_loop(
                             emitted = mouth_streamer.push_pcm16_mono(
                                 audio, input_sr=24000
                             )
-                            mouth_streamer.flush()
+                            mouth_streamer.flush(include_debug=False)
 
-                            raw_obj = _project_streamer_to_raw(mouth_streamer_json)
+                            raw_obj = _project_streamer_obj_to_raw(mouth_streamer)
                             mouth_raw_json.write_text(
-                                json.dumps(raw_obj, ensure_ascii=False, indent=2),
+                                json.dumps(
+                                    raw_obj,
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
                                 encoding="utf-8",
                             )
 
@@ -4484,7 +4487,12 @@ def _stop_m0_worker_pool_tcp(
 
 
 def _rss_mb_for_pids(pids: list[int]) -> dict[str, float]:
-    """Best-effort RSS (MB) for worker PIDs; used in Phase 13 Before/After."""
+    """Best-effort RSS (MB) for worker PIDs; used in Phase 13 Before/After.
+
+    On Windows, `.venv\\Scripts\\python.exe` is often a launcher: the real
+    worker RSS lives in a child process. Include children so M0 pool totals
+    are not stuck near ~4MB.
+    """
     out: dict[str, float] = {"sum_mb": 0.0, "n": 0.0}
     if not pids:
         return out
@@ -4493,15 +4501,29 @@ def _rss_mb_for_pids(pids: list[int]) -> dict[str, float]:
 
         total = 0.0
         alive = 0
+        seen: set[int] = set()
         for pid in pids:
             try:
                 p = psutil.Process(int(pid))
-                rss = float(p.memory_info().rss) / (1024.0 * 1024.0)
-                total += rss
-                alive += 1
-                out[f"pid_{int(pid)}_mb"] = rss
             except Exception:
                 continue
+            procs = [p]
+            try:
+                procs.extend(p.children(recursive=True))
+            except Exception:
+                pass
+            for proc in procs:
+                try:
+                    cpid = int(proc.pid)
+                    if cpid in seen:
+                        continue
+                    seen.add(cpid)
+                    rss = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                    total += rss
+                    alive += 1
+                    out[f"pid_{cpid}_mb"] = rss
+                except Exception:
+                    continue
         out["sum_mb"] = total
         out["n"] = float(alive)
         return out
@@ -4556,6 +4578,113 @@ def _rss_mb_for_pids(pids: list[int]) -> dict[str, float]:
     except Exception:
         pass
     return out
+
+
+async def _phase24_rss_tick_loop(
+    *,
+    stop_event: asyncio.Event,
+    m0_pids: list[int],
+    turn_state: dict[str, Any],
+    csv_path: Path | None,
+    interval_s: float = 2.0,
+) -> None:
+    """Phase24: parent + M0 RSS timeseries (and light qsize / streamer len)."""
+    parent_pid = int(os.getpid())
+    t0 = time.perf_counter()
+    write_header = bool(csv_path is not None and not csv_path.exists())
+    if csv_path is not None:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+    while not stop_event.is_set():
+        try:
+            parent = _rss_mb_for_pids([parent_pid])
+            m0 = _rss_mb_for_pids([int(p) for p in m0_pids if int(p) > 0])
+            parent_mb = float(parent.get(f"pid_{parent_pid}_mb", 0.0) or 0.0)
+            m0_sum = float(m0.get("sum_mb", 0.0) or 0.0)
+            streamer = turn_state.get("mouth_streamer")
+            frames_n = 0
+            try:
+                frames_n = len(getattr(streamer, "_frames", []) or [])
+            except Exception:
+                frames_n = 0
+            inflight = int(turn_state.get("pipeline_inflight", 0) or 0)
+            eq = turn_state.get("pipeline_enqueue_queue_ref")
+            try:
+                qsize = int(eq.qsize()) if eq is not None else -1
+            except Exception:
+                qsize = -1
+            elapsed = time.perf_counter() - t0
+            print(
+                "[phase24][rss]",
+                f"elapsed_s={elapsed:.1f}",
+                f"parent_mb={parent_mb:.1f}",
+                f"m0_sum_mb={m0_sum:.1f}",
+                f"m0_detail={ {k: round(v, 1) for k, v in m0.items() if k.startswith('pid_')} }",
+                f"streamer_frames={frames_n}",
+                f"pipeline_inflight={inflight}",
+                f"enqueue_qsize={qsize}",
+                flush=True,
+            )
+            if csv_path is not None:
+                import csv as _csv
+
+                with csv_path.open("a", encoding="utf-8", newline="") as f:
+                    w = _csv.DictWriter(
+                        f,
+                        fieldnames=[
+                            "ts",
+                            "elapsed_s",
+                            "pid",
+                            "name",
+                            "rss_mb",
+                            "pipeline_inflight",
+                            "enqueue_qsize",
+                            "worker_qsize",
+                            "streamer_frames",
+                        ],
+                    )
+                    if write_header:
+                        w.writeheader()
+                        write_header = False
+                    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+                    w.writerow(
+                        {
+                            "ts": now,
+                            "elapsed_s": f"{elapsed:.1f}",
+                            "pid": str(parent_pid),
+                            "name": "session_loop",
+                            "rss_mb": f"{parent_mb:.1f}",
+                            "pipeline_inflight": str(inflight),
+                            "enqueue_qsize": str(qsize),
+                            "worker_qsize": "",
+                            "streamer_frames": str(frames_n),
+                        }
+                    )
+                    for k, v in m0.items():
+                        if not k.startswith("pid_"):
+                            continue
+                        pid_s = k[len("pid_") : -len("_mb")]
+                        w.writerow(
+                            {
+                                "ts": now,
+                                "elapsed_s": f"{elapsed:.1f}",
+                                "pid": pid_s,
+                                "name": "m0_worker",
+                                "rss_mb": f"{float(v):.1f}",
+                                "pipeline_inflight": str(inflight),
+                                "enqueue_qsize": str(qsize),
+                                "worker_qsize": "",
+                                "streamer_frames": str(frames_n),
+                            }
+                        )
+        except Exception as e:
+            print(
+                f"[phase24][rss][WARN] {type(e).__name__}: {e}",
+                flush=True,
+            )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=float(interval_s))
+        except asyncio.TimeoutError:
+            pass
 
 
 def _call_watch_stream_mouth_and_render_m0(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -5282,6 +5411,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
             turn_state.clear()
+            turn_state["mouth_streamer"] = mouth_streamer
             turn_state["active_turn"] = None
             turn_state["first_audio_sec"] = None
             turn_state["first_mouth_json_logged"] = False
@@ -5364,6 +5494,7 @@ async def _run(args: argparse.Namespace) -> int:
             turn_audio_stop_event = Event()
             recv_stop = asyncio.Event()
             recv_task: asyncio.Task | None = None
+            rss_tick_task: asyncio.Task | None = None
             idle_silent_stop: asyncio.Event | None = None
             ai_audio_started_event: asyncio.Event | None = None
             idle_silent_task: asyncio.Task | None = None
@@ -5476,6 +5607,28 @@ async def _run(args: argparse.Namespace) -> int:
                     ai_audio_started_event=ai_audio_started_event,
                 )
             )
+
+            try:
+                rss_csv = (
+                    Path(__file__).resolve().parents[2]
+                    / "logs"
+                    / f"{args.session_id}_rss.csv"
+                )
+                rss_tick_task = asyncio.create_task(
+                    _phase24_rss_tick_loop(
+                        stop_event=recv_stop,
+                        m0_pids=[int(p.pid) for p in m0_procs if p.pid],
+                        turn_state=turn_state,
+                        csv_path=rss_csv,
+                        interval_s=2.0,
+                    ),
+                    name=f"phase24_rss_turn_{turn_no}",
+                )
+            except Exception as e:
+                print(
+                    f"[phase24][rss][WARN] tick start failed: {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
             if idle_silent_stop is not None and ai_audio_started_event is not None:
                 idle_silent_task = asyncio.create_task(
@@ -5903,10 +6056,32 @@ async def _run(args: argparse.Namespace) -> int:
             turn_state.pop("ai_audio_started_event", None)
 
             recv_stop.set()
+            if rss_tick_task is not None:
+                await _cancel_tasks_safely(
+                    [rss_tick_task],
+                    tag=f"phase24_rss_turn_{turn_no}",
+                )
+                rss_tick_task = None
             await _cancel_tasks_safely(
                 [recv_task],
                 tag=f"turn_{turn_no}_recv",
             )
+
+            # Phase24: archive final mouth_streamer.json with debug_frames for
+            # self-gate / analysis (hot-path flushes omit debug).
+            try:
+                mouth_streamer.finalize()
+                print(
+                    "[phase24][streamer_finalize]",
+                    f"turn={turn_no}",
+                    f"frames={len(getattr(mouth_streamer, '_frames', []) or [])}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[phase24][streamer_finalize][WARN] {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
             # このturn用 audio watcher を停止
             turn_audio_stop_event.set()
@@ -6769,7 +6944,12 @@ def main() -> int:
     ap.add_argument("--mouth_vad_min_silence_ms", type=int, default=120)
     ap.add_argument("--mouth_open_id", type=int, default=1)
     ap.add_argument("--mouth_close_id", type=int, default=0)
-    ap.add_argument("--mouth_flush_every_frames", type=int, default=1)
+    ap.add_argument(
+        "--mouth_flush_every_frames",
+        type=int,
+        default=25,
+        help="Archive flush cadence for MouthStreamerOC (default 25; was 1).",
+    )
     ap.add_argument("--mouth_max_buffer_s", type=float, default=10.0)
     ap.add_argument("--mouth_vowel_mode", choices=["formant", "simple"], default="formant")
     ap.add_argument("--mouth_formant_window_ms", type=int, default=200)
