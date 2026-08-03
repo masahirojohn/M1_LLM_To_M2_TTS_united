@@ -193,7 +193,9 @@ def _find_latest_fg_at_or_before(
         if 0 <= hint <= hi:
             p = _fg_frame_path(fg_dir, hint)
             if p is not None:
-                # Try to walk forward from hint toward target (small gap catch-up).
+                # Walk forward from hint toward target. Skip holes: parallel M0 can
+                # write later frames before earlier ones; breaking on the first gap
+                # freezes display on a stale frame while audio_ms advances (Phase28).
                 best_i = hint
                 best_p = p
                 fwd_lim = min(hi, hint + max(1, int(max_scan)))
@@ -202,8 +204,6 @@ def _find_latest_fg_at_or_before(
                     if cand is not None:
                         best_i = i
                         best_p = cand
-                    else:
-                        break
                 return best_p, int(best_i)
 
     lo = max(0, hi - max(0, int(max_scan)) + 1)
@@ -212,6 +212,46 @@ def _find_latest_fg_at_or_before(
         if p is not None:
             return p, int(i)
     return None
+
+
+def _fg_ready_at_or_after(
+    *,
+    fg_dir: Path,
+    frame_idx: int,
+    max_scan: int = 8,
+) -> bool:
+    """True if any FG exists at frame_idx .. frame_idx+max_scan-1."""
+    start = max(0, int(frame_idx))
+    for i in range(start, start + max(1, int(max_scan))):
+        if _fg_frame_path(fg_dir, i) is not None:
+            return True
+    return False
+
+
+def _should_adopt_sync_meta(
+    *,
+    fg_dir: Path,
+    applied: dict | None,
+    candidate: dict | None,
+) -> bool:
+    """Adopt new turn sync_meta only after new-turn FG exists at frame_offset.
+
+    Phase28: session_loop writes the next frame_offset/base while previous-turn
+    PCM may still be draining from the player. Applying meta early remaps that
+    leftover audio onto missing new-turn frames → SSOT_CATCHUP sticky freeze.
+    """
+    if candidate is None:
+        return False
+    if applied is None:
+        return True
+
+    new_off = int(candidate.get("frame_offset", 0) or 0)
+    old_off = int(applied.get("frame_offset", 0) or 0)
+    if new_off <= old_off:
+        # Same turn (or base-only refresh): always take the newer meta.
+        return True
+
+    return _fg_ready_at_or_after(fg_dir=fg_dir, frame_idx=new_off, max_scan=8)
 
 
 def main() -> int:
@@ -297,6 +337,8 @@ def main() -> int:
     last_displayed_frame: int | None = None
     max_existing_frame: int | None = None
     last_logged_target = None
+    applied_sync_meta: dict | None = None
+    last_meta_defer_key = None
     ssot_enabled = playback_state_file is not None
 
     print("[virtualcam_persistent][START]", flush=True)
@@ -423,7 +465,53 @@ def main() -> int:
 
             if ssot_enabled:
                 playback_state = _read_json_file(playback_state_file)
-                sync_meta = _read_json_file(sync_meta_file)
+                sync_meta_candidate = _read_json_file(sync_meta_file)
+                if _should_adopt_sync_meta(
+                    fg_dir=fg_dir,
+                    applied=applied_sync_meta,
+                    candidate=sync_meta_candidate,
+                ):
+                    if (
+                        applied_sync_meta is not None
+                        and sync_meta_candidate is not None
+                        and int(sync_meta_candidate.get("frame_offset", 0) or 0)
+                        > int(applied_sync_meta.get("frame_offset", 0) or 0)
+                    ):
+                        # New turn FG frontier: do not hint from previous-turn indices.
+                        new_off = int(sync_meta_candidate.get("frame_offset", 0) or 0)
+                        if (
+                            last_displayed_frame is not None
+                            and int(last_displayed_frame) < new_off
+                        ):
+                            last_displayed_frame = None
+                        if (
+                            max_existing_frame is not None
+                            and int(max_existing_frame) < new_off
+                        ):
+                            max_existing_frame = None
+                    applied_sync_meta = sync_meta_candidate
+                elif (
+                    sync_meta_candidate is not None
+                    and applied_sync_meta is not None
+                    and int(sync_meta_candidate.get("frame_offset", 0) or 0)
+                    > int(applied_sync_meta.get("frame_offset", 0) or 0)
+                ):
+                    defer_key = (
+                        int(sync_meta_candidate.get("frame_offset", 0) or 0),
+                        int(sync_meta_candidate.get("base_played_samples", 0) or 0),
+                        int((playback_state or {}).get("played_samples", 0) or 0)
+                        // 4800,
+                    )
+                    if last_meta_defer_key != defer_key:
+                        print(
+                            "[sync][virtualcam][SSOT_META_DEFER]",
+                            f"pending_offset={int(sync_meta_candidate.get('frame_offset', 0) or 0)}",
+                            f"applied_offset={int(applied_sync_meta.get('frame_offset', 0) or 0)}",
+                            f"state={(playback_state or {}).get('state')}",
+                            flush=True,
+                        )
+                        last_meta_defer_key = defer_key
+                sync_meta = applied_sync_meta
                 target = _resolve_ssot_target(
                     playback_state=playback_state,
                     sync_meta=sync_meta,

@@ -45,6 +45,41 @@ def main() -> int:
         )
         assert hit3 is not None and hit3[1] == 2, hit3
 
+        # Phase28: holes from parallel M0 must not freeze at the gap edge.
+        for i in (100, 101, 105, 106, 110):
+            (fg / f"{i:08d}.png").write_bytes(b"x")
+        hit4 = mod._find_latest_fg_at_or_before(
+            fg_dir=fg, target_frame=112, hint_frame=100
+        )
+        assert hit4 is not None and hit4[1] == 110, hit4
+
+        # Phase28: defer adopting a newer frame_offset until new-turn FG exists.
+        applied = {
+            "frame_offset": 0,
+            "base_played_samples": 0,
+            "step_ms": 40,
+            "playback_origin_ms": 0,
+        }
+        candidate = {
+            "frame_offset": 210,
+            "base_played_samples": 100000,
+            "step_ms": 40,
+            "playback_origin_ms": 0,
+        }
+        assert (
+            mod._should_adopt_sync_meta(
+                fg_dir=fg, applied=applied, candidate=candidate
+            )
+            is False
+        )
+        (fg / f"{210:08d}.png").write_bytes(b"x")
+        assert (
+            mod._should_adopt_sync_meta(
+                fg_dir=fg, applied=applied, candidate=candidate
+            )
+            is True
+        )
+
     print("OK phase7_ssot_catchup_selfcheck")
     return 0
 
