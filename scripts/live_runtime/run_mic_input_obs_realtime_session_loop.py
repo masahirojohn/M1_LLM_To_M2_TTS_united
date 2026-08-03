@@ -2893,6 +2893,9 @@ def _enqueue_playback_audio_sync(
     if audio_player_proc is None or audio_device is None:
         return
 
+    # Phase29: publish sync_meta immediately before the first player enqueue.
+    _commit_pending_virtualcam_sync_meta(turn_state)
+
     playback_ref = turn_state.get("audio_playback_state_ref")
     chunk_path = job.pcm_stream_chunks_dir / f"chunk_{job.playback_chunk_idx:06d}.pcm"
     if not chunk_path.exists():
@@ -4367,6 +4370,95 @@ def _read_played_samples_from_state_file(path: Path | None) -> int:
     return 0
 
 
+def _read_playback_clock_from_state_file(
+    path: Path | None,
+) -> tuple[int, int, int]:
+    """Return (played_samples, pending_samples, sample_rate)."""
+    played = 0
+    pending_samples = 0
+    sample_rate = 24000
+    if path is None or not Path(path).exists():
+        return played, pending_samples, sample_rate
+    try:
+        obj = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        if isinstance(obj, dict):
+            played = int(obj.get("played_samples", 0) or 0)
+            pending_samples = int(obj.get("pending_samples", 0) or 0)
+            if pending_samples <= 0:
+                # Fallback when only pending_ms is published.
+                pending_ms = float(obj.get("pending_ms", 0.0) or 0.0)
+                sr = int(obj.get("sample_rate", 24000) or 24000)
+                if sr > 0 and pending_ms > 0.0:
+                    pending_samples = int(round(pending_ms * float(sr) / 1000.0))
+            sample_rate = int(obj.get("sample_rate", 24000) or 24000)
+            if sample_rate <= 0:
+                sample_rate = 24000
+    except Exception:
+        return 0, 0, 24000
+    return int(played), int(pending_samples), int(sample_rate)
+
+
+def _commit_pending_virtualcam_sync_meta(turn_state: dict[str, Any]) -> bool:
+    """Phase29: publish new-turn sync_meta on first player enqueue.
+
+    Writing frame_offset/base at turn start remaps leftover previous-turn PCM
+    onto the new offset (sticky CATCHUP). Commit when new audio is about to be
+    queued, with base at the sample position where that audio will start
+    (played + pending), so residual old PCM keeps audio_ms≈0 under the new meta.
+    """
+    pending = turn_state.get("pending_virtualcam_sync_meta")
+    if not isinstance(pending, dict) or bool(pending.get("committed")):
+        return False
+
+    meta_file = turn_state.get("virtualcam_sync_meta_file")
+    state_file = turn_state.get("playback_state_file")
+    played, pending_samples, _sr = _read_playback_clock_from_state_file(
+        Path(state_file) if state_file is not None else None
+    )
+    if played <= 0 and pending_samples <= 0:
+        ref = turn_state.get("audio_playback_state_ref")
+        if isinstance(ref, dict):
+            try:
+                with ref["lock"]:
+                    played = int(ref.get("played_samples", 0) or 0)
+                    pending_ms = float(ref.get("pending_ms", 0.0) or 0.0)
+                    sr = int(ref.get("sample_rate", 24000) or 24000)
+                if sr <= 0:
+                    sr = 24000
+                if pending_samples <= 0 and pending_ms > 0.0:
+                    pending_samples = int(round(pending_ms * float(sr) / 1000.0))
+            except Exception:
+                pass
+
+    base = max(0, int(played) + int(pending_samples))
+    _write_virtualcam_sync_meta(
+        Path(meta_file) if meta_file is not None else None,
+        frame_offset=int(pending.get("frame_offset", 0) or 0),
+        step_ms=int(pending.get("step_ms", 40) or 40),
+        base_played_samples=int(base),
+        playback_origin_ms=0,
+        turn_no=(
+            int(pending["turn_no"]) if pending.get("turn_no") is not None else None
+        ),
+    )
+    playback_ref = turn_state.get("audio_playback_state_ref")
+    if isinstance(playback_ref, dict):
+        with playback_ref["lock"]:
+            playback_ref["response_playback_base_samples"] = int(base)
+            playback_ref["playback_origin_ms"] = 0
+    pending["committed"] = True
+    print(
+        "[sync][virtualcam_meta][COMMIT_ON_FIRST_ENQUEUE]",
+        f"frame_offset={int(pending.get('frame_offset', 0) or 0)}",
+        f"base_played_samples={int(base)}",
+        f"played_samples={int(played)}",
+        f"pending_samples={int(pending_samples)}",
+        f"turn_no={pending.get('turn_no')}",
+        flush=True,
+    )
+    return True
+
+
 def _write_virtualcam_sync_meta(
     path: Path | None,
     *,
@@ -5529,26 +5621,33 @@ async def _run(args: argparse.Namespace) -> int:
             turn_state["ai_audio_output_device"] = str(args.ai_audio_output_device)
             turn_state["audio_playback_state_ref"] = _make_audio_playback_state_ref()
             turn_state["playback_state_file"] = playback_state_file
+            turn_state["virtualcam_sync_meta_file"] = virtualcam_sync_meta_file
             turn_state["fast_inmemory"] = bool(getattr(args, "fast_inmemory", False))
             turn_state["skip_archive_pcm"] = bool(
                 getattr(args, "fast_inmemory", False)
                 and getattr(args, "skip_archive_pcm", False)
             )
 
-            # VirtualCam SSOT: align PNG index to player audio_ms for this turn.
-            base_played = _read_played_samples_from_state_file(playback_state_file)
-            _write_virtualcam_sync_meta(
-                virtualcam_sync_meta_file,
-                frame_offset=int(next_frame_offset),
-                step_ms=int(args.step_ms),
-                base_played_samples=int(base_played),
-                playback_origin_ms=0,
-                turn_no=int(turn_no),
-            )
+            # Phase29: defer VirtualCam sync_meta (frame_offset/base) until the
+            # first player enqueue. Early write remaps leftover previous-turn PCM
+            # onto the new offset → sticky CATCHUP (see Phase28 root cause).
+            turn_state["pending_virtualcam_sync_meta"] = {
+                "frame_offset": int(next_frame_offset),
+                "step_ms": int(args.step_ms),
+                "turn_no": int(turn_no),
+                "committed": False,
+            }
             playback_ref_init = turn_state["audio_playback_state_ref"]
             with playback_ref_init["lock"]:
-                playback_ref_init["response_playback_base_samples"] = int(base_played)
+                playback_ref_init["response_playback_base_samples"] = 0
                 playback_ref_init["playback_origin_ms"] = 0
+            print(
+                "[sync][virtualcam_meta][DEFER_UNTIL_ENQUEUE]",
+                f"frame_offset={int(next_frame_offset)}",
+                f"step_ms={int(args.step_ms)}",
+                f"turn_no={int(turn_no)}",
+                flush=True,
+            )
 
             mouth_obj_ref: dict[str, Any] = {"obj": None, "knn_raw_frames_done": 0}
             pipeline_sync = bool(getattr(args, "pipeline_sync", True))
