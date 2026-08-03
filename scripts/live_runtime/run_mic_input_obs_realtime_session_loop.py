@@ -2909,6 +2909,8 @@ def _enqueue_playback_audio_sync(
         single_chunk=True,
         audio_playback_state_ref=playback_ref,
     )
+    # Phase29hf: refresh last-good clock after player ack updates playback_ref.
+    _refresh_playback_clock_guard(turn_state)
 
     print(
         "[sync][pipeline_chunk][enqueue_done]",
@@ -4398,6 +4400,111 @@ def _read_playback_clock_from_state_file(
     return int(played), int(pending_samples), int(sample_rate)
 
 
+def _read_playback_clock_from_ref(
+    turn_state: dict[str, Any],
+) -> tuple[int, int, int]:
+    """Return (played_samples, pending_samples, sample_rate) from in-proc ref."""
+    ref = turn_state.get("audio_playback_state_ref")
+    if not isinstance(ref, dict):
+        return 0, 0, 24000
+    try:
+        with ref["lock"]:
+            played = int(ref.get("played_samples", 0) or 0)
+            pending_ms = float(ref.get("pending_ms", 0.0) or 0.0)
+            sr = int(ref.get("sample_rate", 24000) or 24000)
+        if sr <= 0:
+            sr = 24000
+        pending_samples = 0
+        if pending_ms > 0.0:
+            pending_samples = int(round(pending_ms * float(sr) / 1000.0))
+        return int(played), int(pending_samples), int(sr)
+    except Exception:
+        return 0, 0, 24000
+
+
+def _playback_clock_guard(turn_state: dict[str, Any]) -> dict[str, int]:
+    guard = turn_state.get("playback_clock_guard")
+    if not isinstance(guard, dict):
+        guard = {"played_samples": 0, "pending_samples": 0}
+        turn_state["playback_clock_guard"] = guard
+    return guard
+
+
+def _refresh_playback_clock_guard(turn_state: dict[str, Any]) -> None:
+    """Keep session-scoped last-good clock (survives turn_state.clear via reattach)."""
+    guard = _playback_clock_guard(turn_state)
+    state_file = turn_state.get("playback_state_file")
+    f_played, f_pending, _sr = _read_playback_clock_from_state_file(
+        Path(state_file) if state_file is not None else None
+    )
+    r_played, r_pending, _ = _read_playback_clock_from_ref(turn_state)
+    if int(f_played) + int(f_pending) >= int(r_played) + int(r_pending):
+        played, pending_samples = int(f_played), int(f_pending)
+    else:
+        played, pending_samples = int(r_played), int(r_pending)
+    if played + pending_samples <= 0:
+        return
+    guard["played_samples"] = max(int(guard.get("played_samples", 0) or 0), played)
+    # pending is instantaneous; keep latest non-negative snapshot
+    guard["pending_samples"] = max(0, pending_samples)
+
+
+def _pick_playback_clock_for_commit(
+    turn_state: dict[str, Any],
+) -> tuple[int, int, int, str]:
+    """Pick best (played, pending, sr, source) for sync_meta base.
+
+    Prefers the higher played+pending snapshot among state_file and playback_ref.
+    Retries briefly when prior progress exists but both sources read as zero
+    (Windows atomic-replace / empty-file race → T8-type false base=0).
+    """
+    state_file = turn_state.get("playback_state_file")
+    path = Path(state_file) if state_file is not None else None
+    guard = _playback_clock_guard(turn_state)
+    last_played = int(guard.get("played_samples", 0) or 0)
+    last_pending = int(guard.get("pending_samples", 0) or 0)
+    last_sum = max(0, last_played + last_pending)
+    pending_meta = turn_state.get("pending_virtualcam_sync_meta")
+    turn_no = 0
+    if isinstance(pending_meta, dict) and pending_meta.get("turn_no") is not None:
+        try:
+            turn_no = int(pending_meta.get("turn_no") or 0)
+        except Exception:
+            turn_no = 0
+
+    played = 0
+    pending_samples = 0
+    sample_rate = 24000
+    source = "empty"
+    max_attempts = 6 if last_sum > 0 or turn_no > 1 else 1
+    for attempt in range(max_attempts):
+        f_played, f_pending, f_sr = _read_playback_clock_from_state_file(path)
+        r_played, r_pending, r_sr = _read_playback_clock_from_ref(turn_state)
+        if int(f_played) + int(f_pending) >= int(r_played) + int(r_pending):
+            played, pending_samples, sample_rate = int(f_played), int(f_pending), int(f_sr)
+            source = "state_file"
+        else:
+            played, pending_samples, sample_rate = int(r_played), int(r_pending), int(r_sr)
+            source = "playback_ref"
+        if played > 0 or pending_samples > 0:
+            return played, pending_samples, sample_rate, source
+        if last_sum <= 0 and turn_no <= 1:
+            return 0, 0, sample_rate, source
+        print(
+            "[sync][virtualcam_meta][COMMIT_CLOCK_RETRY]",
+            f"attempt={attempt + 1}/{max_attempts}",
+            f"turn_no={turn_no}",
+            f"last_played={last_played}",
+            f"last_pending={last_pending}",
+            f"file=({f_played},{f_pending})",
+            f"ref=({r_played},{r_pending})",
+            flush=True,
+        )
+        time.sleep(0.005)
+    # Still zero after retries while prior progress exists → refuse (caller retries).
+    return 0, 0, sample_rate, "false_zero"
+
+
 def _commit_pending_virtualcam_sync_meta(turn_state: dict[str, Any]) -> bool:
     """Phase29: publish new-turn sync_meta on first player enqueue.
 
@@ -4405,32 +4512,57 @@ def _commit_pending_virtualcam_sync_meta(turn_state: dict[str, Any]) -> bool:
     onto the new offset (sticky CATCHUP). Commit when new audio is about to be
     queued, with base at the sample position where that audio will start
     (played + pending), so residual old PCM keeps audio_ms≈0 under the new meta.
+
+    Phase29hf: refuse commit on transient false-zero clock reads (retry next enqueue).
     """
     pending = turn_state.get("pending_virtualcam_sync_meta")
     if not isinstance(pending, dict) or bool(pending.get("committed")):
         return False
 
     meta_file = turn_state.get("virtualcam_sync_meta_file")
-    state_file = turn_state.get("playback_state_file")
-    played, pending_samples, _sr = _read_playback_clock_from_state_file(
-        Path(state_file) if state_file is not None else None
+    played, pending_samples, _sr, clock_source = _pick_playback_clock_for_commit(
+        turn_state
     )
-    if played <= 0 and pending_samples <= 0:
-        ref = turn_state.get("audio_playback_state_ref")
-        if isinstance(ref, dict):
-            try:
-                with ref["lock"]:
-                    played = int(ref.get("played_samples", 0) or 0)
-                    pending_ms = float(ref.get("pending_ms", 0.0) or 0.0)
-                    sr = int(ref.get("sample_rate", 24000) or 24000)
-                if sr <= 0:
-                    sr = 24000
-                if pending_samples <= 0 and pending_ms > 0.0:
-                    pending_samples = int(round(pending_ms * float(sr) / 1000.0))
-            except Exception:
-                pass
+    guard = _playback_clock_guard(turn_state)
+    last_played = int(guard.get("played_samples", 0) or 0)
+    last_pending = int(guard.get("pending_samples", 0) or 0)
+    last_sum = max(0, last_played + last_pending)
+    turn_no = pending.get("turn_no")
+    if clock_source == "false_zero" or (
+        played <= 0
+        and pending_samples <= 0
+        and (last_sum > 0 or (turn_no is not None and int(turn_no) > 1))
+    ):
+        defer_n = int(pending.get("false_zero_defer_n", 0) or 0) + 1
+        pending["false_zero_defer_n"] = defer_n
+        print(
+            "[sync][virtualcam_meta][COMMIT_DEFER_FALSE_ZERO]",
+            f"frame_offset={int(pending.get('frame_offset', 0) or 0)}",
+            f"turn_no={turn_no}",
+            f"defer_n={defer_n}",
+            f"last_played={last_played}",
+            f"last_pending={last_pending}",
+            f"clock_source={clock_source}",
+            flush=True,
+        )
+        return False
 
     base = max(0, int(played) + int(pending_samples))
+    # Never regress below last-good total when a partial race under-reports.
+    if last_sum > 0 and base < last_sum:
+        print(
+            "[sync][virtualcam_meta][COMMIT_FLOOR_LAST_GOOD]",
+            f"raw_base={base}",
+            f"last_sum={last_sum}",
+            f"played={played}",
+            f"pending_samples={pending_samples}",
+            f"turn_no={turn_no}",
+            flush=True,
+        )
+        base = int(last_sum)
+        played = int(last_played)
+        pending_samples = int(last_pending)
+
     _write_virtualcam_sync_meta(
         Path(meta_file) if meta_file is not None else None,
         frame_offset=int(pending.get("frame_offset", 0) or 0),
@@ -4446,6 +4578,12 @@ def _commit_pending_virtualcam_sync_meta(turn_state: dict[str, Any]) -> bool:
         with playback_ref["lock"]:
             playback_ref["response_playback_base_samples"] = int(base)
             playback_ref["playback_origin_ms"] = 0
+            # Keep ref clock coherent for subsequent commits / fallbacks.
+            if int(played) > int(playback_ref.get("played_samples", 0) or 0):
+                playback_ref["played_samples"] = int(played)
+    if base > 0:
+        guard["played_samples"] = max(int(guard.get("played_samples", 0) or 0), int(played))
+        guard["pending_samples"] = max(0, int(pending_samples))
     pending["committed"] = True
     print(
         "[sync][virtualcam_meta][COMMIT_ON_FIRST_ENQUEUE]",
@@ -4454,6 +4592,7 @@ def _commit_pending_virtualcam_sync_meta(turn_state: dict[str, Any]) -> bool:
         f"played_samples={int(played)}",
         f"pending_samples={int(pending_samples)}",
         f"turn_no={pending.get('turn_no')}",
+        f"clock_source={clock_source}",
         flush=True,
     )
     return True
@@ -5216,6 +5355,12 @@ async def _run(args: argparse.Namespace) -> int:
         )
 
         turn_state: dict[str, Any] = {}
+        # Phase29hf: session-scoped last-good player clock (reattached after clear).
+        playback_clock_guard: dict[str, int] = {
+            "played_samples": 0,
+            "pending_samples": 0,
+        }
+        turn_state["playback_clock_guard"] = playback_clock_guard
         recv_stop = asyncio.Event()
 
         async def _bootstrap_probe_audio_session(
@@ -5606,6 +5751,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
             turn_state.clear()
+            turn_state["playback_clock_guard"] = playback_clock_guard
             turn_state["mouth_streamer"] = mouth_streamer
             turn_state["active_turn"] = None
             turn_state["first_audio_sec"] = None
@@ -5641,11 +5787,24 @@ async def _run(args: argparse.Namespace) -> int:
             with playback_ref_init["lock"]:
                 playback_ref_init["response_playback_base_samples"] = 0
                 playback_ref_init["playback_origin_ms"] = 0
+                # Phase29hf: seed ref from last-good so commit fallback is not false-zero.
+                seed_played = int(playback_clock_guard.get("played_samples", 0) or 0)
+                seed_pending = int(playback_clock_guard.get("pending_samples", 0) or 0)
+                if seed_played > 0:
+                    playback_ref_init["played_samples"] = int(seed_played)
+                if seed_pending > 0:
+                    sr0 = int(playback_ref_init.get("sample_rate", 24000) or 24000)
+                    if sr0 <= 0:
+                        sr0 = 24000
+                    playback_ref_init["pending_ms"] = (
+                        float(seed_pending) * 1000.0 / float(sr0)
+                    )
             print(
                 "[sync][virtualcam_meta][DEFER_UNTIL_ENQUEUE]",
                 f"frame_offset={int(next_frame_offset)}",
                 f"step_ms={int(args.step_ms)}",
                 f"turn_no={int(turn_no)}",
+                f"seed_played={int(playback_clock_guard.get('played_samples', 0) or 0)}",
                 flush=True,
             )
 
