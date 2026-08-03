@@ -56,6 +56,7 @@ from run_mic_input_obs_realtime_step1 import (
     _m0_pool_reset_tcp,
     _m0_timing_add,
     _m0_timing_empty,
+    _mouth_obj_with_hold_extend,
     _start_audio_player,
     _stop_audio_player,
     _send_audio_chunk,
@@ -2515,6 +2516,38 @@ class _PipelineEnqueueItem:
     stage_knn_done_ms: float
     stage_m0_done_ms: float
     m0_breakdown: dict[str, float] | None = None
+    push_wait_ms: float = 0.0
+    t_enqueued: float = 0.0
+
+
+def _tail_hold_extend_live_mouth(
+    mouth_obj_ref: dict[str, Any] | None,
+    *,
+    until_t1_ms: int,
+    step_ms: int,
+) -> int:
+    """Turn-end only: mutate live mouth so the last PCM until can clear mouth_ready.
+
+    Phase22 hold-extend is render-copy only and runs after claim; at generation end
+    mouth often stops ~1 step short of until, so claim never starts. Extending the
+    live ref with the last mouth_id (not mouth_closed) lets M0 cover then enqueue
+    without audio-before.
+    """
+    if mouth_obj_ref is None or int(until_t1_ms) <= 0:
+        return 0
+    obj = mouth_obj_ref.get("obj")
+    if not isinstance(obj, dict):
+        return 0
+    step = max(1, int(step_ms) or 40)
+    # hold_extend upper bound is exclusive (t1//step); +step ensures cov crosses until.
+    target_t1 = int(until_t1_ms) + int(step)
+    new_obj, added = _mouth_obj_with_hold_extend(
+        obj, t1_ms=int(target_t1), step_ms=int(step)
+    )
+    if int(added) <= 0:
+        return 0
+    mouth_obj_ref["obj"] = new_obj
+    return int(added)
 
 
 def _pipeline_inflight_inc(turn_state: dict[str, Any]) -> int:
@@ -2923,6 +2956,8 @@ def _log_pipeline_chunk_result(
     m0_last_global: int,
     turn_state: dict[str, Any],
     queue_wait_ms: float = 0.0,
+    push_wait_ms: float = 0.0,
+    order_wait_ms: float = 0.0,
     stage_knn_done_ms: float = 0.0,
     stage_m0_done_ms: float = 0.0,
     m0_breakdown: dict[str, float] | None = None,
@@ -2938,6 +2973,8 @@ def _log_pipeline_chunk_result(
         f"m0_chunks={int(m0_chunks)}",
         f"enqueue_ms={enqueue_ms:.1f}",
         f"queue_wait_ms={queue_wait_ms:.1f}",
+        f"push_wait_ms={push_wait_ms:.1f}",
+        f"order_wait_ms={order_wait_ms:.1f}",
         f"total_ms={total_ms:.1f}",
         f"stage_knn_done_ms={stage_knn_done_ms:.1f}",
         f"stage_m0_done_ms={stage_m0_done_ms:.1f}",
@@ -2996,7 +3033,9 @@ async def _process_pipeline_chunk_task(
             flush=True,
         )
 
+        t_push0 = time.perf_counter()
         await _await_pipeline_push_turn(turn_state, int(pipeline_seq))
+        push_wait_ms = (time.perf_counter() - t_push0) * 1000.0
         try:
             push_knn_result = await asyncio.to_thread(
                 _process_audio_chunk_push_knn_sync,
@@ -3039,6 +3078,7 @@ async def _process_pipeline_chunk_task(
             t_m0 = time.perf_counter()
             covered = False
             no_progress_rounds = 0
+            tail_hold_attempted = False
             # Coverage wait must not abort immediately on recv_stop: turn-end stop
             # fires while tail chunks still need claim/watermark. Interrupt cancels
             # the task (CancelledError). After stop, allow a short no-progress budget.
@@ -3117,19 +3157,47 @@ async def _process_pipeline_chunk_task(
                     )
                     break
 
-                # recv_stop set and mouth/claim stalled: give up (still block enqueue).
-                if stop_event.is_set() and no_progress_rounds >= 40:
-                    enqueue_blocked = True
-                    m0_ms = (time.perf_counter() - t_m0) * 1000.0
-                    print(
-                        "[sync][pipeline_chunk][m0_tail_uncovered]",
-                        f"chunk_idx={int(job.playback_chunk_idx)}",
-                        f"until_t1_ms={int(enqueue_timeline_end_ms)}",
-                        f"rendered_end_ms={int(rendered_after)}",
-                        f"no_progress_rounds={int(no_progress_rounds)}",
-                        flush=True,
-                    )
-                    break
+                # recv_stop set and mouth/claim stalled: try turn-end hold-extend once
+                # (mouth often ends ~1 step short of until → mouth_ready never clears).
+                # Attempt early after stop (avoid ~2s spin); still block if uncoverable.
+                if stop_event.is_set() and no_progress_rounds >= 4:
+                    if (
+                        not tail_hold_attempted
+                        and int(enqueue_timeline_end_ms) > 0
+                        and int(rendered_after) < int(enqueue_timeline_end_ms)
+                    ):
+                        tail_hold_attempted = True
+                        added = _tail_hold_extend_live_mouth(
+                            mouth_ref,
+                            until_t1_ms=int(enqueue_timeline_end_ms),
+                            step_ms=int(job.step_ms),
+                        )
+                        if added > 0:
+                            print(
+                                "[sync][pipeline_chunk][mouth_tail_hold_extend]",
+                                f"chunk_idx={int(job.playback_chunk_idx)}",
+                                f"until_t1_ms={int(enqueue_timeline_end_ms)}",
+                                f"rendered_end_ms={int(rendered_after)}",
+                                f"hold_frames={int(added)}",
+                                flush=True,
+                            )
+                            ev = turn_state.get("mouth_frames_async_event")
+                            if isinstance(ev, asyncio.Event):
+                                ev.set()
+                            no_progress_rounds = 0
+                            continue
+                    if no_progress_rounds >= 40:
+                        enqueue_blocked = True
+                        m0_ms = (time.perf_counter() - t_m0) * 1000.0
+                        print(
+                            "[sync][pipeline_chunk][m0_tail_uncovered]",
+                            f"chunk_idx={int(job.playback_chunk_idx)}",
+                            f"until_t1_ms={int(enqueue_timeline_end_ms)}",
+                            f"rendered_end_ms={int(rendered_after)}",
+                            f"no_progress_rounds={int(no_progress_rounds)}",
+                            flush=True,
+                        )
+                        break
 
                 t_wait0 = time.perf_counter()
                 # Release inflight slot while waiting for mouth so later chunks can
@@ -3210,6 +3278,8 @@ async def _process_pipeline_chunk_task(
             stage_knn_done_ms=float(stage_knn_done_ms),
             stage_m0_done_ms=float(stage_m0_done_ms),
             m0_breakdown=dict(m0_breakdown),
+            push_wait_ms=float(push_wait_ms),
+            t_enqueued=float(time.perf_counter()),
         )
         enqueue_queue.put_nowait(item)
     except asyncio.CancelledError:
@@ -3288,6 +3358,11 @@ async def _pipeline_enqueue_dispatcher_loop(
     async def _enqueue_one(item: _PipelineEnqueueItem) -> None:
         order = _ensure_pipeline_enqueue_order(turn_state)
         t_enqueue0 = time.perf_counter()
+        order_wait_ms = 0.0
+        if float(item.t_enqueued) > 0.0:
+            order_wait_ms = max(
+                0.0, (t_enqueue0 - float(item.t_enqueued)) * 1000.0
+            )
         try:
             if item.effective_playback:
                 # Final guard + late catch-up: M0 coverage must reach until_t1
@@ -3298,6 +3373,7 @@ async def _pipeline_enqueue_dispatcher_loop(
                 if m0_ref is not None and int(item.enqueue_timeline_end_ms) > 0:
                     rendered_end = _m0_pipeline_rendered_end_ms(m0_ref, playback_ref)
                     catch_rounds = 0
+                    tail_hold_tried = False
                     while (
                         int(rendered_end) < int(item.enqueue_timeline_end_ms)
                         and catch_rounds < 8
@@ -3351,6 +3427,29 @@ async def _pipeline_enqueue_dispatcher_loop(
                             item.png_verified = True
                             break
                         if n_catch <= 0:
+                            # Turn-end safety net: same hold-extend as chunk task.
+                            if (
+                                stop_event.is_set()
+                                and not tail_hold_tried
+                                and mouth_ref is not None
+                            ):
+                                tail_hold_tried = True
+                                added = _tail_hold_extend_live_mouth(
+                                    mouth_ref,
+                                    until_t1_ms=int(item.enqueue_timeline_end_ms),
+                                    step_ms=int(item.job.step_ms),
+                                )
+                                if added > 0:
+                                    print(
+                                        "[sync][pipeline_chunk][mouth_tail_hold_extend]",
+                                        f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                                        f"until_t1_ms={int(item.enqueue_timeline_end_ms)}",
+                                        f"rendered_end_ms={int(rendered_end)}",
+                                        f"hold_frames={int(added)}",
+                                        f"via=enqueue_dispatcher",
+                                        flush=True,
+                                    )
+                                    continue
                             # Mouth not ready yet for next cid; stop spinning here.
                             break
 
@@ -3422,6 +3521,8 @@ async def _pipeline_enqueue_dispatcher_loop(
                 m0_last_global=int(item.m0_last_global),
                 turn_state=turn_state,
                 queue_wait_ms=float(queue_wait_ms),
+                push_wait_ms=float(item.push_wait_ms),
+                order_wait_ms=float(order_wait_ms),
                 stage_knn_done_ms=float(item.stage_knn_done_ms),
                 stage_m0_done_ms=float(item.stage_m0_done_ms),
                 m0_breakdown=item.m0_breakdown,
@@ -3479,7 +3580,9 @@ async def _pipeline_enqueue_dispatcher_loop(
                             f"pipeline_seq={seq}",
                             f"chunk_idx={int(got.job.playback_chunk_idx)}",
                             f"expected_seq={int(order['expected_seq'])}",
+                            f"hol_gap={int(seq) - int(order['expected_seq'])}",
                             f"pending_n={len(pending)}",
+                            f"push_wait_ms={float(got.push_wait_ms):.1f}",
                             flush=True,
                         )
 

@@ -8,7 +8,7 @@
 | --- | --- |
 | 起点 commit | `e4c1204`（Phase10 STEP1 stable restore before STEP2 retry） |
 | 起点 tag | `phase10-local-vad-baseline` |
-| マイルストーン tag | `phase2-pass` … `phase14-idle-bg`（`cf8ec05`） / `phase16-pass`（`6fc6507`） |
+| マイルストーン tag | M1: … `phase22-pass`（`a26efcf`） / `phase24-pass`（`2510f1c`）／M3: … `phase21-pass`（`02dd1aa`） / `phase24-pass`（`abf8226`）／M0: `phase24-pass`（`af3dc72`） |
 | 作業ブランチ | `feature/local-vad-restore` |
 | 復元対象（session_loop） | `git checkout e4c1204 -- scripts/live_runtime/run_mic_input_obs_realtime_session_loop.py` |
 | 未 commit 3 ファイル | 解消済み（Phase 0 監査時点で HEAD blob = e4c1204） |
@@ -39,9 +39,30 @@
 | 15 | wait_mouth（mouth×claim）（任意） | `pass` | 2026-07-30（Pass-with-defer。レース revert） |
 | 16 | N スケール計測 A/B（任意） | `pass` | 2026-07-30（Pass-with-defer。N↑効果なし→default N=2） |
 | 17 | mouth×claim 前線切り分け（任意） | `pass` | 2026-07-30（A=M3。本番 Fix なし） |
-| 18 | M3 mouth 前線先行（任意） | `in_progress` | — |
+| 18 | M3 mouth 前線先行（任意） | `pass` | 2026-07-30（Pass-with-defer。主観未達→頭止めへ） |
+| 19 | 到着順 enqueue 頭止め（任意） | `pass` | 2026-07-30（Pass-with-defer。HOL否定・観測のみ） |
+| 20 | Phase18 回帰切り分け／ベース復帰 | `pass` | 2026-07-31（183212型復帰。因果emit Keep） |
+| 21 | M3 VAD buffer/index（任意） | `pass` | 2026-07-31（長尺≥10s 口回復） |
+| 22 | 長尺散発欠落／等速残差（任意） | `pass` | 2026-07-31（Pass-with-defer。hold-extend） |
+| 23 | 中盤REB1／終端停止残差（任意） | `pass` | 2026-08-01（Hold。差分なし・縫い目 defer） |
+| 24 | メモリ／キャッシュ削減（任意） | `pass` | 2026-08-01（Pass-with-defer。RSS頭打ち） |
+| 25 | N 再計測 A/B（削減後）（任意） | `pass` | 2026-08-02（Pass-with-defer。default=N=2 再確認） |
+| 26 | 残差指紋の横断切り分け（任意） | `pass` | 2026-08-02（実装なし。本命=終端＋CATCHUP） |
+| 27 | 終端／ENQUEUE_BLOCKED（任意） | `pass` | 2026-08-03（Pass-with-defer。AB/BLOCK 0） |
+| 28 | 多ターン後半 CATCHUP／VCam（任意） | `in_progress` | — |
 
 状態値: `pending` / `in_progress` / `pass` / `blocked`
+
+### 長尺品質ライン（2026-07-30〜・以降の品質 Phase に適用）
+
+設計切り替え期はログ重視でよかったが、**現状の最大課題は長尺の2文目以降のリップ詰まり**のため、以降は次を採用する。
+
+1. **長尺主観が主 Pass 条件**（Before 比で口の詰まり改善）。改善なし／悪化は **Fail または revert**（ログだけ良いは Pass にしない）
+2. ログは改悪検知・不変条件・切り分け用（AUDIO_BEFORE 実 enqueue 0、enqueue 到着順、SSOT_WAIT、通常 clear 0、方式2、N=2 default 等は必須）
+3. メトリクス改善のみ・主観横ばい／悪化 → Fail／revert。Pass-with-defer は「次手が明確なとき」のみ
+4. 多ターン非回帰は維持条件（長尺のために多ターンを壊さない）
+
+**子セルフゲート（親主観依頼の前に必須）:** 長尺ログ／mouth を時間帯分割（例 0–2s / 2s–end）。各帯の mouth_id nonzero 比率・ユニーク数・変化回数を表で報告。2文目以降帯で口形が実質変化なし／ほぼ全程 0 → **自動 Fail・Hold**（改善報告禁止）。PCM RMS が高いのに vad_active 後半全程 0 → Fail・Hold（改悪候補）。ゲート未達で親に主観依頼しない。
 
 ---
 
@@ -649,20 +670,30 @@
 - **Pass**。切り分け **A（M3）** 確定。本線は M3 mouth 前線先行。
 - 「M1 緩める」はゲート定義の設計論のみ可。口形捨て／mouth_closed 埋めで wait を消すのは禁止。
 - Keep All 可（ヘルパ＋観測ログ）。任意長尺で frontier 再確認は Phase18 で可。
+- tag: `phase17-pass`（commit `93f0820`）付与済み（2026-07-30）。
 - 次: **Phase 18 = M3 mouth 前線先行**。
 
 ---
 
 ## Phase 18: M3 mouth 前線先行（任意）
 
-**前提:** Phase17 Pass。作業ベース = `phase16-pass`（`6fc6507`）＋ Phase17 Keep（ヘルパ／観測）。default **N=2**。N↑本線外。
+**前提:** Phase17 Pass。作業ベース = tag `phase17-pass`（`93f0820`）。default **N=2**。N↑本線外。
 
-**目的:** mouth_streamer／formant 窓／KNN emit が PCM／claim より **2–4 frame（約 80–160ms）先行**できるよう、計測→最小改善する。目標: knn 時点で `claim_gap≤0` 比率↑、中盤 `wait_mouth`↓、長尺中盤口フリーズ改善。
+**目的:** mouth_streamer／formant 窓／KNN emit が PCM／claim より **2–4 frame（約 80–160ms）先行**できるよう、計測→最小改善する。**本物 KNN 口形のまま**前倒し（口形品質を捨てない）。目標: knn 時点で `claim_gap≤0` 比率↑、中盤 `wait_mouth`↓、長尺中盤口フリーズ改善。
 
 **スコープ:**
 - 主対象: M3（mouth_streamer / formant 窓 / KNN emit）。M1 は観測・配線の最小のみ（図A・ゲートの口形要件を捨てない）
 - 主テスト: `--no-fast_inmemory`・N=2。Before: `180454`／Phase16 N2。frontier ログで gap を再確認可
 - 順序: **計測で遅れ箇所を特定 → 最小改善 → Before 比**
+- **本 Phase では頭止め修正・M0 使い方見直し・N 再計測に手を出さない**（結果報告で分岐提案のみ）
+
+**Phase18 の結果で分岐（次 Phase・親が発行。子は実装しない）:**
+1. mouth 前線は改善したが **なお等速 enqueue が崩れる** → 到着順 enqueue 頭止め（先行 chunk 停滞）を計測→最小修正（図Aの順序は維持）
+2. mouth は揃うのに **M0／png_wait 支配** → M0 側（既存 N=2 プールの使い方含む）
+3. それでも長尺だけ不足 → N は **再計測オプション**（default は安易に上げない。Phase16 結論を尊重）
+
+**当面やらない（全 Phase 共通の継続禁止）:**
+- ジッタ延長で中盤隠し、付け替え系、口形品質捨て、6コア全振り
 
 **禁止（継続＋本 Phase 強調）:**
 - 初期ジッター延長で中盤 REB を「直した」ことにする（初期ジッタは開始前のみ）
@@ -672,10 +703,402 @@
 - `.cursorrules` §2 時間軸図・誤解禁止に反する説明で Pass しない
 
 **Pass 基準（骨子）:**
-- [ ] knn 時点の mouth vs until/claim_gap が Before 比で改善（claim_gap≤0 比率↑ または 構造的 +80ms の縮小）
-- [ ] 中盤 wait_mouth↓、または主観（中盤口フリーズ）改善。未達なら計測で次手段を提案（Pass-with-defer 可）
-- [ ] 不変条件維持（AUDIO_BEFORE 実 enqueue 0 目安、SSOT_WAIT、通常 clear 0、到着順、方式2、N=2）
-- [ ] 付け替え・ジッタ隠蔽・口形捨てでないこと
+- [x] knn 時点の mouth vs until/claim_gap が Before 比で改善 → **until−mouth_cov 常時0、claim_gap≤0 ~33%、wait_mouth↓**
+- [x] 中盤 wait_mouth↓、または主観改善 → wait↓は達成。**主観中盤口フリーズは未達** → Pass-with-defer
+- [x] 不変条件維持
+- [x] 付け替え・ジッタ隠蔽・口形捨てでないこと
+- [x] 分岐提案 → **1 頭止め**
+
+**子チャット報告（受理 2026-07-30）:**
+- M3: formant 未来半窓待ち（+120ms）が構造遅れの主因。**step 完了で因果 emit**＋窓をバッファへクランプ（本物 KNN。口形捨てなし）。
+- Keep: `mouth_streamer_oc.py` のみ。M3 無関係 dirty（knn timeline）は除外。M1 は selfcheck ヘルパのみ。
+- 主観 `sess_phase10_step2_subj_20260730_183212`: 音声正常・**2–3文目〜末尾口フリーズ**。M3 効果は維持（cov gap=0、wait≈21）。REB=3 がフリーズ開始と一致。until≥12s で **queue_wait p50≈509**、enqueue_order pending 多発 → 口は揃ったのに等速 enqueue 崩れ。
+
+**親判定（2026-07-30）:**
+- **Pass-with-defer**。M3 前線先行は計測 Pass。主観 Fail を正式受理（M3 Keep は維持・主因ではない）。
+- Keep: M3 `mouth_streamer_oc.py` 因果 emit。tag: `phase18-pass`（M3 commit `0bfd8bb`、repo `M3_Live_API_1_united`）付与済み（2026-07-30）。
+- 次本線: **Phase 19 = 到着順 enqueue 頭止め**（計測→最小修正。図Aの順序は維持）。
+- 分岐 2（M0）／3（N再計測）は頭止め否定後まで後回し。
+- ジッタ延長・付け替え・口形捨て・N↑で隠さない。
+
+---
+
+## Phase 19: 到着順 enqueue 頭止め（任意）
+
+**前提:** Phase18 Pass-with-defer。作業ベース = M1 `phase17-pass`（`93f0820`）＋ M3 `phase18-pass`（`0bfd8bb`、因果 emit）。default **N=2**。mouth 前線は揃っている前提。
+
+**目的:** 口が揃った後も中盤で等速 enqueue が崩れる主因として、**到着順 enqueue の頭止め（先行 chunk 停滞で後続完了分が player に届かない）** を計測し、図Aの順序を維持したまま最小修正する。
+
+**スコープ:**
+- 主対象: M1 の到着順 enqueue／dispatcher／先行 chunk 待ち（頭止めの観測と最小緩和）。順序保証（chunk_idx 到着順）は壊さない
+- 主テスト: `--no-fast_inmemory`・N=2。Before: Phase18 主観 `183212`／メトリクス `180805`。M3 Keep は維持・巻き戻さない
+- 順序: **計測で頭止めを確認 → 最小修正 → Before 比（queue_wait／pending／REB／主観）**
+- M0／N↑は本 Phase の主対象外（頭止め否定後に親が分岐）
+
+**禁止（継続）:**
+- ジッタ延長で中盤隠し、付け替え、口形捨て、音声先行 enqueue、clear 隠蔽、短タイムアウト
+- 到着順の破棄（後続を先行 chunk より先に player へ出すこと）
+- 根拠なし N↑、6コア全振り、図A・方式2・SSOT・Phase14 IDLE_BG・Phase18 M3 成果の破壊
+- `PROGRESS.md` 編集（親のみ）
+
+**Pass 基準（骨子）:**
+- [x] 頭止めが Before 比で計測改善、または主因を計測で閉じる → **閉じた（主因ではない）**
+- [ ] 中盤 REB／主観口フリーズ改善 → **未達**（挙動修正は悪化で破棄）
+- [x] enqueue 到着順維持・不変条件 OK
+- [x] ジッタ／口形捨て／付け替えで隠していない
+
+**子チャット報告（受理 2026-07-30）:**
+- `order_wait≈0`／`push_wait≈queue_wait` → dispatcher HOL ではない。late qw の本体は直列 KNN（push_turn）待ち。
+- 挙動修正2案（push-before-acquire／release-around-push）は悪化 → 破棄。Keep = 観測フィールドのみ。
+- その後の長尺主観は改悪方向（1文目からフリーズ／全程閉じ口の例あり）。多ターン≈2文は完走 → VAD常時死にではない。
+
+**親判定（2026-07-30）:**
+- **Pass-with-defer**（分岐1＝HOL 仮説の閉鎖）。Keep = 観測のみ。挙動差分は残さない。
+- **次は分岐2（M0）に進まない。** 先に長尺品質のベース復帰（Phase18 回帰切り分け）。
+- VAD 新 Phase を本線にしない（改悪のマッチポンプ禁止）。VAD 全程0はベース復帰後に再発するときだけ独立対応。
+- 以降の品質 Phase は「長尺品質ライン」＋子セルフゲートを適用。
+
+---
+
+## Phase 20: Phase18 回帰切り分け／ベース復帰
+
+**前提:** Phase19 Pass-with-defer。フルロールバック（Phase0／マルチ前）はしない。作業は **ピンポイント**: Phase18 M3 因果 emit の bisect／revert／副作用最小修正。
+
+**目的:** 長尺主観を **「1文目リップOK・2文目途中フリーズ」**（Phase18 Keep 直後〜`183212` 型）まで復帰させる。1文目からフリーズ／全程閉じ口の改悪を止める。
+
+**スコープ:**
+- 第一候補: M3 `phase18-pass`（`0bfd8bb`）因果 emit の bisect／revert／副作用最小修正
+- M1 Phase19 観測は可。Phase19 挙動修正は再投入禁止
+- 復帰確認: 長尺主観＋子セルフゲート。多ターン非回帰の短確認
+- 復帰後に残る中盤フリーズは次本線（M0／等速）。N↑後回し
+- VAD 全程0は本線化しない（復帰後再発時のみ）
+
+**禁止:**
+- ジッタ延長・付け替え・口形捨て・音声先行・clear 隠蔽・短タイムアウト・N↑・6全振り
+- フルロールバック、VAD 新 Phase としての前進扱い
+- ゲート未達での「改善報告」／親への主観依頼
+- `PROGRESS.md` 編集
+
+**Pass 基準（骨子）— 長尺品質ライン適用:**
+- [x] 長尺主観が「1文目OK・2文目途中フリーズ」まで復帰 → **`134138` で到達**（全程閉じ口改悪ではない）
+- [x] 子セルフゲート通過（6–10s 変化あり。10s 以降の死は残差として次へ）
+- [x] 不変条件維持。多ターン非回帰 OK（`133246`）
+- [x] 復帰手段明記 → **コード変更なし（因果 emit Keep）。Phase18 は改悪主因否定**
+
+**子チャット報告（受理 2026-07-31）:**
+- bisect: 因果 emit ON≈OFF（同一 PCM）→ Phase18 は全程閉じ口改悪の主因ではない。revert 益なし → Keep。
+- 改悪 `223210`/`190747`: 10s まで無音→以降に音声集中＋高 RMS・vad≈0。
+- 主観追記: 多ターン `133246` OK。長尺 `134138` = 183212 型復帰（1文目終わり頃から口フリーズ。last nonzero≈10.2s）。
+- 残差仮説: **`max_buffer_s=10` トリム後も EnergyVAD が絶対 step でスライス → 以降 vad_active=0 固定**（多ターンは短いので出ない）。
+
+**親判定（2026-07-31）:**
+- **Pass**（復帰目標達成）。Phase18 因果 emit **Keep 維持**（revert しない）。
+- 次本線: **Phase 21 = M3 VAD buffer/index 最小修正**（マッチポンプの「VAD新Phase化」ではない。復帰確認後の残差本丸）。
+- M0／N↑は後回し。ジッタ延長で隠さない。
+
+---
+
+## Phase 21: M3 VAD buffer/index（任意）
+
+**前提:** Phase20 Pass。作業ベース = M1 現行＋ M3 `phase18-pass`（因果 emit Keep）。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** `max_buffer_s=10` トリムと EnergyVAD の絶対 step スライスが噛み合い、**音声があるのに vad_active=0 → 閉じ口**になる問題を最小修正する。長尺で 10s 以降／2文目以降の口フリーズを Before（`134138`／`183212`）比で改善する。
+
+**スコープ:**
+- 主対象: M3（VAD バッファ／index／トリム後の step 整合）。M1 は観測・配線の最小のみ
+- 主テスト: 長尺 N=2・`--no-fast_inmemory`。多ターン短確認（非回帰）
+- Before: `logs/sess_phase10_step2_subj_20260731_134138`（復帰後残差）／`183212`
+- 順序: 仮説確認（トリム後 index）→ 最小修正 → セルフゲート → 長尺主観
+
+**禁止:**
+- ジッタ延長・付け替え・口形捨て・音声先行・clear 隠蔽・短タイムアウト・N↑・6全振り
+- 図A・方式2・SSOT・Phase18 因果 emit の無断破壊
+- ゲート未達での改善報告／親主観依頼
+- `PROGRESS.md` 編集
+- 「VAD新Phase」として Phase20 改悪をすり替える説明（本 Phase は復帰後残差の本丸）
+
+**Pass 基準（骨子）— 長尺品質ライン:**
+- [x] 長尺主観で 2文目以降／10s 以降の口フリーズが Before 比で改善 → **大幅改善**（`145030`）
+- [x] セルフゲート: 高 RMS 帯で vad/mouth 回復（10–20s nz 2.4%→98%）
+- [x] 多ターン非回帰（`145500`）。不変条件維持
+- [x] トリム後も相対 index で VAD 追従する説明と一致
+
+**子チャット報告（受理 2026-07-31）:**
+- 仮説再現→ VAD スライスをトリム後バッファ相対 index に修正（emit 側と同型）。
+- After `144410`／主観 `145030`: ≥10s 口死は閉鎖。5–6文目まで基本維持。散発欠落は残差。
+- Phase18 因果 emit Keep。M1 本番差分なし。knn dirty 除外。
+
+**親判定（2026-07-31）:**
+- **Pass**（長尺品質ライン主条件達成）。Keep = M3 `mouth_streamer_oc.py` の VAD 相対 index のみ。
+- tag: `phase21-pass`（M3 commit `02dd1aa`）付与済み（2026-07-31）。
+- 残件 defer: 長尺散発 PNG 欠落／多ターン末の軽い切れ → **Phase22（任意）**。M0／N↑はなお後回し可。
+- メモリは未評価のまま並行観測可（本線差し替えなし）。
+
+---
+
+## Phase 22: 長尺散発欠落／等速残差（任意）
+
+**前提:** Phase21 Pass。M3 VAD 崖は閉鎖。作業ベース = M3 `phase21-pass`（`02dd1aa`）＋因果 emit Keep。M1 は現行（Phase19 観測のみ可）。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** VAD 口死とは別の残差—長尺の**散発欠落**（ところどころ口／PNG 抜け）、等速 enqueue／REB 残、多ターン末の軽い切れ—を計測で切り分け、最小改善する。主観悪化は Fail・revert。
+
+**スコープ:**
+- Before: Phase21 主観 `logs/sess_phase10_step2_subj_20260731_145030`（大幅改善済み・散発欠落残）／多ターン `145500`
+- 主テスト: 長尺 N=2・`--no-fast_inmemory`。多ターン短確認（非回帰）
+- 切り分け優先: 散発欠落が mouth／M0 png／enqueue／VirtualCam のどこか → 最小修正は該当層のみ
+- 並行観測（本線化しない）: RSS 時系列・可能なら qsize。単調悪化が主因指紋なら親へメモリ Phase 提案のみ
+- M3 VAD／因果 emit は巻き戻さない。N↑は安易に本線化しない（Phase16 結論）
+
+**禁止:**
+- ジッタ延長・付け替え・口形捨て・音声先行 enqueue・clear 隠蔽・短タイムアウト・frame drop 間引き・先制 gc.collect
+- 図A・到着順・方式2・SSOT・Phase14 IDLE_BG・Phase18/21 M3 成果の破壊
+- ゲート未達での改善報告／親主観依頼
+- `PROGRESS.md` 編集
+
+**Pass 基準（骨子）— 長尺品質ライン:**
+- [x] 長尺主観で散発欠落／途切れが Before（`145030`）比で改善 → **大幅改善**（局在化した残差のみ）
+- [x] セルフゲート通過（VAD 崖再発なし）
+- [x] 多ターン非回帰。不変条件維持
+- [x] 切り分けと修正層一致 → 等速崩れ（claim 120ms vs until ~40ms → wait_mouth）に step1 最小修正
+
+**子チャット報告（受理 2026-07-31）:**
+- mouth/VAD 穴・中盤 png_verified 多発は否定。主因＝ claim 窓が playback until を跨ぐ wait_mouth スパイク→pending 枯渇 REB。
+- step1: until クランプ mouth ゲート＋render 専用 hold-extend（last mouth_id、`mouth_closed` ではない）。
+- 主観 `230158`: 最後まで音声＋リップ基本維持。2文目途中一瞬フリーズ＋終端間際停止。REB 5→2、wait_mouth≈0。
+- 多ターン `230719` 非回帰。RSS 単調悪化の主因指紋なし。M3 未変更。session_loop 観測 dirty は Keep 外。
+
+**親判定（2026-07-31）:**
+- **Pass-with-defer**。散発「ところどころ」型から局在残差へ。Keep = M1 step1 のみ（hold-extend 承認）。
+- tag: `phase22-pass`（M1 commit `a26efcf`、step1 のみ）付与済み（2026-07-31）。session_loop・M3 未含。
+- M3 Phase18/21 Keep。Phase19 session_loop 観測は Keep に含めない。
+- 残件 → **Phase23（任意）**: 中盤 REB1回＋終端停止。ジッタ延長で隠さない。
+
+---
+
+## Phase 23: 中盤 REB1／終端停止残差（任意）
+
+**前提:** Phase22 Pass-with-defer。作業ベース = M1 `phase22-pass`（`a26efcf`、step1 hold-extend）＋ M3 `phase21-pass`（`02dd1aa`）。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** Phase22 後に局在した残差—(1) 長尺中盤の一瞬フリーズ（REB 1回級）(2) 終端間際の音声・リップ停止—を計測で切り分け、最小改善する。主観悪化は Fail・revert。
+
+**スコープ:**
+- Before: Phase22 主観 `logs/sess_phase10_step2_subj_20260731_230158`（REB@~2.5s/~9.9s＋終端≈18.9s）／多ターン `230719`
+- 主テスト: 長尺 N=2・`--no-fast_inmemory`。多ターン短確認（非回帰）
+- 切り分け: 中盤 REB と終端停止は同一原因か別か。層は mouth／M0／enqueue／player／tail のいずれか1つに絞る
+- Phase22 hold-extend は維持が原則。副作用（sticky）が主因なら縮小は可（口形捨て・closed 埋めは禁止）
+- M3 VAD／因果 emit・到着順・N↑安易本線化は禁止。RSS 並行観測可（本線差し替えなし）
+
+**禁止:**
+- ジッタ延長・付け替え・口形捨て・音声先行 enqueue・clear 隠蔽・短タイムアウト・frame drop・先制 gc.collect
+- 図A・方式2・SSOT・Phase18/21/22 成果の無断破壊
+- ゲート未達での改善報告／親主観依頼
+- `PROGRESS.md` 編集
+
+**Pass 基準（骨子）— 長尺品質ライン:**
+- [ ] 長尺主観で中盤一瞬フリーズおよび／または終端停止が Before（`230158`）比で改善 → **未達（改善候補なし）**
+- [x] 切り分け実施 → 中盤と終端は別因。縫い目試行はトレードオフで不採用
+- [x] 本番差分なし（`phase22-pass` 復帰）。悪化を残していない
+
+**子チャット報告（受理 2026-08-01）:**
+- 中盤 REB@~2.5s＝idle 浅バッファ、@~9.9s＝idle→real 縫い目（STOP_ON_REAL_AUDIO）。終端＝push_wait／tail（別件）。
+- 縫い目修正2案は改悪または REB残＋AUDIO_BEFORE → 破棄。hold-extend 未縮小。M3 未変更。
+- 主観依頼なし。多ターン未実施。
+
+**親判定（2026-08-01）:**
+- **Hold**（Keep All 不可・本番差分なし）。縫い目の「許容定義決め」は今はやらない（仕上げ論点・低優先）。
+- 終端／縫い目／idle 浅バッファは既知メモとして defer。
+- Phase21/22 Keep（M3 VAD・step1 hold-extend）維持。
+- 次本線: **Phase 24 = メモリ／キャッシュ削減**（運用耐久・長尺化備え。残 REB1 の特効薬扱いしない）。その後 N=2/3/4 再計測（default 据え置き）。
+
+---
+
+## Phase 24: メモリ／キャッシュ削減（任意）
+
+**前提:** Phase23 Hold。作業ベース = M1 `phase22-pass`（`a26efcf`）＋ M3 `phase21-pass`（`02dd1aa`）。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** 数十分配信／長尺化に備えた **運用耐久**のため、メモリ／キャッシュを計測→削減する。Phase22 時点で RSS 単調悪化が主因指紋ではなかったため、**中盤 REB1 の特効薬扱いをしない**。品質非回帰が必須。
+
+**スコープ:**
+- 計測ファースト: 長尺（および可能なら耐久）で親／M0 Worker の RSS 時系列、可能なら主要 Queue qsize、既存 wait/lock/png/queue/push/order_wait
+- 削減候補（計測で優先度決定）: M0 スプライト／フレームキャッシュ、ターン境界 flush、不要な保持・コピー、履歴肥大など
+- 主テスト: 長尺 N=2・`--no-fast_inmemory`＋品質セルフゲート。可能なら多ターン連続または長時間耐久
+- Before 品質: `230158`／Phase22 水準を非回帰基準とする
+- その後（別 Phase）: N=2/3/4 再計測（default 据え置き）。本 Phase では N↑しない
+
+**禁止:**
+- frame drop／deque 間引き、先制 gc.collect を改善手段にする
+- ジッタ延長・付け替え・口形捨て・音声先行 enqueue・clear 隠蔽・短タイムアウト
+- 図A・方式2・SSOT・Phase18/21/22 Keep の破壊
+- 根拠なし N↑、6コア全振り
+- ゲート未達での「品質改善」主張、`PROGRESS.md` 編集
+
+**Pass 基準（骨子）:**
+- [x] 長尺 RSS 時系列（削減前後）→ 親 **頭打ち**（+8–9MB 級）。M0 は有界プラトー
+- [x] 長尺品質非回帰（`165233` 正常。ゲート OK）
+- [x] 耐久: 12t A/B で親頭打ち・品質ほぼ同帯（明確な Phase24 回帰なし）。28t 悪化は今回再現せず→ばらつき／尺要因メモ
+- [x] 不変条件維持。残 REB／縫い目／終端は主 Pass にしていない
+
+**子チャット報告（受理 2026-08-01）:**
+- 最大項: MouthStreamer 全履歴 flush→disk 再読込。削減: M3 compact flush／M1 in-mem KNN＋flush 間引き＋finalize／M0 turn reset 実 flush。
+- 主観最終: 長尺 `165233` OK。12t A vs B2 ほぼ同帯（回帰なし）。残るターン末フリーズ／CATCHUP は baseline にもあり次線。
+- 旧B `214408` は stash 未復帰走行→归因無効・破棄。
+
+**親判定（2026-08-01）:**
+- **Pass-with-defer**。メモリ目的達成寄り。Keep All 可（**M1 + M3 + M0** の Phase24 削減のみ）。
+- tag `phase24-pass` 付与済み: M1 `2510f1c` / M3 `abf8226` / M0 `af3dc72`（2026-08-01）。push 未実施。
+- 孤児 `m0_persistent_worker` のホスト掃除は **運用として可**（品質 Fix 手段にしない。先制 gc.collect 禁止は維持）。
+- 次: **Phase25 = 削減後 N=2/3/4 再計測**（default 据え置き・親承認後発行）。縫い目／終端はなお defer。
+
+---
+
+## Phase 25: N 再計測 A/B（削減後）（任意）
+
+**前提:** Phase24 Pass-with-defer。作業ベース = M1/M3/M0 各 `phase24-pass`（`2510f1c` / `abf8226` / `af3dc72`）＋品質 Keep（hold-extend／VAD／因果 emit）。**default N=2 据え置き**（計測完了まで変更禁止）。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** メモリ削減後ベースで **N=2（基準）→ N=3 → N=4** を同一条件再計測し、RSS／品質／供給指標を更新したうえで、default 変更の Go/No-Go を親に提案する。Phase16（N↑だけでは中盤を解かない）を尊重しつつ、削減後の前提を更新する。**本 Phase は計測が主。無断で default を変えない。**
+
+**スコープ:**
+- 同一長尺台本・`--no-fast_inmemory` で N=2/3/4（各1本以上。可能なら主観も）
+- 見る指標: 中盤〜後半の主観口、REB、供給リード、wait_mouth/lock/png/m0、queue/push/order_wait、**RSS（親＋M0 Worker、子プロセス込み）**
+- Before 参照: Phase16（N↑効果なし）／Phase24 品質（`165233`・12t B2）
+- CLI 上限 1..4 既存のまま。6コア全振り禁止
+- 縫い目／終端／残 REB1 は観測メモ可。本 Phase の「N で直す」対象にしない
+- 本番の挙動「改善」実装は原則不要（計測ヘルパのみ可）
+
+**禁止:**
+- **計測完了前に default N を変えること**
+- ジッタ延長・付け替え・口形捨て・音声先行・clear 隠蔽・短タイムアウト・frame drop・先制 gc
+- 図A・方式2・SSOT・Phase21/22/24 Keep の破壊
+- N>4／6コア全振り、`PROGRESS.md` 編集
+- ゲート未達での「N↑で改善」主張
+
+**Pass 基準（骨子）:**
+- [x] N=2/3/4 の同一条件比較表（長尺＋多ターン主観）
+- [x] default 据え置き。親へ Go/No-Go → **No-Go（default=N=2 維持）**
+- [x] 不変条件維持。Phase24 RSS 頭打ちは N↑で破綻しないが線形増
+- [x] 無理な Hotfix なし（計測ヘルパのみ）
+
+**子チャット報告（受理 2026-08-02）:**
+- 長尺≈20s: REB・mid wait/lock/m0 は N 横ばい。RSS 線形（302→355→417）。ゲートは全通過だが N↑優位なし。
+- 多ターン8t主観: N=2 やや悪化感（1回）、N=3 主観微差「少し良い」だが REB は非改善、N=4 は REB 明確悪化。
+- Phase16 結論を削減後でも再確認: N↑で中盤/後半口問題は閉じない。品質改善は Phase18/21/22 Keep 側。
+
+**親判定（2026-08-02）:**
+- **Pass-with-defer**。計測＋主観で閉鎖。
+- **default = N=2 維持（No-Go）**。N=3 非推奨。N=4 は CLI 上限のみ。
+- **N=2 vs N=3 微差の再テストは不要**（親希望なし）。
+- Keep All 可（計測ヘルパのみ。本番／default 未変更）。tag `phase25-pass` は任意・必須ではない。
+- 基本線は一通り閉鎖（VAD／口前線／hold-extend／メモリ／N=2 再確認）。
+- 次: **Phase26 = 残差指紋の横断切り分けのみ（実装なし）** → 最多指紋へ最小修正（見込み順: 終端 → 多ターン後半 ※同型なら合流 → 縫い目は最後）。縫い目許容定義 Phase は作らない。N↑・ジッタ延長・frame drop は再開しない。
+
+---
+
+## Phase 26: 残差指紋の横断切り分け（任意・分析のみ）
+
+**前提:** Phase25 Pass-with-defer。作業ベース = 各 `phase24-pass`（品質 Keep: VAD／因果 emit／hold-extend）。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** ターン後半の散発フリーズ／画像欠落（ばらつきあり）について、既知残差ラベルを横断して **指紋を切り分けるだけ**。実装・「改善」Fix はしない。
+
+**切り分け対象（例）:**
+- idle→real 縫い目（STOP_ON_REAL_AUDIO 等）
+- 中盤 REB（数件級）
+- 終端停止／末尾 ENQUEUE_BLOCKED・push_wait
+- 多ターン後半フリーズ／SSOT_CATCHUP スパイク
+- その他（口 nz 落ち・png 欠・queue/push 等）
+
+**スコープ:**
+- 既存ログ＋必要なら N=2・`--no-fast_inmemory` の長尺／多ターン再計測（観測のみ）
+- 出力: 症状×指紋×層の表、最多指紋、次最小修正の優先順提案（親承認待ち）
+- **実装なし。** 本番差分を残さない
+
+**修正見込み順（親確定・実装は次 Phase）:**
+1. 終端
+2. 多ターン後半（終端と同型なら合流）
+3. 縫い目は最後（許容定義専用 Phase は作らない）
+
+**禁止:**
+- 実装 Fix、N↑、ジッタ延長、frame drop、付け替え、口形捨て、音声先行 enqueue
+- 縫い目「許容定義」Phase の新設・本線化
+- `PROGRESS.md` 編集、ゲート未達での改善主張
+
+**Pass 基準（骨子）:**
+- [x] 残差ラベル横断の指紋表（長尺10＋多ターン10）
+- [x] 最多指紋と層を根拠付きで特定
+- [x] 次最小修正の優先順を親承認待ちで提案（実装しない）
+- [x] 本番差分なし（観測ヘルパのみ）
+
+**子チャット報告（受理 2026-08-02）:**
+- セッションヒット最多は縫い目だが、現残差の重症度本命は **終端 BLOCKED/AUDIO_BEFORE** ＋ **多ターン後半 CATCHUP（virtualcam）**。
+- BLOCKED ≡ AUDIO_BEFORE（同数）。hang_used=0。長尺 keep は終端 push スパイク減衰・CATCHUP=0。
+- 多ターン後半: BLOCKED は終端と同型で合流可。CATCHUP は別層。
+
+**親判定（2026-08-02）:**
+- **Pass**。Keep＝観測ヘルパのみ可。
+- 多ターン後半は **2チケット分離**: **Phase27=終端/BLOCKED → Phase28=CATCHUP/virtualcam**（1 Phase 混在禁止）。
+- `push_wait`／`order_wait` 分解ログは **Phase27 の観測として最小復元可**（別 Phase 不要）。
+- 縫い目許容定義 Phase は作らない。縫い目 Fix は最後。N↑・ジッタ・frame drop 再開しない。
+
+---
+
+## Phase 27: 終端／ENQUEUE_BLOCKED（任意）
+
+**前提:** Phase26 Pass。作業ベース = 各 `phase24-pass`＋品質 Keep。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** `FP_TAIL_PUSH_BLOCK`（ターン末 `ENQUEUE_BLOCKED` / `AUDIO_BEFORE_M0` ガード経路）を計測→最小修正し、長尺間欠および多ターン末の途切れ／ガード発火を Before 比で改善する。**CATCHUP／virtualcam は触らない**（Phase28）。
+
+**スコープ:**
+- 主対象: enqueue／tail 層。必要なら `push_wait`／`order_wait` 観測の最小復元
+- Before: 多ターン `140224`（AB/BLOCK=5）／長尺 keep `165233`（BLOCK=0 のこともある＝間欠）
+- 主テスト: N=2・`--no-fast_inmemory`。長尺＋多ターン短確認
+- Phase28（CATCHUP）と混在させない
+
+**禁止:**
+- virtualcam CATCHUP「直し」を本 Phase に混ぜる
+- ジッタ延長・付け替え・口形捨て・音声先行 enqueue・clear 隠蔽・短タイムアウト・frame drop・N↑
+- 縫い目本線化、`PROGRESS.md` 編集、ゲート未達での改善主張
+- Phase18/21/22/24 Keep の破壊
+
+**Pass 基準（骨子）— 長尺品質ライン:**
+- [x] 終端 BLOCKED・AUDIO_BEFORE 発火減 → **multi/long とも 0**（hold-extend 後 enqueue）
+- [x] セルフゲート通過。CATCHUP を本 Phase 成果にしない
+- [x] 多ターン非回帰・不変条件維持
+- [x] 主観: 終端途切れ型は改善。前半ターン末の口詰まり残 → Phase28
+
+**子チャット報告（受理 2026-08-03）:**
+- push/order 観測復元＋ターン末 hold-extend（音声先行なし）。AB/BLOCK 5→0。
+- 親主観 `135918`（N=2）: T1–4 末口詰まり残、T5 以降概ね正常。CATCHUP 1028→659（観測のみ）。
+- 終端追加 Hotfix なし。N=4 `134914` は参考のみ。
+
+**親判定（2026-08-03）:**
+- **Pass-with-defer**。Keep All 可（観測復元＋終端 hold-extend）。
+- 次: **Phase28 = CATCHUP／VirtualCam**（`FP_MULTI_LATE_CATCHUP`）。終端と混在させない。
+- 縫い目本線化・N↑・ジッタ・frame drop 再開なし。
+
+---
+
+## Phase 28: 多ターン後半 CATCHUP／VirtualCam（任意）
+
+**前提:** Phase27 Pass-with-defer。作業ベース = Phase27 Keep（終端 hold-extend＋push 観測）＋各 `phase24-pass` 品質 Keep。default **N=2**。長尺品質ライン＋子セルフゲート適用。
+
+**目的:** `FP_MULTI_LATE_CATCHUP`（virtualcam SSOT_CATCHUP 後半スパイク）を計測→最小修正し、多ターン前半〜後半のターン末口詰まり／画像欠落を Before 比で改善する。**終端 BLOCKED 経路・enqueue 追加直しはしない**（Phase27 済み）。
+
+**スコープ:**
+- 主対象: virtualcam／Sync SSOT 表示側（CATCHUP の原因層）
+- Before: 多ターン `logs/sess_phase11_subj_20260803_135918`（Phase27 After・CATCHUP≈659、T1–4 詰まり）／更に旧 `140224`（CATCHUP≈1028）も参照可
+- 主テスト: 多ターン N=2・`--no-fast_inmemory`（本丸）。長尺は非回帰短確認
+- audio_ms 照合を壊さない。sequential frame 消費を復活させない
+
+**禁止:**
+- 終端 hold-extend の巻き戻し／enqueue 音声先行で CATCHUP を隠す
+- ジッタ延長・付け替え・口形捨て・clear 隠蔽・短タイムアウト・frame drop・N↑
+- 縫い目本線化、`PROGRESS.md` 編集、ゲート未達での改善主張
+- Phase18/21/22/24/27 Keep の破壊
+
+**Pass 基準（骨子）— 長尺品質ライン:**
+- [ ] 多ターン主観でターン末口詰まり／画像欠が Before（`135918`）比で改善
+- [ ] CATCHUP スパイクが計測で改善、または主因を計測で閉じる（Pass-with-defer 可）
+- [ ] セルフゲート通過。AB/BLOCK 実 enqueue 0 を回帰させない（Phase27 成果維持）
+- [ ] 長尺非回帰。不変条件維持
 
 **親メモ:** 子は `docs/PROGRESS.md` を編集しない。
 
@@ -736,4 +1159,32 @@
 | 2026-07-30 | Phase17=mouth×claim 前線切り分け定義・子プロンプト発行（分析優先・Fixは親承認後） |
 | 2026-07-30 | `.cursorrules` §2: 時間軸図・直列補給負け誤解禁止・中盤第一疑いを復元追記 |
 | 2026-07-30 | Phase17 Pass。切り分け A=M3。Keep=ヘルパ＋観測。本線=M3 前線先行 |
+| 2026-07-30 | `phase17-pass` tag（`93f0820`）付与確認 |
 | 2026-07-30 | Phase18=M3 mouth 前線先行定義・子プロンプト発行 |
+| 2026-07-30 | Phase18以降の分岐順を SSOT 反映（頭止め→M0→N再計測オプション。当面ジッタ/付け替え/口形捨て/6全振り禁止） |
+| 2026-07-30 | Phase18 Pass-with-defer。M3因果emit計測Pass・主観未達。Keep=M3。次=頭止め（Phase19） |
+| 2026-07-30 | M3 `phase18-pass` tag（`0bfd8bb`）付与確認 |
+| 2026-07-30 | Phase19=到着順 enqueue 頭止め定義・子プロンプト発行 |
+| 2026-07-30 | Phase19 Pass-with-defer。HOL否定（order_wait≈0）。Keep=観測のみ。挙動修正破棄 |
+| 2026-07-30 | 長尺品質ライン導入（主観主Pass・子セルフゲート）。次=Phase20 Phase18回帰／ベース復帰（VAD本線化禁止） |
+| 2026-07-30 | Phase20定義・子プロンプト発行 |
+| 2026-07-31 | Phase20 Pass。183212型復帰。因果emit Keep（改悪主因否定）。次=M3 VAD buffer/index |
+| 2026-07-31 | Phase21定義・子プロンプト発行（長尺品質ライン＋セルフゲート適用） |
+| 2026-07-31 | Phase21 Pass。VAD相対indexで≥10s口回復。Keep=M3 mouth_streamer。残=散発欠落→Phase22任意 |
+| 2026-07-31 | M3 `phase21-pass` tag（`02dd1aa`）付与確認 |
+| 2026-07-31 | メモリは未評価・Phase21と並行観測可（本線差し替えなし）とメモ |
+| 2026-07-31 | Phase22=長尺散発欠落／等速残差 本定義・子プロンプト発行 |
+| 2026-07-31 | Phase22 Pass-with-defer。step1 hold-extend Keep。残=中盤REB1＋終端停止→Phase23任意 |
+| 2026-07-31 | M1 `phase22-pass` tag（`a26efcf`、step1のみ）付与確認 |
+| 2026-08-01 | Phase23=中盤REB1／終端停止 本定義・子プロンプト発行 |
+| 2026-08-01 | Phase23 Hold。縫い目／終端 defer。次=Phase24 メモリ／キャッシュ削減→その後N再計測 |
+| 2026-08-01 | Phase24定義・子プロンプト発行 |
+| 2026-08-01 | Phase24 Pass-with-defer。親RSS頭打ち・品質非回帰。Keep=M1+M3+M0。次=N再計測（Phase25） |
+| 2026-08-01 | `phase24-pass` tag 付与確認: M1 `2510f1c` / M3 `abf8226` / M0 `af3dc72`（push未） |
+| 2026-08-01 | Phase25=削減後 N=2/3/4 再計測 本定義・子プロンプト発行（default据え置き） |
+| 2026-08-02 | Phase25 Pass-with-defer。削減後も N↑効果なし。default=N=2 再確認。N2/N3微差再テスト不要 |
+| 2026-08-02 | 基本線閉鎖メモ。Phase26=残差指紋横断切り分け（実装なし）定義・子プロンプト発行 |
+| 2026-08-02 | Phase26 Pass。本命=終端BLOCKED＋多ターンCATCHUP。2チケット分離→P27/P28 |
+| 2026-08-02 | Phase27=終端/ENQUEUE_BLOCKED 定義・子プロンプト発行（push観測復元可・CATCHUP混ぜない） |
+| 2026-08-03 | Phase27 Pass-with-defer。AB/BLOCK 0・終端途切れ改善。残=T1–4口詰まり→Phase28 CATCHUP |
+| 2026-08-03 | Phase28=CATCHUP/VirtualCam 定義・子プロンプト発行 |
