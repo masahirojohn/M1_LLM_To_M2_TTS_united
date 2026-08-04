@@ -2550,6 +2550,80 @@ def _tail_hold_extend_live_mouth(
     return int(added)
 
 
+def _tail_hold_gate_ready(
+    turn_state: dict[str, Any],
+    stop_event: asyncio.Event,
+    no_progress_rounds: int,
+) -> bool:
+    """Phase30: allow turn-end hold-extend as soon as generation_complete is seen.
+
+    Before: gate required recv_stop (turn teardown), so last chunks spun ~1–2s on
+    wait_mouth while player depleted → turn-end REB / lip freeze. generation_complete
+    is input-end only (no clear_queue); using it here only unlocks mouth hold-extend.
+    """
+    gen_done = bool(turn_state.get("generation_complete_seen"))
+    if not gen_done and not stop_event.is_set():
+        return False
+    # After input end, one no-progress round (~50ms) is enough; recv_stop path keeps 4.
+    need = 1 if gen_done else 4
+    return int(no_progress_rounds) >= int(need)
+
+
+def _mouth_shortfall_frames(
+    mouth_obj_ref: dict[str, Any] | None,
+    *,
+    until_t1_ms: int,
+    step_ms: int,
+) -> int:
+    """How many step frames mouth last is short of until (0 if caught up / unknown)."""
+    if mouth_obj_ref is None or int(until_t1_ms) <= 0:
+        return 0
+    obj = mouth_obj_ref.get("obj")
+    if not isinstance(obj, dict):
+        return 0
+    frames = obj.get("frames")
+    if not isinstance(frames, list) or not frames:
+        return 0
+    step = max(1, int(step_ms) or 40)
+    last_t = int(frames[-1].get("t_ms", 0) or 0)
+    # mouth_ready needs last_t + step >= until; shortfall in frames beyond that.
+    need_t = int(until_t1_ms)
+    cov = int(last_t) + int(step)
+    if cov >= need_t:
+        return 0
+    return max(0, (int(need_t) - int(cov) + int(step) - 1) // int(step))
+
+
+# Phase30: gen_complete may unlock hold while streamer still far behind; only auto-hold
+# tiny shortfalls (Before post_gen was always 1 frame). Larger gaps wait for mouth/stop.
+_TAIL_HOLD_GEN_COMPLETE_MAX_SHORTFALL_FRAMES = 3
+
+
+def _try_tail_hold_extend(
+    mouth_obj_ref: dict[str, Any] | None,
+    *,
+    until_t1_ms: int,
+    step_ms: int,
+    turn_state: dict[str, Any],
+    stop_event: asyncio.Event,
+) -> int:
+    """Apply live tail hold-extend with Phase30 gen_complete shortfall guard."""
+    gen_done = bool(turn_state.get("generation_complete_seen"))
+    if gen_done and not stop_event.is_set():
+        shortfall = _mouth_shortfall_frames(
+            mouth_obj_ref,
+            until_t1_ms=int(until_t1_ms),
+            step_ms=int(step_ms),
+        )
+        if int(shortfall) > int(_TAIL_HOLD_GEN_COMPLETE_MAX_SHORTFALL_FRAMES):
+            return 0
+    return _tail_hold_extend_live_mouth(
+        mouth_obj_ref,
+        until_t1_ms=int(until_t1_ms),
+        step_ms=int(step_ms),
+    )
+
+
 def _pipeline_inflight_inc(turn_state: dict[str, Any]) -> int:
     n = int(turn_state.get("pipeline_inflight", 0)) + 1
     turn_state["pipeline_inflight"] = n
@@ -3162,28 +3236,31 @@ async def _process_pipeline_chunk_task(
                     )
                     break
 
-                # recv_stop set and mouth/claim stalled: try turn-end hold-extend once
-                # (mouth often ends ~1 step short of until → mouth_ready never clears).
-                # Attempt early after stop (avoid ~2s spin); still block if uncoverable.
-                if stop_event.is_set() and no_progress_rounds >= 4:
+                # Turn-end mouth/claim stall: hold-extend once (mouth often ends ~1
+                # step short of until → mouth_ready never clears). Phase30: also gate
+                # on generation_complete_seen so we do not wait for recv_stop teardown.
+                if _tail_hold_gate_ready(turn_state, stop_event, no_progress_rounds):
                     if (
                         not tail_hold_attempted
                         and int(enqueue_timeline_end_ms) > 0
                         and int(rendered_after) < int(enqueue_timeline_end_ms)
                     ):
-                        tail_hold_attempted = True
-                        added = _tail_hold_extend_live_mouth(
+                        added = _try_tail_hold_extend(
                             mouth_ref,
                             until_t1_ms=int(enqueue_timeline_end_ms),
                             step_ms=int(job.step_ms),
+                            turn_state=turn_state,
+                            stop_event=stop_event,
                         )
                         if added > 0:
+                            tail_hold_attempted = True
                             print(
                                 "[sync][pipeline_chunk][mouth_tail_hold_extend]",
                                 f"chunk_idx={int(job.playback_chunk_idx)}",
                                 f"until_t1_ms={int(enqueue_timeline_end_ms)}",
                                 f"rendered_end_ms={int(rendered_after)}",
                                 f"hold_frames={int(added)}",
+                                f"via={'gen_complete' if turn_state.get('generation_complete_seen') else 'recv_stop'}",
                                 flush=True,
                             )
                             ev = turn_state.get("mouth_frames_async_event")
@@ -3191,6 +3268,9 @@ async def _process_pipeline_chunk_task(
                                 ev.set()
                             no_progress_rounds = 0
                             continue
+                        if stop_event.is_set():
+                            # stop path already allows unbounded hold; do not retry.
+                            tail_hold_attempted = True
                     if no_progress_rounds >= 40:
                         enqueue_blocked = True
                         m0_ms = (time.perf_counter() - t_m0) * 1000.0
@@ -3433,18 +3513,26 @@ async def _pipeline_enqueue_dispatcher_loop(
                             break
                         if n_catch <= 0:
                             # Turn-end safety net: same hold-extend as chunk task.
+                            # Phase30: generation_complete_seen unlocks without recv_stop.
                             if (
-                                stop_event.is_set()
+                                (
+                                    stop_event.is_set()
+                                    or bool(
+                                        turn_state.get("generation_complete_seen")
+                                    )
+                                )
                                 and not tail_hold_tried
                                 and mouth_ref is not None
                             ):
-                                tail_hold_tried = True
-                                added = _tail_hold_extend_live_mouth(
+                                added = _try_tail_hold_extend(
                                     mouth_ref,
                                     until_t1_ms=int(item.enqueue_timeline_end_ms),
                                     step_ms=int(item.job.step_ms),
+                                    turn_state=turn_state,
+                                    stop_event=stop_event,
                                 )
                                 if added > 0:
+                                    tail_hold_tried = True
                                     print(
                                         "[sync][pipeline_chunk][mouth_tail_hold_extend]",
                                         f"chunk_idx={int(item.job.playback_chunk_idx)}",
@@ -3452,9 +3540,12 @@ async def _pipeline_enqueue_dispatcher_loop(
                                         f"rendered_end_ms={int(rendered_end)}",
                                         f"hold_frames={int(added)}",
                                         f"via=enqueue_dispatcher",
+                                        f"gen_complete={1 if turn_state.get('generation_complete_seen') else 0}",
                                         flush=True,
                                     )
                                     continue
+                                if stop_event.is_set():
+                                    tail_hold_tried = True
                             # Mouth not ready yet for next cid; stop spinning here.
                             break
 
@@ -3978,11 +4069,18 @@ async def _receive_loop(
                             if bool(
                                 getattr(server_content, "generation_complete", False)
                             ):
+                                # Phase30: unlock turn-end mouth hold-extend early.
+                                # Still marker_only for player/clear (Phase 4).
+                                turn_state["generation_complete_seen"] = True
+                                ev_gc = turn_state.get("mouth_frames_async_event")
+                                if isinstance(ev_gc, asyncio.Event):
+                                    ev_gc.set()
                                 print(
                                     "[session_loop][generation_complete]",
                                     "marker_only",
                                     "no_clear_queue",
                                     f"active_turn={turn_state.get('active_turn')}",
+                                    "tail_hold_gate=1",
                                     flush=True,
                                 )
                             model_turn = getattr(server_content, "model_turn", None)
@@ -5763,6 +5861,7 @@ async def _run(args: argparse.Namespace) -> int:
             turn_state["live_emo_events"] = []
             turn_state["transcription_accum"] = ""
             turn_state["debug_receive_raw_count"] = 0
+            turn_state["generation_complete_seen"] = False
             turn_state["audio_player_proc"] = audio_player_proc
             turn_state["ai_audio_output_device"] = str(args.ai_audio_output_device)
             turn_state["audio_playback_state_ref"] = _make_audio_playback_state_ref()
