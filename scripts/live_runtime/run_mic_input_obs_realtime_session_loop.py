@@ -834,10 +834,18 @@ async def _send_mic_once(
         if not activity_started or not send_activity_signals:
             return
         await session.send_realtime_input(activity_end=types.ActivityEnd())
+        _ae_perf_ms = time.perf_counter() * 1000.0
         print(
             "[mic_vad][ACTIVITY_END]",
             f"reason={reason}",
             f"elapsed_s={time.perf_counter() - t0:.3f}",
+            flush=True,
+        )
+        # Phase R1: response-timing SSOT (same clock as speech_end / first_audio)
+        print(
+            "[resp_timing] activity_end",
+            f"perf_ms={_ae_perf_ms:.3f}",
+            f"reason={reason}",
             flush=True,
         )
 
@@ -927,6 +935,13 @@ async def _send_mic_once(
                             silence_blocks = 0
                         else:
                             silence_blocks += 1
+                            if silence_blocks == 1:
+                                # Phase R1: speech_end = silence accumulation start
+                                print(
+                                    "[resp_timing] speech_end",
+                                    f"perf_ms={time.perf_counter() * 1000.0:.3f}",
+                                    flush=True,
+                                )
                             if mic_vad_debug and (
                                 silence_blocks == 1
                                 or silence_blocks % 5 == 0
@@ -4237,6 +4252,13 @@ async def _receive_loop(
                             print(
                                 f"[perf][turn{active_turn}_first_response_audio_chunk_sec] "
                                 f"{first_audio:.3f}",
+                                flush=True,
+                            )
+                            # Phase R1: response-timing SSOT (same clock as speech_end / activity_end)
+                            print(
+                                "[resp_timing] first_audio",
+                                f"perf_ms={now * 1000.0:.3f}",
+                                f"turn={active_turn}",
                                 flush=True,
                             )
 
