@@ -725,7 +725,8 @@ async def _send_mic_once(
     mic_vad_rms_threshold: float = 0.015,
     mic_vad_end_rms_threshold: float | None = None,
     mic_vad_min_voice_ms: int = 200,
-    mic_vad_silence_ms: int = 700,
+    mic_vad_silence_ms: int = 350,
+    mic_vad_silence_ms_ref: dict[str, int] | None = None,
     mic_vad_min_listen_ms: int = 800,
     mic_vad_debug: bool = False,
     send_activity_signals: bool = True,
@@ -754,14 +755,26 @@ async def _send_mic_once(
         1,
         int(round(float(mic_vad_min_voice_ms) / actual_chunk_ms)),
     )
-    silence_blocks_limit = max(
-        1,
-        int(round(float(mic_vad_silence_ms) / actual_chunk_ms)),
-    )
     min_listen_blocks = max(
         1,
         int(round(float(mic_vad_min_listen_ms) / actual_chunk_ms)),
     )
+
+    def _silence_ms_now() -> int:
+        if mic_vad_silence_ms_ref is not None:
+            try:
+                return int(mic_vad_silence_ms_ref["value"])
+            except Exception:
+                pass
+        return int(mic_vad_silence_ms)
+
+    def _silence_blocks_limit_now() -> int:
+        return max(
+            1,
+            int(round(float(_silence_ms_now()) / actual_chunk_ms)),
+        )
+
+    silence_blocks_limit = _silence_blocks_limit_now()
 
     voice_blocks = 0
     silence_blocks = 0
@@ -782,6 +795,7 @@ async def _send_mic_once(
             f"enabled={bool(mic_vad_end_enabled)}",
             f"chunk_ms={actual_chunk_ms:.2f}",
             f"voice_blocks={min_voice_blocks}",
+            f"silence_ms={_silence_ms_now()}",
             f"silence_blocks={silence_blocks_limit}",
             f"min_listen_blocks={min_listen_blocks}",
             f"start_threshold={vad_start_threshold:.5f}",
@@ -893,6 +907,8 @@ async def _send_mic_once(
 
                 # --- client RMS VAD（発話開始 / 無音終了）---
                 if mic_vad_end_enabled:
+                    # Phase R2: re-read silence limit each chunk (file may switch 350↔250)
+                    silence_blocks_limit = _silence_blocks_limit_now()
                     samples = np.frombuffer(chunk, dtype=np.int16)
                     if samples.size > 0:
                         rms = float(
@@ -951,6 +967,7 @@ async def _send_mic_once(
                                     "[mic_vad][SILENCE]",
                                     f"i={i}",
                                     f"rms={rms:.5f}",
+                                    f"silence_ms={_silence_ms_now()}",
                                     f"silence_blocks={silence_blocks}/{silence_blocks_limit}",
                                     f"min_listen_ok={i >= min_listen_blocks}",
                                     flush=True,
@@ -966,6 +983,7 @@ async def _send_mic_once(
                                     "[mic_vad][END]",
                                     f"i={i}",
                                     f"rms={rms:.5f}",
+                                    f"silence_ms={_silence_ms_now()}",
                                     flush=True,
                                 )
                             # 終端チャンクは送らず、activity_end でターン完結
@@ -2245,6 +2263,185 @@ def _start_event_runtime_file_thread(
             except BaseException as e:
                 print(
                     f"[event_runtime][file_warn] {type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+            time.sleep(float(poll_s))
+
+    th = Thread(target=_target, daemon=True)
+    th.start()
+    return th
+
+
+# Phase R2: runtime VAD silence profile (350=usual / 250=aggressive). File watch only.
+_VAD_PROFILE_ALLOWED_SILENCE_MS = frozenset({250, 350})
+_VAD_PROFILE_DEFAULT_SILENCE_MS = 350
+
+
+def _parse_vad_profile_file_text(raw: str) -> int | None:
+    """Parse allowed mic_vad_silence_ms from profile file text. Invalid → None."""
+    raw = str(raw or "").strip()
+    if not raw:
+        return None
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            for key in ("mic_vad_silence_ms", "silence_ms", "vad_silence_ms"):
+                if key not in obj:
+                    continue
+                try:
+                    v = int(obj[key])
+                except (TypeError, ValueError):
+                    return None
+                if v in _VAD_PROFILE_ALLOWED_SILENCE_MS:
+                    return v
+                return None
+            return None
+        if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+            v = int(obj)
+            if v in _VAD_PROFILE_ALLOWED_SILENCE_MS:
+                return v
+            return None
+    except Exception:
+        pass
+
+    try:
+        v = int(raw.split()[0])
+    except (TypeError, ValueError):
+        return None
+    if v in _VAD_PROFILE_ALLOWED_SILENCE_MS:
+        return v
+    return None
+
+
+def _read_vad_profile_file(path: Path) -> int | None:
+    path = Path(path)
+    if not path.is_file():
+        return None
+    raw = ""
+    for enc in ("utf-8-sig", "utf-8", "cp932", "utf-16"):
+        try:
+            raw = path.read_text(encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            return None
+    return _parse_vad_profile_file_text(raw)
+
+
+def _resolve_mic_vad_silence_ms(
+    *,
+    cli_value: int | None,
+    profile_path: Path | None,
+) -> tuple[int, str]:
+    """Priority: CLI explicit > persistent file > default 350."""
+    if cli_value is not None:
+        return int(cli_value), "cli"
+    if profile_path is not None:
+        file_v = _read_vad_profile_file(profile_path)
+        if file_v is not None:
+            return int(file_v), "file"
+    return int(_VAD_PROFILE_DEFAULT_SILENCE_MS), "default"
+
+
+def _start_vad_profile_file_thread(
+    *,
+    path: Path,
+    silence_ms_ref: dict[str, int],
+    loop: asyncio.AbstractEventLoop,
+    poll_s: float,
+) -> Thread:
+    """Watch vad_profile file; apply 250/350 only. Does not clear file (persistence)."""
+    path = Path(path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+
+    last_raw = ""
+    try:
+        last_mtime = float(path.stat().st_mtime)
+        for enc in ("utf-8-sig", "utf-8", "cp932", "utf-16"):
+            try:
+                last_raw = path.read_text(encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    except OSError:
+        last_mtime = 0.0
+
+    def _target() -> None:
+        nonlocal last_mtime, last_raw
+
+        print(
+            "[vad_profile][file_ready]",
+            f"path={path}",
+            f"poll_s={float(poll_s):.3f}",
+            f"current={int(silence_ms_ref.get('value', _VAD_PROFILE_DEFAULT_SILENCE_MS))}",
+            flush=True,
+        )
+
+        while True:
+            try:
+                stat = path.stat()
+                mtime = float(stat.st_mtime)
+
+                raw = ""
+                for enc in ("utf-8-sig", "utf-8", "cp932", "utf-16"):
+                    try:
+                        raw = path.read_text(encoding=enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+
+                # Content-aware: Windows mtime granularity can hide same-second writes.
+                if mtime <= last_mtime and raw == last_raw:
+                    time.sleep(float(poll_s))
+                    continue
+
+                last_mtime = mtime
+                last_raw = raw
+
+                parsed = _parse_vad_profile_file_text(raw)
+                if parsed is None:
+                    if str(raw or "").strip():
+                        print(
+                            "[vad_profile][reject]",
+                            f"raw={str(raw).strip()!r}",
+                            f"keep={int(silence_ms_ref.get('value', _VAD_PROFILE_DEFAULT_SILENCE_MS))}",
+                            flush=True,
+                        )
+                    time.sleep(float(poll_s))
+                    continue
+
+                prev = int(
+                    silence_ms_ref.get("value", _VAD_PROFILE_DEFAULT_SILENCE_MS)
+                )
+                if parsed == prev:
+                    print(
+                        "[vad_profile][noop]",
+                        f"silence_ms={parsed}",
+                        flush=True,
+                    )
+                else:
+
+                    def _apply(
+                        v: int = parsed,
+                        p: int = prev,
+                    ) -> None:
+                        silence_ms_ref["value"] = int(v)
+                        print(
+                            "[vad_profile][set]",
+                            f"from={p}",
+                            f"to={int(v)}",
+                            flush=True,
+                        )
+
+                    loop.call_soon_threadsafe(_apply)
+
+            except BaseException as e:
+                print(
+                    f"[vad_profile][file_warn] {type(e).__name__}: {e}",
                     flush=True,
                 )
 
@@ -5176,6 +5373,40 @@ async def _run(args: argparse.Namespace) -> int:
         flush=True,
     )
 
+    # Phase R2: mic_vad_silence_ms resolve (CLI > file > 350) + runtime file override.
+    if args.vad_profile_file == "":
+        vad_profile_path: Path | None = None
+    elif args.vad_profile_file is None:
+        vad_profile_path = m1_repo / "in" / "vad_profile_live.txt"
+    else:
+        vad_profile_path = Path(args.vad_profile_file).resolve()
+
+    cli_silence_raw = getattr(args, "mic_vad_silence_ms", None)
+    resolved_silence_ms, silence_source = _resolve_mic_vad_silence_ms(
+        cli_value=(int(cli_silence_raw) if cli_silence_raw is not None else None),
+        profile_path=vad_profile_path,
+    )
+    args.mic_vad_silence_ms = int(resolved_silence_ms)
+    mic_vad_silence_ms_ref: dict[str, int] = {"value": int(resolved_silence_ms)}
+    print(
+        "[vad_profile][init]",
+        f"silence_ms={int(resolved_silence_ms)}",
+        f"source={silence_source}",
+        f"path={vad_profile_path}",
+        f"allowed={sorted(_VAD_PROFILE_ALLOWED_SILENCE_MS)}",
+        flush=True,
+    )
+    if vad_profile_path is not None:
+        vad_profile_path.parent.mkdir(parents=True, exist_ok=True)
+        if int(resolved_silence_ms) in _VAD_PROFILE_ALLOWED_SILENCE_MS:
+            # Persist starting profile (do not persist non-allowed CLI values).
+            vad_profile_path.write_text(
+                f"{int(resolved_silence_ms)}\n",
+                encoding="utf-8",
+            )
+        elif not vad_profile_path.exists():
+            vad_profile_path.touch()
+
     py = m1_repo / ".venv" / "Scripts" / "python.exe"
 
     out_root = m1_repo / "out" / "obs_realtime_session_loop" / str(args.session_id)
@@ -5331,6 +5562,7 @@ async def _run(args: argparse.Namespace) -> int:
         battle_file_thread: Thread | None = None
         battle_control_file_thread: Thread | None = None
         event_runtime_file_thread: Thread | None = None
+        vad_profile_file_thread: Thread | None = None
         battle_dev_file_writer_thread: Thread | None = None
         battle_queue_file_thread: Thread | None = None
         battle_interrupt_lines: list[str] = []
@@ -5710,7 +5942,8 @@ async def _run(args: argparse.Namespace) -> int:
                         else None
                     ),
                     mic_vad_min_voice_ms=int(args.mic_vad_min_voice_ms),
-                    mic_vad_silence_ms=int(args.mic_vad_silence_ms),
+                    mic_vad_silence_ms=int(mic_vad_silence_ms_ref["value"]),
+                    mic_vad_silence_ms_ref=mic_vad_silence_ms_ref,
                     mic_vad_min_listen_ms=int(args.mic_vad_min_listen_ms),
                     mic_vad_debug=bool(args.mic_vad_debug),
                     send_activity_signals=True,
@@ -6170,7 +6403,8 @@ async def _run(args: argparse.Namespace) -> int:
                     else None
                 ),
                 mic_vad_min_voice_ms=int(args.mic_vad_min_voice_ms),
-                mic_vad_silence_ms=int(args.mic_vad_silence_ms),
+                mic_vad_silence_ms=int(mic_vad_silence_ms_ref["value"]),
+                mic_vad_silence_ms_ref=mic_vad_silence_ms_ref,
                 mic_vad_min_listen_ms=int(args.mic_vad_min_listen_ms),
                 mic_vad_debug=bool(args.mic_vad_debug),
                 send_activity_signals=True,
@@ -6656,6 +6890,15 @@ async def _run(args: argparse.Namespace) -> int:
                 battle_mic_gate_ref=battle_mic_gate_ref,
             )
 
+        if vad_profile_path is not None and vad_profile_file_thread is None:
+            loop = asyncio.get_running_loop()
+            vad_profile_file_thread = _start_vad_profile_file_thread(
+                path=vad_profile_path,
+                silence_ms_ref=mic_vad_silence_ms_ref,
+                loop=loop,
+                poll_s=float(args.vad_profile_file_poll_s),
+            )
+
         if bool(args.reconnect_per_turn):
             for i in range(int(args.turns)):
                 max_attempts = (
@@ -7016,8 +7259,27 @@ def main() -> int:
     ap.add_argument(
         "--mic_vad_silence_ms",
         type=int,
-        default=700,
-        help="Silence ms after speech before activity_end.",
+        default=None,
+        help=(
+            "Silence ms after speech before activity_end. "
+            "Priority: CLI explicit > --vad_profile_file > 350. "
+            "CLI sets initial only; runtime file may override (250/350)."
+        ),
+    )
+    ap.add_argument(
+        "--vad_profile_file",
+        default=None,
+        help=(
+            "Path to vad_profile_live.txt (plain 250|350 or JSON). "
+            "Default: <m1>/in/vad_profile_live.txt. "
+            "Empty string disables file watch/persistence."
+        ),
+    )
+    ap.add_argument(
+        "--vad_profile_file_poll_s",
+        type=float,
+        default=0.05,
+        help="Polling interval for --vad_profile_file.",
     )
     ap.add_argument(
         "--mic_vad_min_listen_ms",

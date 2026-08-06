@@ -9,6 +9,9 @@ DEFAULT_ROOT = Path(r"C:\dev\M1_LLM_To_M2_TTS_united")
 DEFAULT_CONTROL_FILE = DEFAULT_ROOT / "in" / "battle_control_live.txt"
 DEFAULT_INTERRUPT_FILE = DEFAULT_ROOT / "in" / "battle_interrupt_live.txt"
 DEFAULT_EVENT_FILE = DEFAULT_ROOT / "in" / "event_runtime_live.txt"
+DEFAULT_VAD_PROFILE_FILE = DEFAULT_ROOT / "in" / "vad_profile_live.txt"
+
+VAD_PROFILE_ALLOWED_SILENCE_MS = frozenset({250, 350})
 
 
 DEFAULT_LEADERSHIP_CONTROL_TEXT = (
@@ -83,6 +86,35 @@ def write_event(
     write_json(event_file, payload)
 
     return payload
+
+
+def write_vad_profile(
+    *,
+    vad_profile_file: Path | str = DEFAULT_VAD_PROFILE_FILE,
+    silence_ms: int,
+) -> dict[str, Any]:
+    """Write mic_vad_silence_ms profile for R2 file-watch (plain 250|350 one line)."""
+    try:
+        value = int(silence_ms)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"invalid vad_profile silence_ms: {silence_ms!r}") from e
+
+    if value not in VAD_PROFILE_ALLOWED_SILENCE_MS:
+        raise ValueError(
+            f"vad_profile silence_ms must be one of "
+            f"{sorted(VAD_PROFILE_ALLOWED_SILENCE_MS)}, got {value}"
+        )
+
+    path = Path(vad_profile_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # R2 watch: plain integer one line (same as existing in/vad_profile_live.txt)
+    path.write_text(f"{value}\n", encoding="utf-8")
+
+    return {
+        "type": "vad_profile",
+        "mic_vad_silence_ms": value,
+        "path": str(path),
+    }
 
 
 def write_control(
@@ -215,9 +247,11 @@ def read_status(
     control_file: Path | str = DEFAULT_CONTROL_FILE,
     interrupt_file: Path | str = DEFAULT_INTERRUPT_FILE,
     event_file: Path | str = DEFAULT_EVENT_FILE,
+    vad_profile_file: Path | str = DEFAULT_VAD_PROFILE_FILE,
 ) -> dict[str, str]:
     return {
         "control": read_text_file(control_file),
         "interrupt": read_text_file(interrupt_file),
         "event": read_text_file(event_file),
+        "vad_profile": read_text_file(vad_profile_file),
     }

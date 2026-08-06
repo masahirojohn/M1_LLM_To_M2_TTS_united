@@ -1378,7 +1378,8 @@
 | --- | --- | --- | --- |
 | R1 | レスポンス遅延計測＋silence A/B＋短回帰 | `pass` | 2026-08-06 |
 | R1b | silence 攻め腕短検証（250 vs 350） | `pass` | 2026-08-06（分岐 A） |
-| R2 | 管理画面から VAD プロファイル切替（350／250） | `pending` | —（今やる） |
+| R2 | runtime ファイル切替（350／250） | `pass` | 2026-08-06（Pass-with-defer: UI→R2b） |
+| R2b | 管理画面→`vad_profile_live.txt` 書込 | `pass` | 2026-08-06 |
 
 ### プロファイル（R1b 確定）
 
@@ -1500,12 +1501,64 @@
 - アイドル発話、BGV ズレ、OBS 制御
 
 **Pass 基準:**
-- [ ] 手段の設計メモ（親承認済み）＋実装
-- [ ] 350↔250 を再起動なしで切替できる
-- [ ] 永続化・default・安全弁（許可値以外拒否）
-- [ ] 切替後 `[resp_timing]` で silence待ち≈設定値を確認
-- [ ] 短回帰（短発話 or talkover どちらか最小）非破壊
-- [ ] 親向けサマリーのみ
+- [x] 手段の設計メモ（親承認済み）＋実装
+- [x] 350↔250 を再起動なしで切替できる
+- [x] 永続化・default・安全弁（許可値以外拒否）
+- [x] 切替後 `[resp_timing]` で silence待ち≈設定値を確認
+- [x] 短回帰（短発話 or talkover どちらか最小）非破壊
+- [x] 親向けサマリーのみ
+- [ ] 管理画面 UI から書込 → **defer R2b**
+
+**設計決定（2026-08-06 親 Go）:**
+- 手段: 既存 battle/event と同型の **ファイル watch**（例 `in/vad_profile_live.txt`）。HTTP 新設なし（管理画面は当該ファイルを書くだけ）
+- 許可値: **350 / 250 のみ**。他は拒否＋現状維持
+- 永続: 同ファイルで可（`out/runtime/vad_profile.json` は任意・二重化しないなら不要）
+- 起動初期値: **CLI 明示 > 永続ファイル > default 350**
+- runtime: 起動後は **control ファイルが常に上書き可**（CLI は初期値のみ。管理画面切替が本旨のためロックしない）
+- 切替確認: `[resp_timing]` silence待ち≈設定値
+
+**子報告要約（2026-08-06）:**
+- `in/vad_profile_live.txt` watch。default 350。reject＋現状維持。CLI 初期のみ／runtime file 上書き。
+- Live: set 350→250、silence待ち 372→256。短回帰 OK。selfcheck OK。
+- Keep: `session_loop`＋`in/vad_profile_live.txt`＋R2 tools／ハーネス。
+
+**親判定（2026-08-06）:**
+- **Pass-with-defer。** runtime 切替は完了。管理画面 UI 書込は **R2b**。
+- Keep All 可（R2 runtime）。commit/tag は R2b 後でも可（今すぐなら R2 分のみでも可）。
+
+---
+
+## Phase R2b: 管理画面→`vad_profile_live.txt` 書込
+
+**目的:** 既存 Streamlit 管理画面から 通常=350／攻め腕=250 を押し、`in/vad_profile_live.txt` へ書くだけ。HTTP 新設なし。session_loop 本線は触らない（R2 済み）。
+
+**主な対象:**
+- `scripts/live_runtime/admin_control_panel.py`
+- `scripts/live_runtime/battle_runtime_admin_api.py`（`write_*` と同型の `write_vad_profile`）
+- 既定パス: `in/vad_profile_live.txt`（R2 と一致）
+
+**スコープ:**
+1. UI: 「通常 350」「攻め腕 250」ボタン（または同等）。許可値以外は出さない
+2. API: ファイル書込ヘルパ（battle/event 同型）
+3. 確認: 画面操作→ファイル内容→（可能なら）既存 Live で `[vad_profile][set]`／`[resp_timing]`。Live 再計測は最小で可
+4. 不安定なら攻め腕 UI を捨て 350 固定に戻してよい（親へ報告）
+
+**スコープ外:** session_loop 再設計、API end→first、リップ品質、HTTP サーバ新設、200/600 追加
+
+**Pass 基準:**
+- [x] 管理画面から 350/250 をファイルに書ける
+- [x] 書込形式が R2 watch と互換（session_loop が受理）
+- [x] 最小動作確認（ファイル or Live 1 切替）
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-06）:**
+- `write_vad_profile`＋ Streamlit ボタン（通常350／攻め腕250）。形式 `250\n`/`350\n`。HTTP・session_loop 非変更。
+- Live 主観: UI→file→`[vad_profile][set] 350→250` 確認。silence待ち turn1≈379 → turn3/4≈254–258。主観「turn3以降早い」。攻め腕 UI 維持。
+
+**親判定（2026-08-06）:**
+- **Pass。** レスポンス／VAD プロファイル本線（R1→R1b→R2→R2b）クローズ可。
+- 運用: 通常=350／攻め腕=250（管理画面）。起動 CLI を 350 固定にする必要なし（default 解決＋ファイルで足りる）。
+- 次本線候補（未発行）: API `end→first` は別トラック／アイドル発話／BGV↔M0／OBS。リップ品質には戻らない。
 
 ---
 
@@ -1616,3 +1669,6 @@
 | 2026-08-06 | Phase R1 計測計画 Go。同一 perf_ms で speech_end/activity_end/first_audio。A/B silence 600 vs 350。実装→計測へ |
 | 2026-08-06 | Phase R1 Pass。silence待ちは設定どおり短縮可・合計過半は API。主観で 600→350 は体感差小。運用ベース=350 固定。600/350 切替不採用・R2 hold。次=R1b（200–250 vs 350） |
 | 2026-08-06 | Phase R1b Pass・分岐A。通常=350／攻め腕=250（主観満足・短回帰OK）。200不要。R2=管理画面切替へ |
+| 2026-08-06 | Phase R2 手段 Go: ファイル watch（350/250）。起動=CLI>file>350、runtime は file 上書き可。実装へ |
+| 2026-08-06 | Phase R2 Pass-with-defer。runtime 切替 OK。管理画面 UI 書込→R2b |
+| 2026-08-06 | Phase R2b Pass。管理画面→vad_profile 書込＋Live set 確認。レスポンス本線クローズ可 |

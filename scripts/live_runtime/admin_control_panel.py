@@ -9,6 +9,7 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     DEFAULT_CONTROL_FILE,
     DEFAULT_INTERRUPT_FILE,
     DEFAULT_EVENT_FILE,
+    DEFAULT_VAD_PROFILE_FILE,
     DEFAULT_LEADERSHIP_CONTROL_TEXT,
     DEFAULT_LEADERSHIP_INTERRUPT_TEXT,
     DEFAULT_LEADERSHIP_OPEN_TEXT,
@@ -24,6 +25,7 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     write_zoom_leadership_start,
     write_mic_gate,
     write_normal_conversation,
+    write_vad_profile,
 )
 
 
@@ -47,7 +49,7 @@ def main() -> None:
     st.title("Battle Runtime Admin Control Panel")
 
     st.caption(
-        "battle_interrupt / battle_control / mic_gate を "
+        "battle_interrupt / battle_control / mic_gate / vad_profile を "
         "live txt file 経由で操作する管理者UI"
     )
 
@@ -69,17 +71,24 @@ def main() -> None:
             value=str(DEFAULT_EVENT_FILE),
         )
 
+        vad_profile_file_str = st.text_input(
+            "vad_profile_live.txt",
+            value=str(DEFAULT_VAD_PROFILE_FILE),
+        )
+
         control_file = Path(control_file_str)
         interrupt_file = Path(interrupt_file_str)
         event_file = Path(event_file_str)
+        vad_profile_file = Path(vad_profile_file_str)
 
         st.divider()
 
         st.write("Current paths")
-        st.code(f"control:   {control_file}")
-        st.code(f"interrupt: {interrupt_file}")
-        st.code(f"event:     {event_file}")
-
+        st.code(f"control:     {control_file}")
+        st.code(f"interrupt:   {interrupt_file}")
+        st.code(f"event:       {event_file}")
+        st.code(f"vad_profile: {vad_profile_file}")
+   
     st.header("基本操作")
 
     quick_interrupt_text = DEFAULT_LEADERSHIP_INTERRUPT_TEXT
@@ -205,6 +214,35 @@ def main() -> None:
 
     st.divider()
 
+    st.header("VAD プロファイル（silence_ms）")
+
+    st.caption(
+        "再起動なしで mic_vad_silence_ms を切替。"
+        "通常=350 / 攻め腕=250。許可値以外は API 側で拒否。"
+    )
+
+    v1, v2 = st.columns(2)
+
+    with v1:
+        if st.button("通常 350", type="primary", use_container_width=True):
+            write_vad_profile(
+                vad_profile_file=vad_profile_file,
+                silence_ms=350,
+            )
+            _append_ui_log("vad_profile silence_ms=350")
+            st.success("通常プロファイル (350) を書き込みました。")
+
+    with v2:
+        if st.button("攻め腕 250", use_container_width=True):
+            write_vad_profile(
+                vad_profile_file=vad_profile_file,
+                silence_ms=250,
+            )
+            _append_ui_log("vad_profile silence_ms=250")
+            st.success("攻め腕プロファイル (250) を書き込みました。")
+
+    st.divider()
+
     st.header("戦闘管制")
 
     st.caption(
@@ -245,13 +283,15 @@ def main() -> None:
         control_file=control_file,
         interrupt_file=interrupt_file,
         event_file=event_file,
+        vad_profile_file=vad_profile_file,
     )
 
     control_text_now = status["control"]
     interrupt_text_now = status["interrupt"]
     event_text_now = status["event"]
+    vad_profile_text_now = status["vad_profile"]
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
 
     with d1:
         st.subheader("battle_control_live.txt")
@@ -264,6 +304,10 @@ def main() -> None:
     with d3:
         st.subheader("event_runtime_live.txt")
         st.code(event_text_now)
+
+    with d4:
+        st.subheader("vad_profile_live.txt")
+        st.code(vad_profile_text_now)
 
     st.subheader("UI Operation Log")
 
