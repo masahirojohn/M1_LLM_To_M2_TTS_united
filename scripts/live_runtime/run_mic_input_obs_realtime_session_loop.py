@@ -730,6 +730,14 @@ async def _send_mic_once(
     mic_vad_min_listen_ms: int = 800,
     mic_vad_debug: bool = False,
     send_activity_signals: bool = True,
+    # --- Phase I1: idle utterance (proactive AI speech; NOT Phase12 idle_silent_pcm) ---
+    idle_utterance_s: float = 0.0,
+    idle_utterance_prompt: str = "",
+    idle_utterance_cooldown_s: float = 1.0,
+    idle_utterance_cooldown_ref: dict[str, float] | None = None,
+    ai_audio_started_event: asyncio.Event | None = None,
+    mic_result_ref: dict[str, Any] | None = None,
+    turn_no: int | None = None,
 ) -> int:
     """
     Mic PCM を Live API へ送信する。
@@ -781,6 +789,11 @@ async def _send_mic_once(
     has_spoken = False
     activity_started = False
     vad_ended = False
+    idle_fired = False
+    idle_anchor_perf = time.perf_counter()
+    idle_s = float(idle_utterance_s)
+    # Phase I1b: first-turn prime ends activity inside fire path; skip finally end.
+    skip_final_activity_end = False
 
     vad_start_threshold = float(mic_vad_rms_threshold)
     vad_end_threshold = (
@@ -815,6 +828,7 @@ async def _send_mic_once(
 
     sent_bytes = 0
     t0 = time.perf_counter()
+    end_reason = "unknown"
 
     print(
         "[mic_send][BEGIN]",
@@ -924,6 +938,8 @@ async def _send_mic_once(
                     if not has_spoken:
                         if rms >= vad_start_threshold:
                             voice_blocks += 1
+                            # User voice energy cancels idle-utterance timer.
+                            idle_anchor_perf = time.perf_counter()
                             if voice_blocks >= min_voice_blocks:
                                 has_spoken = True
                                 silence_blocks = 0
@@ -938,6 +954,105 @@ async def _send_mic_once(
                                 await _emit_activity_start(i)
                         else:
                             voice_blocks = 0
+                            # Phase I1/I1b: local silence → proactive AI speech.
+                            # turn>=2: text only. turn1: silent-PCM prime then text.
+                            # Do not treat Phase12 idle_silent PLAYING as "AI speaking".
+                            if idle_s > 0.0 and not idle_fired:
+                                mic_gate_state_idle = (
+                                    str(mic_gate_ref.get("value", "open")).strip().lower()
+                                    if mic_gate_ref is not None
+                                    else "open"
+                                )
+                                talkover_active = (
+                                    stop_event is not None and stop_event.is_set()
+                                )
+                                ai_playing = (
+                                    ai_audio_started_event is not None
+                                    and ai_audio_started_event.is_set()
+                                )
+                                muted = mic_gate_state_idle == "mute"
+                                now_perf = time.perf_counter()
+                                cooldown_until = 0.0
+                                if idle_utterance_cooldown_ref is not None:
+                                    try:
+                                        cooldown_until = float(
+                                            idle_utterance_cooldown_ref.get(
+                                                "until_perf", 0.0
+                                            )
+                                            or 0.0
+                                        )
+                                    except Exception:
+                                        cooldown_until = 0.0
+                                blocked = muted or talkover_active or ai_playing
+                                if blocked or now_perf < cooldown_until:
+                                    idle_anchor_perf = now_perf
+                                elif (now_perf - idle_anchor_perf) >= idle_s:
+                                    prompt = _build_idle_utterance_prompt(
+                                        idle_utterance_prompt
+                                    )
+                                    # I1b candidate A: first turn only
+                                    # activity_start → silent PCM (≥min_voice) →
+                                    # activity_end → text. After-convo stays text-only.
+                                    first_turn_prime = (
+                                        int(turn_no) == 1 and not activity_started
+                                    )
+                                    print(
+                                        "[idle_utterance][fire]",
+                                        f"turn={turn_no}",
+                                        f"idle_s={idle_s:.3f}",
+                                        f"elapsed_s={now_perf - t0:.3f}",
+                                        f"first_turn_prime={int(first_turn_prime)}",
+                                        f"prompt={prompt}",
+                                        flush=True,
+                                    )
+                                    if first_turn_prime:
+                                        print(
+                                            "[idle_utterance][first_turn_prime]",
+                                            f"turn={turn_no}",
+                                            "seq=activity_start→silent_pcm→activity_end→text",
+                                            f"silent_blocks={min_voice_blocks}",
+                                            f"block_samples={block_samples}",
+                                            flush=True,
+                                        )
+                                        await _emit_activity_start(i)
+                                        silent_chunk = b"\x00" * (
+                                            int(block_samples) * 2
+                                        )
+                                        for k in range(int(min_voice_blocks)):
+                                            await session.send_realtime_input(
+                                                audio=types.Blob(
+                                                    data=silent_chunk,
+                                                    mime_type=(
+                                                        f"audio/pcm;rate={int(input_sr)}"
+                                                    ),
+                                                )
+                                            )
+                                            sent_bytes += len(silent_chunk)
+                                            print(
+                                                "[idle_utterance][silent_pcm]",
+                                                f"turn={turn_no}",
+                                                f"k={k}",
+                                                f"bytes={len(silent_chunk)}",
+                                                flush=True,
+                                            )
+                                        await _emit_activity_end(
+                                            "idle_utterance_prime"
+                                        )
+                                        skip_final_activity_end = True
+                                        await session.send_realtime_input(
+                                            text=prompt
+                                        )
+                                    else:
+                                        await session.send_realtime_input(
+                                            text=prompt
+                                        )
+                                    idle_fired = True
+                                    if idle_utterance_cooldown_ref is not None:
+                                        idle_utterance_cooldown_ref["until_perf"] = (
+                                            now_perf
+                                            + max(0.0, float(idle_utterance_cooldown_s))
+                                        )
+                                    break
                     else:
                         if rms >= vad_end_threshold:
                             if mic_vad_debug and silence_blocks > 0:
@@ -1026,13 +1141,22 @@ async def _send_mic_once(
     finally:
         if stop_event is not None and stop_event.is_set():
             end_reason = "cut_in"
+        elif idle_fired:
+            end_reason = "idle_utterance"
         elif vad_ended:
             end_reason = "vad_silence"
         elif mic_vad_end_enabled and not has_spoken:
             end_reason = "no_speech"
         else:
             end_reason = "max_duration"
-        await _emit_activity_end(end_reason)
+        if not skip_final_activity_end:
+            await _emit_activity_end(end_reason)
+        if mic_result_ref is not None:
+            mic_result_ref["end_reason"] = end_reason
+            mic_result_ref["idle_fired"] = bool(idle_fired)
+            mic_result_ref["has_spoken"] = bool(has_spoken)
+            mic_result_ref["activity_started"] = bool(activity_started)
+            mic_result_ref["first_turn_prime"] = bool(skip_final_activity_end)
 
     print(
         "[mic_send][DONE]",
@@ -1040,10 +1164,22 @@ async def _send_mic_once(
         f"elapsed_s={time.perf_counter() - t0:.3f}",
         f"activity_started={activity_started}",
         f"has_spoken={has_spoken}",
+        f"idle_fired={bool(idle_fired)}",
+        f"end_reason={end_reason}",
         flush=True,
     )
 
     return sent_bytes
+
+
+def _build_idle_utterance_prompt(raw_text: str | None = None) -> str:
+    """Phase I1: client-text prompt for proactive AI speech (no activity signals)."""
+    raw = str(raw_text or "").strip()
+    if not raw:
+        raw = "ユーザーがしばらく無言です。自然に短く話しかけてください。"
+    if raw.startswith("【アイドル発話】"):
+        return raw
+    return f"【アイドル発話】{raw}"
 
 
 # --- [ADD] Battle Runtime: admin CLI interrupt helpers ---
@@ -5705,6 +5841,23 @@ async def _run(args: argparse.Namespace) -> int:
             f"drop_initial_audio_ms_forced=0",
             flush=True,
         )
+        print(
+            "[idle_utterance][config]",
+            f"idle_utterance_s={float(args.idle_utterance_s):.3f}",
+            f"cooldown_s={float(args.idle_utterance_cooldown_s):.3f}",
+            f"mic_send_max_s={float(args.mic_send_max_s):.3f}",
+            f"turn_idle_wait_s={float(args.turn_idle_wait_s):.3f}",
+            flush=True,
+        )
+        if (
+            float(args.idle_utterance_s) > 0.0
+            and float(args.idle_utterance_s) >= float(args.mic_send_max_s)
+        ):
+            print(
+                "[idle_utterance][WARN]",
+                "idle_utterance_s>=mic_send_max_s; fire may never occur in a turn",
+                flush=True,
+            )
 
         turn_state: dict[str, Any] = {}
         # Phase29hf: session-scoped last-good player clock (reattached after clear).
@@ -5713,6 +5866,8 @@ async def _run(args: argparse.Namespace) -> int:
             "pending_samples": 0,
         }
         turn_state["playback_clock_guard"] = playback_clock_guard
+        # Phase I1: cross-turn cooldown after idle_utterance fire (perf counter).
+        idle_utterance_cooldown_ref: dict[str, float] = {"until_perf": 0.0}
         recv_stop = asyncio.Event()
 
         async def _bootstrap_probe_audio_session(
@@ -6383,6 +6538,7 @@ async def _run(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
+            mic_result_ref: dict[str, Any] = {}
             sent_bytes = await _send_mic_once(
                 session=session,
                 duration_s=float(args.mic_send_max_s),
@@ -6408,7 +6564,15 @@ async def _run(args: argparse.Namespace) -> int:
                 mic_vad_min_listen_ms=int(args.mic_vad_min_listen_ms),
                 mic_vad_debug=bool(args.mic_vad_debug),
                 send_activity_signals=True,
+                idle_utterance_s=float(args.idle_utterance_s),
+                idle_utterance_prompt=str(args.idle_utterance_prompt or ""),
+                idle_utterance_cooldown_s=float(args.idle_utterance_cooldown_s),
+                idle_utterance_cooldown_ref=idle_utterance_cooldown_ref,
+                ai_audio_started_event=ai_audio_started_event,
+                mic_result_ref=mic_result_ref,
+                turn_no=int(turn_no),
             )
+            idle_utterance_fired = bool(mic_result_ref.get("idle_fired"))
 
             if (
                 bool(args.battle_talkover_cut_in_on_interrupt)
@@ -6576,6 +6740,14 @@ async def _run(args: argparse.Namespace) -> int:
                 # 通常ターンの response_trigger は復活させない。
                 # active_control の継続保持は emo 用。text 再送は新規 activate 時のみ。
                 # arbitration: interrupt > control（同時時は interrupt のみ送る）
+                # Phase I1: idle_utterance already sent client text inside mic listen.
+                if idle_utterance_fired:
+                    print(
+                        "[idle_utterance][activity_path_skip]",
+                        f"turn={turn_no}",
+                        "reason=already_fired_in_mic",
+                        flush=True,
+                    )
                 if active_control:
                     print(
                         "[battle_control][emo_active]",
@@ -6583,7 +6755,9 @@ async def _run(args: argparse.Namespace) -> int:
                         f"active={active_control}",
                         flush=True,
                     )
-                if interrupt_text_to_send:
+                if idle_utterance_fired:
+                    pass
+                elif interrupt_text_to_send:
                     if bool(args.battle_interrupt_file_immediate_send):
                         # immediate_send 済み。二重送信しない（pending は consume 用に残す）
                         print(
@@ -6613,29 +6787,37 @@ async def _run(args: argparse.Namespace) -> int:
                     )
             else:
                 # debug only: legacy response_trigger 合成（通常運用では skip=True）
-                if active_control:
+                if idle_utterance_fired:
                     print(
-                        "[battle_control][apply_active]",
+                        "[idle_utterance][response_trigger_skip]",
                         f"turn={turn_no}",
-                        f"active={active_control}",
+                        "reason=already_fired_in_mic",
                         flush=True,
                     )
-                    response_trigger = (
-                        f"{response_trigger}\n"
-                        f"【管理者制御】{active_control}"
+                else:
+                    if active_control:
+                        print(
+                            "[battle_control][apply_active]",
+                            f"turn={turn_no}",
+                            f"active={active_control}",
+                            flush=True,
+                        )
+                        response_trigger = (
+                            f"{response_trigger}\n"
+                            f"【管理者制御】{active_control}"
+                        )
+                    if interrupt_text_to_send:
+                        response_trigger = (
+                            f"{response_trigger}\n"
+                            f"【管理者割り込み予約】{interrupt_text_to_send}"
+                        )
+                    print(
+                        f"[session_loop][response_trigger] "
+                        f"turn={turn_no} text={response_trigger}",
+                        flush=True,
                     )
-                if interrupt_text_to_send:
-                    response_trigger = (
-                        f"{response_trigger}\n"
-                        f"【管理者割り込み予約】{interrupt_text_to_send}"
-                    )
-                print(
-                    f"[session_loop][response_trigger] "
-                    f"turn={turn_no} text={response_trigger}",
-                    flush=True,
-                )
 
-                await session.send_realtime_input(text=response_trigger)
+                    await session.send_realtime_input(text=response_trigger)
 
             input_audio_ms = int(round((sent_bytes // 2) * 1000.0 / int(args.input_sr)))
             print(
@@ -6654,6 +6836,13 @@ async def _run(args: argparse.Namespace) -> int:
                         f"[session_loop][turn_first_audio_detected] turn={turn_no}",
                         flush=True,
                     )
+                    if idle_utterance_fired:
+                        print(
+                            "[idle_utterance][first_audio]",
+                            f"turn={turn_no}",
+                            f"first_audio_sec={float(turn_state.get('first_audio_sec') or 0.0):.3f}",
+                            flush=True,
+                        )
 
                     # --- [FIX] Battle Runtime: enqueue queue-file interrupts only once after first audio ---
                     if (
@@ -6681,6 +6870,14 @@ async def _run(args: argparse.Namespace) -> int:
                         f"[session_loop][WARN] first_audio timeout turn={turn_no}",
                         flush=True,
                     )
+                    if idle_utterance_fired:
+                        print(
+                            "[idle_utterance][WARN]",
+                            f"turn={turn_no}",
+                            "reason=no_first_audio_after_text_fire",
+                            "note=text_only_may_be_silent_on_Live_do_not_add_activity",
+                            flush=True,
+                        )
                     break
 
                 await asyncio.sleep(0.02)
@@ -7222,6 +7419,28 @@ def main() -> int:
     ap.add_argument("--turns", type=int, default=2)
     ap.add_argument("--gap_s", type=float, default=0.8)
     ap.add_argument("--turn_idle_wait_s", type=float, default=0.8)
+    # --- Phase I1: proactive AI speech after user silence (NOT Phase12 idle_silent_pcm) ---
+    ap.add_argument(
+        "--idle_utterance_s",
+        type=float,
+        default=3.0,
+        help=(
+            "Seconds of local user silence while listening before proactive AI "
+            "speech via client text (default 3). <=0 disables. "
+            "Separate from --turn_idle_wait_s (AI audio drain)."
+        ),
+    )
+    ap.add_argument(
+        "--idle_utterance_prompt",
+        default="ユーザーがしばらく無言です。自然に短く話しかけてください。",
+        help="Client text prompt sent on idle_utterance fire.",
+    )
+    ap.add_argument(
+        "--idle_utterance_cooldown_s",
+        type=float,
+        default=1.0,
+        help="Min seconds after an idle_utterance fire before another can arm.",
+    )
     ap.add_argument("--turn_first_audio_timeout_s", type=float, default=5.0)
     ap.add_argument("--debug_receive", action="store_true")
     ap.add_argument("--debug_receive_raw", action="store_true")

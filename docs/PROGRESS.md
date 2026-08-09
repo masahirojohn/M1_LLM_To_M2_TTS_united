@@ -1370,9 +1370,10 @@
 | 体感「話し終わり〜反応」 | クライアント silence 待ち＋API `end→first_pcm`。合計の過半は API（R1 計測） |
 | 関連 CLI（例） | `--mic_vad_end_enabled` / `--mic_vad_silence_ms` / `--mic_vad_min_voice_ms`（240）/ `--mic_vad_min_listen_ms`（800）／RMS 閾値類 |
 | 運用ベース継承 | default **N=2**・`--no-fast_inmemory` 優先・図A・品質凍結 Keep 一式 |
-| レスポンス運用ベース（R1 後） | **`mic_vad_silence_ms=350` 固定候補**（他 `mic_vad_*` 据え置き）。旧 600 は残す理由なし |
+| レスポンス運用ベース | 通常 **350**／攻め腕 **250**（管理画面 `vad_profile_live.txt`）。commit `eb26a9c` / tag `phase-r2-pass` |
+| レスポンス本線 | **クローズ**（2026-08-06）。API `end→first` 短縮はバックログ（当面不要） |
 
-### R フェーズ一覧
+### R フェーズ一覧（レスポンス／VAD・クローズ）
 
 | Phase | 名称 | 状態 | Pass 日 |
 | --- | --- | --- | --- |
@@ -1381,28 +1382,34 @@
 | R2 | runtime ファイル切替（350／250） | `pass` | 2026-08-06（Pass-with-defer: UI→R2b） |
 | R2b | 管理画面→`vad_profile_live.txt` 書込 | `pass` | 2026-08-06 |
 
-### プロファイル（R1b 確定）
+### プロファイル（確定・運用中）
 
 | プロファイル | `mic_vad_silence_ms` | 用途 | 状態 |
 | --- | ---: | --- | --- |
 | 通常 | **350** | 日常運用 | 確定 |
-| 攻め腕（バトル） | **250** | 反応優先。短回帰 OK・主観で満足到達 | 確定 |
-| （不採用）旧通常 | 600 | 体感差小 | 廃止 |
-| （見送り）200 | 200 | 250 で満足のため未実施 | 不要 |
+| 攻め腕（バトル） | **250** | 反応優先 | 確定 |
 
-**方針:** 切替は **通常=350／攻め腕=250**。R2 で管理画面（別プロセス）から再起動なし切替。default CLI 据え置き（親承認後に default=350 化を検討可）。API `end→first` 短縮は別トラック（今はやらない）。200 は不要。
+### プロダクト本線（続き）
 
-### 当面の非本線（後続・今は実装させない）
+| Phase | 名称 | 状態 | Pass 日 |
+| --- | --- | --- | --- |
+| I1 | 無言→AI アイドル発話（会話後） | `pass` | 2026-08-09（Pass-with-defer: 初手→I1b） |
+| I1b | 初手無言（セッション開始時の口火） | `pass` | 2026-08-09（候補A） |
+| （予約） | BGV↔M0 位置／向きズレ | — | I1b 後。着手時に BGV 時計特定が第一 |
+| （予約） | OBS 制御（BGM／背景等） | — | BGV 後 |
 
-- 無言数秒後の AI アイドル発話（レスポンス系の次候補メモ）
-- **BGV↔M0 位置／向きの徐々ズレ**（音声↔M0 は `played_audio_ms` SSOT 同期済。BGV 時計の特定が先。着手時は wall / playlist / played_audio_ms のどれかを実コード特定が第一タスク）
-- OBS BGM／背景切替などの OBS 制御
+### 当面の非本線（今は実装させない）
 
-### 全 R Phase 共通禁止（子）
+- API `end→first` 短縮
+- **BGV↔M0 位置／向きの徐々ズレ**（定義のみ。音声↔M0 は `played_audio_ms` SSOT 同期済）
+- OBS BGM／背景切替
+- Phase12 系の idle silent PCM／縫い目の品質本線化
+
+### 全プロダクト Phase 共通禁止（子）
 
 - `docs/PROGRESS.md` 無断編集、凍結 Keep 破壊、N↑、ジッタ延長で症状隠し、frame drop、音声先行 enqueue、口形捨て
-- 「ローカル VAD だから遅れは不可避」で打ち切らない（パラメータで縮む前提を **計測で** 検証する）
-- リップ品質・縫い目・idle 品質本線化への回帰
+- リップ品質・縫い目・Silero 再設計・API end→first 本線化
+- VAD 350/250 プロファイルと talkover／割り込みの破壊
 
 ---
 
@@ -1556,9 +1563,92 @@
 - Live 主観: UI→file→`[vad_profile][set] 350→250` 確認。silence待ち turn1≈379 → turn3/4≈254–258。主観「turn3以降早い」。攻め腕 UI 維持。
 
 **親判定（2026-08-06）:**
-- **Pass。** レスポンス／VAD プロファイル本線（R1→R1b→R2→R2b）クローズ可。
-- 運用: 通常=350／攻め腕=250（管理画面）。起動 CLI を 350 固定にする必要なし（default 解決＋ファイルで足りる）。
-- 次本線候補（未発行）: API `end→first` は別トラック／アイドル発話／BGV↔M0／OBS。リップ品質には戻らない。
+- **Pass。** レスポンス／VAD プロファイル本線（R1→R1b→R2→R2b）クローズ。
+- 運用: 通常=350／攻め腕=250（管理画面）。起動 CLI を 350 固定にする必要なし。
+- 次本線: **I1 アイドル発話**（2026-08-09）。API `end→first`／BGV／OBS は後続。
+
+---
+
+## Phase I1: 無言→AI アイドル発話
+
+**目的:** ユーザー無言が数秒続いたら AI が自ら発話を開始する。  
+**Phase12 idle silent PCM（待機モーション／無音 PCM）とは別機能。** 混同・改修しない。
+
+**スコープ:**
+1. **調査（先）:** 既存のターン境界・`activity_start/end`・client content 送信・`turn_idle_wait_s`・battle/event との関係を洗い、トリガー手段を **5 行以内で親に提案**（承認前に本実装しない）
+2. **実装（親 Go 後）:** 無言タイマー（CLI 可変・初期案 5–8s）満了 → AI 発話開始。発話中／ユーザー発話中／talkover 中は発火しない
+3. **衝突回避:** talkover／割り込み／VAD 350・250 プロファイルを壊さない。ユーザー発話でタイマーリセット／キャンセル
+4. **観測:** 発火ログ（例 `[idle_utterance][fire]`）＋ first_audio まで。短回帰（通常ターン＋talkover 1 本）
+
+**スコープ外:**
+- Phase12 `idle_silent_pcm` の品質・縫い目チューニング
+- API `end→first` 短縮、Silero 再設計、リップ品質、BGV ズレ、OBS 制御
+- 管理画面への idle タイマー UI（必要なら後続。I1 は CLI＋動作で可）
+
+**Pass 基準:**
+- [x] 設計提案が親承認済み
+- [x] 無言 N 秒後に AI 発話が始まる（ログ＋主観または自動）— **会話成立後**
+- [x] ユーザー発話／talkover で誤発火しない・割り込み可能
+- [x] VAD 350/250・方式2・図A・N=2・`--no-fast_inmemory`・品質凍結 Keep 非破壊
+- [x] Phase12 idle silent と混同した改修がない
+- [x] 親向けサマリーのみ
+- [ ] セッション初手無言 → **defer I1b**（実運用で必要）
+
+**設計決定（2026-08-09 親 Go）:**
+- トリガー: **client text**（会話後パス）。server VAD なし。Phase12 `idle_silent_pcm` 非改修
+- 計時: `--idle_utterance_s`。cooldown 1s。`turn_idle_wait_s` とは別
+
+**子報告要約（2026-08-09）:**
+- 会話後無言: fire→first_audio OK。talkover 短回帰 OK。初手 text のみは `audio_chunks=0`（activity 未追加・報告どおり）
+- 主観（idle=3s）: 発話↔AI↔無言↔idle AI を複数回確認。誤発火なし。運用は **3s が妥当**（6s は長い）
+
+**親判定（2026-08-09）:**
+- **Pass-with-defer。** Keep: I1 実装。**`--idle_utterance_s` default を 3.0 に変更**（I1 Keep に含む／I1b 着手時に同時で可）
+- 初手無言（相手が最初に話さない→AI が口火）は **I1b**（SNS バトル実運用のため必須）
+- commit/tag は I1b 後まとめで可（今すぐ I1 のみでも可）
+
+---
+
+## Phase I1b: 初手無言（セッション開始時の口火）
+
+**目的:** セッション開始後、ユーザーが一度も話さないまま無言タイマー満了したときも AI が音声で口火を切る。会話後パス（I1）は維持。
+
+**背景:** text のみでは Live が初手で黙る場合あり（実測）。activity 全面偽装は禁止だが、**初手専用の最小手段**は親承認のうえ検討可（server VAD 復活は禁止）。
+
+**スコープ:**
+1. 先に手段を 5 行で親提案（承認前に本実装しない）
+   - 既知: 会話後は text のみで OK。初手は text のみ NG
+   - 候補例: 初手のみ `activity_start`→text→`activity_end`（ユーザー音声なし）。他手段があれば優先検討
+2. 親 Go 後実装。発火条件: セッション内にユーザー発話（または prior turn）がまだ無い＋無言タイマー満了
+3. 会話後パスは I1 のまま（余計な activity を付けない）
+4. `--idle_utterance_s` default **3.0**（未反映なら同時変更）
+5. 短回帰: 初手 idle→first_audio／通常ユーザー発話ターン／talkover。VAD 350/250・図A・方式2 非破壊。Phase12 非改修
+
+**スコープ外:** BGV、OBS、API end→first、リップ品質、server VAD、idle silent 品質
+
+**Pass 基準:**
+- [x] 設計が親承認済み
+- [x] 初手無言で fire→first_audio
+- [x] 会話後パス非回帰
+- [x] talkover／通常ターン非破壊
+- [x] default idle=3.0
+- [x] 親向けサマリーのみ
+
+**設計決定（2026-08-09 親 Go）:**
+- 会話後: text のみ（I1）。activity を付けない
+- 初手 v1（Fail・Revert 済）: `activity_start`→text→`activity_end`（PCM なし）→ Live 沈黙
+- 初手 v2 **採用（候補A）:** 初手のみ `activity_start` → silent PCM ×`min_voice_blocks` → `activity_end` → text
+- 会話後パスへ silent PCM／activity を漏らさない。server VAD／response_trigger／Phase12 改修禁止
+- `--idle_utterance_s` default=3.0
+
+**子報告要約（2026-08-09）:**
+- 初手: `first_turn_prime=1` → silent×6 → end → text → first_audio / chunks=13
+- 会話後: `first_turn_prime=0` / text のみ → first_audio 非回帰。talkover OK
+- 主観 4t: T1/T2 無言→AI OK、T3–T4 発話後→AI OK
+
+**親判定（2026-08-09）:**
+- **Pass。** Keep = I1 + I1b 候補A。アイドル発話本線クローズ可。
+- 次本線候補: BGV↔M0（未発行）。OBS はその後。API end→first はバックログ。
 
 ---
 
@@ -1672,3 +1762,10 @@
 | 2026-08-06 | Phase R2 手段 Go: ファイル watch（350/250）。起動=CLI>file>350、runtime は file 上書き可。実装へ |
 | 2026-08-06 | Phase R2 Pass-with-defer。runtime 切替 OK。管理画面 UI 書込→R2b |
 | 2026-08-06 | Phase R2b Pass。管理画面→vad_profile 書込＋Live set 確認。レスポンス本線クローズ可 |
+| 2026-08-06 | R2+R2b commit `eb26a9c` / tag `phase-r2-pass` |
+| 2026-08-09 | レスポンス本線クローズ確定。次本線=I1 アイドル発話（Phase12 idle silent とは別）。BGV/OBS は予約のみ |
+| 2026-08-09 | Phase I1 設計 Go: client text トリガー＋`--idle_utterance_s` default6。実装→検証へ |
+| 2026-08-09 | Phase I1 Pass-with-defer。会話後 idle OK・主観3s妥当。default→3。初手無言→I1b |
+| 2026-08-09 | Phase I1b 設計 Go: 初手のみ activity_start→text→activity_end。実装→検証へ |
+| 2026-08-09 | I1b v1 Fail（空 activity+text・audio0）Revert。再 Go=候補A（silent PCM→end→text） |
+| 2026-08-09 | Phase I1b Pass（候補A）。初手／会話後／talkover／主観OK。アイドル本線クローズ可 |
