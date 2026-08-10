@@ -1395,15 +1395,21 @@
 | --- | --- | --- | --- |
 | I1 | 無言→AI アイドル発話（会話後） | `pass` | 2026-08-09（Pass-with-defer: 初手→I1b） |
 | I1b | 初手無言（セッション開始時の口火） | `pass` | 2026-08-09（候補A） |
-| （予約） | BGV↔M0 位置／向きズレ | — | I1b 後。着手時に BGV 時計特定が第一 |
-| （予約） | OBS 制御（BGM／背景等） | — | BGV 後 |
+| B1 | BGV 時計特定（調査のみ） | `pass` | 2026-08-09 |
+| B2 | BGV↔audio_ms ズレ定量＋方式選択材料 | `pass` | 2026-08-09 |
+| B3 | PLAYING 中 `played_audio_ms→BG frame` 実装 | `pass` | 2026-08-09（Pass-with-followup→B3hf） |
+| B3hf | BG 固着／playback_state 読取競合 Hotfix | `pass` | 2026-08-10（Pass-with-followup→B3hf2） |
+| B3hf2 | Turn 先頭 bg_pos 固着／境界スナップショット | `pass` | 2026-08-10 |
+| B4 | T2 残ズレ：pose／幾何切り分け（分析のみ） | `pending` | —（今やる） |
+| （予約） | OBS 制御 | — | B4 で A（または runtime でない）確認後に可。Colab 完了待ち不要 |
+| （予約） | OBS 制御（BGM／背景等） | — | BGV 本線後 |
 
 ### 当面の非本線（今は実装させない）
 
 - API `end→first` 短縮
-- **BGV↔M0 位置／向きの徐々ズレ**（定義のみ。音声↔M0 は `played_audio_ms` SSOT 同期済）
 - OBS BGM／背景切替
 - Phase12 系の idle silent PCM／縫い目の品質本線化
+- BGV 同期の実装修正（B1 は調査のみ。300ms 決め打ち禁止）
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -1647,8 +1653,225 @@
 - 主観 4t: T1/T2 無言→AI OK、T3–T4 発話後→AI OK
 
 **親判定（2026-08-09）:**
-- **Pass。** Keep = I1 + I1b 候補A。アイドル発話本線クローズ可。
-- 次本線候補: BGV↔M0（未発行）。OBS はその後。API end→first はバックログ。
+- **Pass。** Keep = I1 + I1b 候補A。commit `bb0ef93` / tag `phase-i1-pass`。アイドル発話本線クローズ。
+- 次本線: **B1 BGV 時計特定（調査のみ）**。OBS／API end→first は後続。
+
+---
+
+## Phase B1: BGV 時計特定（調査のみ・実装禁止）
+
+**目的:** BGV↔M0 FG の顔位置・サイズ・向きが徐々にズレる問題について、**まず BGV が今どの時計で進んでいるかを実コード／実ログで一つに確定する。** 修正実装はしない。
+
+**前提:**
+- 音声↔M0 は `played_audio_ms` SSOT で同期済
+- ズレは BGV↔M0 FG。ターン開始でリセット想定
+- 資料: ユーザー手元「新チャット引継ぎ資料（ローカル版 BGV・M0同期ズレ解消）」＋本節
+
+**スコープ（調査のみ）:**
+1. 実コードで BGV 進行時計を **必ず一つに確定**（推測禁止）  
+   候補: `wall` / `chunk local` / `playlist absolute` / `played_audio_ms`／他なら明記
+2. 根拠: ファイル・関数名・式・（可能なら）ログ引用パス。`bg_frame_idx` / `bg_start_ms` / playlist の関係を表にする
+3. M0（`played_audio_ms` 系）との差・ズレが蓄積しうる理由
+4. 修正方針案のみ（実装・diff 禁止）。資料の同期候補は未決のまま列挙可  
+   - played_audio_ms→bg_frame_idx 直接  
+   - BGV 側 hold/drop（**口／FG frame drop ではない**。BGV 側の可否は時計確定後に親判断）  
+   - 微小速度補正
+
+**スコープ外（B1 禁止）:**
+- いかなる同期修正の実装・「300ms ずらせば直る」決め打ち
+- 口形 frame drop、音声先行 enqueue、ジッタ延長で隠し、リップ品質本線化、N↑、Silero
+- OBS 制御、API end→first、VAD／アイドル発話の再設計
+- Phase12 idle silent 品質チューニング
+
+**参照起点（子が実在パスを特定）:**
+- M1: `run_mic_input_obs_realtime_session_loop.py` / audio_chunk_player（`played_audio_ms`・ジッタ）
+- M0: `tools/run_chunk.py` / `render_core.py`（pose/mouth/expr `t_ms`）
+- M3.5: `m3_5/bg_scheduler.py` / `compositor_direct.py` / `run_virtualcam_persistent.py` 等（`bg_frame_idx`・`bg_start_ms`・playlist）
+
+**Pass 基準:**
+- [x] BGV 時計を一つに確定（根拠付き）
+- [x] M0 時計との差分説明（なぜ徐々ズレうるか）
+- [x] 修正方針案（未決列挙可・採用は親）。実装なし
+- [x] 親向けサマリーのみ（diff/ログ全文禁止）
+
+**子報告要約（2026-08-09）:**
+- Live BGV 時計 = **virtualcam FPS 順次デコード**（毎ループ `cap.read()` → `sleep_until_next_frame`）。`played_*` 非参照。wall ペース。
+- FG = `played_audio_ms` → `target_frame`。`bg_frame_idx`/`bg_start_ms`/playlist は Live 未配線（M3.5 offline のみ）。
+- 蓄積点: `IDLE_BG_ADVANCE` で非 PLAYING 中も BG 進行・FG 停止。ターン開始は FG sync_meta 更新のみで BG `VideoCapture` はリセットしない。
+- コード変更なし。
+
+**親判定（2026-08-09）:**
+- **Pass。** 時計確定を受理。
+- **IDLE_BG_ADVANCE は単純廃止しない**（Phase12/14 意図的 Keep。待機 BGV 固着の再発リスク）。
+- 次=**B2**: ズレ定量→方式選択材料。PLAYING 中は `played_audio_ms→BG frame` 寄せを第一候補として検討。M3.5 playlist 丸ごと移植禁止。実装修正は B3（親承認後）。
+
+---
+
+## Phase B2: BGV↔audio_ms ズレ定量＋方式選択材料
+
+**目的:** Live 本線で「BG 暗黙 frame」と `audio_ms` の同時系列を最小観測し、REBUFFERING／ターン境界での Δ 蓄積を定量する。方式は親が決める。**本格同期修正の実装はしない**（観測ログのみ可）。
+
+**前提（B1 確定）:**
+- BG = virtualcam FPS 順次（wall ペース）。FG = `played_audio_ms`
+- `IDLE_BG_ADVANCE` 単純廃止禁止（待機中 BGV 維持が Keep）
+- M3.5 offline `BgScheduler`/playlist の Live 丸ごと移植禁止
+
+**スコープ:**
+1. 挙動不変の最小観測ログ（例: 同時刻の `audio_ms`／推定 BG frame or read 回数／player state）
+2. REBUFFERING・ターン境界・定常 PLAYING での Δ(bg, audio_ms) 定量表
+3. 方式比較材料（実装せず提案のみ）:
+   - **第一候補方向:** PLAYING 中 `played_audio_ms → BG frame` 寄せ
+   - BGV 側 hold/drop（口／FG drop ではない。IDLE_BG_ADVANCE との共存設計を含める）
+   - 微小速度補正
+4. 親が B3 方式を選べる結論（推奨1つ＋棄却理由）
+
+**スコープ外:**
+- 同期本実装、300ms 決め打ち、口形捨て、ジッタ延長隠し、N↑、リップ品質、OBS、API end→first
+- IDLE_BG_ADVANCE の無条件削除、playlist 移植
+
+**Pass 基準:**
+- [x] Δ 定量表（区間・条件付き）
+- [x] 方式比較と推奨（親決定用）。本実装なし
+- [x] IDLE_BG_ADVANCE／待機 BGV への影響を明記
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-09）:**
+- 主因: 非 PLAYING 中 IDLE_BG_ADVANCE で BG 進行＋ターンで BG 非リセット。定常 PLAYING は共進で Δ≈0。
+- 推奨 A: PLAYING 中のみ `played_audio_ms→BG frame`。IDLE_BG_ADVANCE 維持。速度補正は主手段棄却。
+- Keep: 観測 `[B2_OBS]`＋`phase_b2_bg_delta_quant.py`（挙動変更なし）。
+
+**親判定（2026-08-09）:**
+- **Pass。** 方式 **A を採用** → B3 実装 Go。
+- IDLE_BG_ADVANCE 維持。playlist／微小速度補正は入れない。hold/drop は A の実装手段として可。
+
+---
+
+## Phase B3: PLAYING 中 `played_audio_ms→BG frame` 実装
+
+**目的:** PLAYING 中だけ BG を `played_audio_ms`（＋必要なら loop）で決め、REB／ターン復帰で audio に再ロックする。非 PLAYING は現行 `IDLE_BG_ADVANCE` 維持。
+
+**方式（親確定）:**
+- PLAYING: `played_audio_ms → BG frame`（loop 可）
+- 非 PLAYING: 順次 `cap.read()` 継続（IDLE_BG_ADVANCE Keep）
+- 禁止: playlist 移植、速度補正を主手段、口／FG drop、ジッタ延長隠し、300ms 決め打ち、IDLE_BG_ADVANCE 廃止
+
+**スコープ:**
+1. `run_virtualcam_persistent.py` に最小実装
+2. REB／ターン復帰で audio に再ロック（持ち越し Δ を切る）
+3. 既存 `[B2_OBS]` または同等で Before/After Δ 改善を示す
+4. 短回帰: 待機 BGV が固着しない／方式2・図A・N=2・`--no-fast_inmemory`・品質凍結 Keep 非破壊
+5. 主観またはログで顔位置ズレ改善（可能な範囲）
+
+**Pass 基準:**
+- [x] PLAYING 中 BG が audio_ms に追従（ログ根拠）
+- [x] 非 PLAYING で IDLE_BG_ADVANCE 維持（待機固着なし）
+- [x] REB／ターン後の持ち越し Δ が改善
+- [x] 短回帰・Keep 非破壊
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-09）:**
+- 方式 A: PLAYING=`audio→BG`（相対ロック＋seek）、非 PLAYING=順次／IDLE_BG_ADVANCE。`[B3_BG_RELOCK]`。
+- selfcheck PASS。持ち越し Δ 切断を確認。talkover API 本線は未／割り込み主観で非破壊。
+- 主観: 全体は顔位置適合改善。Turn2 で上下ズレ時間帯あり → `bg_mode=audio` なのに `bg_pos` 固定（FG/audio 進行）をログで説明可能。
+
+**親判定（2026-08-09）:**
+- **Pass-with-followup。** Keep = B3 本体。
+- 次=**B3hf**: playback_state 単一読取で BG/FG 共通化、UNKNOWN 時 a_ms 固着防止、必要なら seek 実フレーム検証。pose.json 切り分けは Hotfix 後の再主観。
+- UTF-16 ログは定量ツール側の追従を任意（本線外でも可）。
+
+---
+
+## Phase B3hf: BG 固着／playback_state 読取競合 Hotfix
+
+**目的:** PLAYING 中に `bg_mode=audio` なのに `bg_pos` が固まり FG だけ進む区間を潰す。方式 A・IDLE_BG_ADVANCE は維持。
+
+**疑い（主観ログ根拠）:**
+- Turn2: RELOCK 後〜REB 前まで `bg_pos` 固定・`audio_ms` 進行 → 読取競合／UNKNOWN 固着／seek 失敗が第一候補
+- pose.json 単独より B3 実装側を先に直す
+
+**スコープ:**
+1. playback_state（または同等）の **単一読取**で BG/FG が同じ `audio_ms` を使う
+2. UNKNOWN 瞬断時の `a_ms` 固着防止（誤って BG を止め続けない）
+3. 必要なら seek 後の実フレーム検証（失敗時のフォールバックをログ付きで）
+4. Before/After: 同型主観または `[B2_OBS]` で `bg_mode=audio` 中の `bg_pos` 停滞区間が消える／短縮
+5. IDLE_BG_ADVANCE・方式2・図A・品質凍結 Keep 非破壊
+
+**スコープ外:** playlist、速度補正主手段、口／FG drop、ジッタ延長、pose 本線化、OBS
+
+**Pass 基準:**
+- [x] 固着メカニズムを特定または有力仮説を閉じる（ログ根拠）
+- [x] Hotfix 実装＋`bg_pos` 停滞の改善根拠 — **T1 audio 中停滞は解消。T2 先頭停滞は残**
+- [x] 非 PLAYING／IDLE_BG_ADVANCE 非破壊
+- [x] 親向けサマリー（再主観依頼の要否を明記）
+
+**子報告要約（2026-08-10）:**
+- 原因: playback_state 二重読取。BG が None/UNKNOWN で a_ms を RELOCK 値に固着、FG だけ再読取で進行。
+- Fix: 1 tick 1 スナップショット＋last-good PLAYING／seek 検証。selfcheck stall 解消。
+- 主観: T1 停滞消えた。T2 先頭は `bg_mode=audio` で bg_pos 固定が残（≈2.4–3.4s）。SEEK_FAIL=0。待ち時間ズレは境界別件の示唆。
+
+**親判定（2026-08-10）:**
+- **Pass-with-followup。** Keep = B3hf（二重読取閉鎖は有効）。Fail にはしない。
+- 次=**B3hf2**: sync_meta も含め BG/FG resolve 1回／診断ログ（a_ms_bg/desired/bg_pos/a_ms_fg）／T2 先頭固着閉鎖。pose 切り分けはその後。待ち時間（T1→T2 seq なし PLAYING のまま）は同 Phase で切り分けメモ可・本線は T2 先頭固着。
+
+---
+
+## Phase B3hf2: Turn 先頭 bg_pos 固着／境界スナップショット
+
+**目的:** Turn 開始直後に `bg_mode=audio` なのに `bg_pos` が数秒固定する残件を閉じる。B3hf の 1-tick snapshot は維持。
+
+**スコープ:**
+1. `playback_state` だけでなく **sync_meta も BG/FG 単一スナップショット**（resolve 1回）
+2. 診断ログ: `a_ms_bg` / `desired` / `bg_pos` / `a_ms_fg`（または同等）を併記し分岐を閉じる
+3. T2 先頭固着の Before/After（実ログまたは再現ハーネス）
+4. T1→T2 待ちで PLAYING のまま `reason=turn` RELOCK する場合の影響を切り分けメモ（本線は先頭固着。別チケット化してよい）
+5. IDLE_BG_ADVANCE・方式 A・品質凍結 Keep 非破壊
+
+**スコープ外:** playlist、速度補正主手段、口／FG drop、ジッタ延長、IDLE 廃止、OBS、pose 本線化（切り分けは Hotfix 後）
+
+**Pass 基準:**
+- [x] T2（または同型）先頭の bg_pos 停滞が解消／大幅短縮（ログ根拠）
+- [x] 診断ログで原因分岐が閉じている
+- [x] 短回帰・IDLE_BG_ADVANCE 非破壊
+- [x] 再主観要否を明記
+
+**子報告要約（2026-08-10）:**
+- 主因: `lock_audio_ms=0` falsy（`or a_ms` で毎 tick 潰れ → desired=lock_bg 固定）。`is not None` で修正。
+- sync_meta adopt→resolve 1回共用。`[B3hf2_SNAP]`。selfcheck stall 解消。B3/B3hf selfcheck PASS。
+- 主観: T2 先頭固着クローズ（SNAP一致・追従）。**T2 上下ズレは残**（同期分岐型ではない）。待ち時間ズレは本測未再現→バックログ。
+
+**親判定（2026-08-10）:**
+- **Pass。** Keep = B3hf2。BGV runtime 同期本線（B1–B3hf2）クローズ可。
+- 次=**B4** pose／幾何切り分け（分析のみ）。OBS は B4 で A（または runtime でない）確認後に着手可（Colab 完了待ち不要）。
+
+---
+
+## Phase B4: T2 残ズレ — pose／幾何切り分け（分析のみ）
+
+**目的:** 残る T2 上下ズレについて、主因を **A/B/C の一つに確定**する。実装修正・Colab 改修はしない。
+
+**前提:**
+- BGV runtime 同期（方式 A＋二重読取＋falsy-0）は閉じた前提
+- 対象主観ログ例: `sess_phase11_subj_20260810_215344`（残ズレ帯）
+- 待ち時間 reason=turn RELOCK ズレはバックログ（本線外）
+
+**スコープ（分析のみ）:**
+1. 残ズレ帯の `audio_ms`／`bg_pos` と、当該 BGV フレーム顔位置 vs M0／`pose.json` を照合
+2. 主因を次の **一つ**に確定:
+   - **A)** `pose.json`（ETL 資産）ずれ
+   - **B)** M0 適用／幾何変換側
+   - **C)** なお runtime 残
+3. 根拠表（ファイル・フレーム・数値）。推測で実装提案しない
+4. A 確定時: 後続は資産再生成→差替検証（本 Phase ではやらない）。B/C なら親が次手再定義
+
+**スコープ外:**
+- 実装修正、Colab スクリプト改善（別途進行・Cursor 本線外）
+- playlist／速度補正／口 FG drop／ジッタ／IDLE 廃止、OBS 実装（B4 判定後）
+
+**Pass 基準:**
+- [ ] A/B/C を一つに確定（根拠付き）
+- [ ] 残ズレ帯の照合表
+- [ ] 次手提案 3 行（実装しない）
+- [ ] コード変更なしが原則
 
 ---
 
@@ -1769,3 +1992,10 @@
 | 2026-08-09 | Phase I1b 設計 Go: 初手のみ activity_start→text→activity_end。実装→検証へ |
 | 2026-08-09 | I1b v1 Fail（空 activity+text・audio0）Revert。再 Go=候補A（silent PCM→end→text） |
 | 2026-08-09 | Phase I1b Pass（候補A）。初手／会話後／talkover／主観OK。アイドル本線クローズ可 |
+| 2026-08-09 | I1/I1b commit `bb0ef93` / tag `phase-i1-pass` |
+| 2026-08-09 | 次本線=B1 BGV 時計特定（調査のみ）。実装・300ms決め打ち禁止。子プロンプト発行 |
+| 2026-08-09 | Phase B1 Pass。Live BGV=virtualcam FPS 順次。IDLE_BG_ADVANCE 単純廃止禁止。次=B2 定量 |
+| 2026-08-09 | Phase B2 Pass。方式A採用（PLAYING中 audio→BG、IDLE維持）。次=B3 実装 |
+| 2026-08-09 | Phase B3 Pass-with-followup。方式A Keep。Turn2 bg_pos固着→B3hf |
+| 2026-08-10 | Phase B3hf Pass-with-followup。二重読取閉鎖・T1停滞解消。T2先頭残→B3hf2 |
+| 2026-08-10 | Phase B3hf2 Pass。falsy-0 閉鎖。BGV runtime 同期クローズ可。次=B4 pose/幾何分析。OBSはB4後可 |
