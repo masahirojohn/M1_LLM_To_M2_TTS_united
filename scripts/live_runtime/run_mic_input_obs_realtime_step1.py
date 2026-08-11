@@ -609,6 +609,230 @@ def _bisect_frames_left(frames: list[dict[str, Any]], t_ms: int) -> int:
     return int(lo)
 
 
+def _pose_abs_window_ms(
+    *,
+    t0_ms: int,
+    t1_ms: int,
+    pose_base_frame: int,
+    step_ms: int,
+) -> tuple[int, int]:
+    """Phase B5: map turn-local chunk window → absolute pose t_ms via BGV base."""
+    step = max(1, int(step_ms))
+    base_ms = int(pose_base_frame) * int(step)
+    return int(base_ms + int(t0_ms)), int(base_ms + int(t1_ms))
+
+
+def _read_bg_cursor_pose_base(path: Path | None) -> int | None:
+    """Compat: bg_pos only. Prefer _read_bg_cursor_info for B5hf."""
+    info = _read_bg_cursor_info(path)
+    if info is None:
+        return None
+    pos = info.get("bg_pos")
+    return int(pos) if pos is not None and int(pos) >= 0 else None
+
+
+def _read_bg_cursor_info(path: Path | None) -> dict[str, Any] | None:
+    """Read VirtualCam bg_cursor.json (bg_pos/mode/ideal_base/fo). None if unavailable."""
+    if path is None:
+        return None
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        raw = p.read_text(encoding="utf-8-sig").strip()
+        if not raw:
+            return None
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return None
+        pos = int(obj.get("bg_pos", -1))
+        if pos < 0:
+            return None
+        mode = str(obj.get("bg_mode") or "seq")
+        step = max(1, int(obj.get("step_ms", 40) or 40))
+        a_raw = obj.get("audio_ms", None)
+        if a_raw is None:
+            audio_ms = None
+        else:
+            audio_ms = int(a_raw)
+            if audio_ms < 0:
+                audio_ms = None
+        if "ideal_base_frame" in obj and obj.get("ideal_base_frame") is not None:
+            ideal = int(obj.get("ideal_base_frame"))
+        elif audio_ms is not None:
+            ideal = int(pos) - int(audio_ms) // int(step)
+        else:
+            ideal = int(pos)
+        fo_raw = obj.get("frame_offset", None)
+        if fo_raw is None:
+            cursor_fo = None
+        else:
+            cursor_fo = int(fo_raw)
+            if cursor_fo < 0:
+                cursor_fo = None
+        return {
+            "bg_pos": int(pos),
+            "bg_mode": str(mode),
+            "audio_ms": audio_ms,
+            "step_ms": int(step),
+            "ideal_base_frame": int(ideal),
+            "frame_offset": cursor_fo,
+        }
+    except Exception:
+        return None
+
+
+def _read_bg_cursor_info_retry(
+    path: Path | None,
+    *,
+    attempts: int = 5,
+    sleep_s: float = 0.002,
+) -> dict[str, Any] | None:
+    """Retry brief torn-read / replace races. Never invents pose_base=0."""
+    last: dict[str, Any] | None = None
+    n = max(1, int(attempts))
+    for i in range(n):
+        last = _read_bg_cursor_info(path)
+        if last is not None:
+            return last
+        if i + 1 < n:
+            time.sleep(float(sleep_s))
+    return last
+
+
+def _ensure_pose_base_frame(m0_pipeline_ref: dict[str, Any]) -> tuple[int, str]:
+    """Snapshot PLAYING/RELOCK ideal_base once per turn for pose slice clock.
+
+    B5hf:
+    - Do not freeze on idle/seq cursor (avoids T1 constant Δ vs enter_playing RELOCK).
+    - Never silent-freeze pose_base=0 on missing cursor; retry → last-good → turn_local.
+    B5hf2:
+    - ok_audio freeze only when cursor.frame_offset matches this turn's fo
+      (rejects prior-turn PLAYING cursor before new-fo enter_playing/turn RELOCK).
+    - fo↑ / fo mismatch → provisional turn_local (no absolute freeze yet).
+    Returns (pose_base_frame, mode) with mode in {"absolute", "turn_local"}.
+    """
+    existing_mode = m0_pipeline_ref.get("pose_clock_mode")
+    existing = m0_pipeline_ref.get("pose_base_frame")
+    if existing_mode == "absolute" and existing is not None:
+        return int(existing), "absolute"
+    if existing_mode == "turn_local":
+        return 0, "turn_local"
+
+    turn_fo = int(m0_pipeline_ref.get("frame_offset", 0) or 0)
+
+    def _freeze_absolute(pose_base: int, *, cursor_tag: str) -> tuple[int, str]:
+        m0_pipeline_ref["pose_base_frame"] = int(pose_base)
+        m0_pipeline_ref["pose_clock_mode"] = "absolute"
+        ssot = m0_pipeline_ref.get("pose_base_ssot")
+        if isinstance(ssot, dict):
+            ssot["last_good"] = int(pose_base)
+            ssot["last_good_fo"] = int(turn_fo)
+        print(
+            "[sync][B5_POSE_BASE]",
+            f"pose_base_frame={int(pose_base)}",
+            f"bg_cursor={cursor_tag}",
+            f"mode=absolute",
+            f"frame_offset={int(turn_fo)}",
+            f"step_ms={int(m0_pipeline_ref.get('step_ms', 40) or 40)}",
+            flush=True,
+        )
+        return int(pose_base), "absolute"
+
+    def _pending(tag: str, *, info: dict[str, Any] | None = None) -> tuple[int, str]:
+        if not m0_pipeline_ref.get("pose_base_pending_logged"):
+            m0_pipeline_ref["pose_base_pending_logged"] = True
+            parts = [
+                "[sync][B5_POSE_BASE]",
+                "pose_base_frame=pending",
+                f"bg_cursor={tag}",
+                "mode=turn_local",
+            ]
+            if info is not None:
+                cfo = info.get("frame_offset")
+                cfo_s = str(int(cfo)) if cfo is not None else "missing"
+                parts.extend(
+                    [
+                        f"bg_pos={int(info['bg_pos'])}",
+                        f"ideal_base_frame={int(info['ideal_base_frame'])}",
+                        f"cursor_fo={cfo_s}",
+                    ]
+                )
+            parts.extend(
+                [
+                    f"frame_offset={int(turn_fo)}",
+                    f"step_ms={int(m0_pipeline_ref.get('step_ms', 40) or 40)}",
+                ]
+            )
+            print(*parts, flush=True)
+        return 0, "turn_local"
+
+    def _cursor_fo_aligned(info: dict[str, Any]) -> bool:
+        """True only when cursor fo is known and equals this turn fo.
+
+        Legacy cursor without fo: allow only turn_fo==0 (T1) so fo↑ turns
+        never freeze on stale prior-turn PLAYING audio.
+        """
+        cfo = info.get("frame_offset")
+        if cfo is None:
+            return int(turn_fo) == 0
+        return int(cfo) == int(turn_fo)
+
+    def _snapshot_unlocked() -> tuple[int, str]:
+        mode_i = m0_pipeline_ref.get("pose_clock_mode")
+        existing_i = m0_pipeline_ref.get("pose_base_frame")
+        if mode_i == "absolute" and existing_i is not None:
+            return int(existing_i), "absolute"
+        if mode_i == "turn_local":
+            return 0, "turn_local"
+
+        info = _read_bg_cursor_info_retry(m0_pipeline_ref.get("bg_cursor_file"))
+        if info is not None:
+            bg_mode = str(info.get("bg_mode") or "seq")
+            # B5hf2: prior-turn PLAYING audio must not freeze the new fo.
+            if not _cursor_fo_aligned(info):
+                return _pending("fo_wait", info=info)
+            # Freeze only on PLAYING/audio cursor (= RELOCK-aligned ideal_base).
+            if bg_mode == "audio":
+                return _freeze_absolute(
+                    int(info["ideal_base_frame"]),
+                    cursor_tag="ok_audio",
+                )
+            # Idle/seq: do not freeze; provisional turn-local until audio RELOCK.
+            return _pending("seq_wait", info=info)
+
+        # Missing after retry: same-fo last-good only; else provisional (never silent 0).
+        ssot = m0_pipeline_ref.get("pose_base_ssot")
+        last_good = None
+        last_good_fo = None
+        if isinstance(ssot, dict) and ssot.get("last_good") is not None:
+            try:
+                last_good = int(ssot.get("last_good"))
+            except Exception:
+                last_good = None
+            try:
+                if ssot.get("last_good_fo") is not None:
+                    last_good_fo = int(ssot.get("last_good_fo"))
+            except Exception:
+                last_good_fo = None
+        if (
+            last_good is not None
+            and last_good >= 0
+            and last_good_fo is not None
+            and int(last_good_fo) == int(turn_fo)
+        ):
+            return _freeze_absolute(int(last_good), cursor_tag="missing_last_good")
+        # Cross-turn / unknown-fo missing: keep provisional so later ok_audio can freeze.
+        return _pending("missing_wait")
+
+    # N>1: first chunk race — serialize snapshot (render runs outside claim lock).
+    lock = m0_pipeline_ref.get("lock")
+    if lock is not None:
+        with lock:
+            return _snapshot_unlocked()
+    return _snapshot_unlocked()
+
+
 def _slice_shift_timeline(raw: Any, t0_ms: int, t1_ms: int) -> Any:
     """Slice [t0_ms, t1_ms) and shift to local t=0.
 
@@ -931,6 +1155,8 @@ def _create_m0_pipeline_ref(
     m0_worker_ports: list[int] | None = None,
     inline_emo_id: str | None = None,
     close_mouth_id: int = 0,
+    bg_cursor_file: Path | None = None,
+    pose_base_ssot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     chunks_root = work_dir / "stream_chunks"
     chunks_root.mkdir(parents=True, exist_ok=True)
@@ -978,6 +1204,12 @@ def _create_m0_pipeline_ref(
         "m0_worker_port": (int(ports[0]) if ports else m0_worker_port),
         "inline_emo_id": inline_emo_id,
         "close_mouth_id": int(close_mouth_id),
+        # Phase B5/B5hf2: fo-aligned PLAYING ideal_base freeze; else provisional.
+        "bg_cursor_file": Path(bg_cursor_file).resolve() if bg_cursor_file else None,
+        "pose_base_frame": None,
+        "pose_clock_mode": None,
+        "pose_base_pending_logged": False,
+        "pose_base_ssot": pose_base_ssot if isinstance(pose_base_ssot, dict) else {"last_good": None},
     }
 
 
@@ -1005,7 +1237,20 @@ def _m0_pipeline_render_one_chunk_sync(
     expr_chunk_json = cdir / "expr.chunk.json"
 
     t_slice0 = time.perf_counter()
-    pose_chunk = _slice_shift_timeline(m0_pipeline_ref["pose_obj"], t0_ms, t1_ms)
+    # Phase B5/B5hf2: pose follows fo-aligned PLAYING ideal_base; mouth turn-local.
+    pose_base, pose_clock_mode = _ensure_pose_base_frame(m0_pipeline_ref)
+    if pose_clock_mode == "turn_local":
+        pose_t0_ms, pose_t1_ms = int(t0_ms), int(t1_ms)
+    else:
+        pose_t0_ms, pose_t1_ms = _pose_abs_window_ms(
+            t0_ms=int(t0_ms),
+            t1_ms=int(t1_ms),
+            pose_base_frame=int(pose_base),
+            step_ms=int(step_ms),
+        )
+    pose_chunk = _slice_shift_timeline(
+        m0_pipeline_ref["pose_obj"], pose_t0_ms, pose_t1_ms
+    )
     mouth_chunk = _slice_shift_timeline(mouth_obj, t0_ms, t1_ms)
 
     effective_emo_id = m0_pipeline_ref.get("inline_emo_id")

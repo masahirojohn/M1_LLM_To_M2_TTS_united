@@ -5115,6 +5115,7 @@ def _start_virtualcam(
     bg_override_file: Path | None = None,
     playback_state_file: Path | None = None,
     sync_meta_file: Path | None = None,
+    bg_cursor_file: Path | None = None,
     step_ms: int = 40,
     frame_offset: int = 0,
 ) -> subprocess.Popen:
@@ -5158,6 +5159,13 @@ def _start_virtualcam(
             [
                 "--sync_meta_file",
                 str(Path(sync_meta_file).resolve()),
+            ]
+        )
+    if bg_cursor_file is not None:
+        cmd.extend(
+            [
+                "--bg_cursor_file",
+                str(Path(bg_cursor_file).resolve()),
             ]
         )
 
@@ -5582,6 +5590,9 @@ async def _run(args: argparse.Namespace) -> int:
     sync_dir.mkdir(parents=True, exist_ok=True)
     playback_state_file = sync_dir / "playback_state.json"
     virtualcam_sync_meta_file = sync_dir / "virtualcam_sync_meta.json"
+    # Phase B5/B5hf2: VirtualCam publishes bg cursor+fo; M0 freezes fo-aligned ideal_base.
+    bg_cursor_file = sync_dir / "bg_cursor.json"
+    pose_base_ssot: dict[str, Any] = {"last_good": None, "last_good_fo": None}
     _write_virtualcam_sync_meta(
         virtualcam_sync_meta_file,
         frame_offset=0,
@@ -5628,6 +5639,7 @@ async def _run(args: argparse.Namespace) -> int:
             bg_override_file=bg_override_file,
             playback_state_file=playback_state_file,
             sync_meta_file=virtualcam_sync_meta_file,
+            bg_cursor_file=bg_cursor_file,
             step_ms=int(args.step_ms),
             frame_offset=0,
         )
@@ -6413,6 +6425,8 @@ async def _run(args: argparse.Namespace) -> int:
                         else None
                     ),
                     close_mouth_id=int(args.mouth_close_id),
+                    bg_cursor_file=bg_cursor_file,
+                    pose_base_ssot=pose_base_ssot,
                 )
                 turn_state["m0_pipeline_ref"] = m0_pipeline_ref
                 print(

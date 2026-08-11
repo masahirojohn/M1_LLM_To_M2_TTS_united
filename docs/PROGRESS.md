@@ -1400,8 +1400,12 @@
 | B3 | PLAYING 中 `played_audio_ms→BG frame` 実装 | `pass` | 2026-08-09（Pass-with-followup→B3hf） |
 | B3hf | BG 固着／playback_state 読取競合 Hotfix | `pass` | 2026-08-10（Pass-with-followup→B3hf2） |
 | B3hf2 | Turn 先頭 bg_pos 固着／境界スナップショット | `pass` | 2026-08-10 |
-| B4 | T2 残ズレ：pose／幾何切り分け（分析のみ） | `pending` | —（今やる） |
-| （予約） | OBS 制御 | — | B4 で A（または runtime でない）確認後に可。Colab 完了待ち不要 |
+| B4 | T2 残ズレ：pose／幾何切り分け（分析のみ） | `pass` | 2026-08-10（主因 **B**） |
+| B5 | pose スライス時計を BGV 継続 index へ結ぶ | `pass` | 2026-08-11（主観 Fail・方式 Keep→B5hf） |
+| B5hf | pose_base snapshot／missing→0 Hotfix | `pass` | 2026-08-11（Pass-with-defer→B5hf2） |
+| B5hf2 | ターン境界の誤 pose_base freeze | `pass` | 2026-08-11 |
+| （任意） | T2 高速帯の数フレームラグ詰め | — | バックログ。必須 Hotfix ではない |
+| （予約） | OBS 制御 | — | **今から発行可**（B5 系主観完了。顔ズレ本線は閉じた前提） |
 | （予約） | OBS 制御（BGM／背景等） | — | BGV 本線後 |
 
 ### 当面の非本線（今は実装させない）
@@ -1868,10 +1872,116 @@
 - playlist／速度補正／口 FG drop／ジッタ／IDLE 廃止、OBS 実装（B4 判定後）
 
 **Pass 基準:**
-- [ ] A/B/C を一つに確定（根拠付き）
-- [ ] 残ズレ帯の照合表
-- [ ] 次手提案 3 行（実装しない）
-- [ ] コード変更なしが原則
+- [x] A/B/C を一つに確定（根拠付き）
+- [x] 残ズレ帯の照合表
+- [x] 次手提案 3 行（実装しない）
+- [x] コード変更なしが原則
+
+**子報告要約（2026-08-10）:**
+- **B 確定**（M0 適用／pose インデックス）。A 否定（pose[i]↔BGV i 整合）。C 否定（B3hf2 sync 維持）。
+- T2: BGV=`bg_pos=274+audio/40` なのに M0 は turn ローカル `pose[audio/40]`。`p_use.ty−p_bg.ty` absmean≈41.5。
+
+**親判定（2026-08-10）:**
+- **Pass（分析）。** 主因 B。
+- 次=**B5** pose 適用修正。資産再生成は本因対応にしない。OBS は **B5 後**。待ち時間 RELOCK ズレはバックログ。
+
+---
+
+## Phase B5: pose スライス時計を BGV 継続 index へ結ぶ
+
+**目的:** turn ローカル `t_ms=0` 起点の pose 適用をやめ、表示中 BGV（`bg_pos` / `frame_offset` 相当の絶対 index／絶対 t_ms）と pose を一致させ、T2 上下ズレを解消する。
+
+**前提（B4）:**
+- ETL `pose.json` 資産そのものは主因ではない（A 否定）
+- BGV runtime sync は閉じた前提（C 否定・方式 A Keep）
+- Colab／pose 再生成は本因対応にしない
+
+**スコープ:**
+1. 実コードで「誰が turn ローカル pose スライスを切っているか」を特定（M0 / session_loop / virtualcam の適用点）
+2. **最小修正:** pose 参照を BGV 継続 index（または等価な絶対 t_ms）へ結ぶ。等価なら親承認可能な別手段可
+3. Before/After: T2 帯で `pose_i ≈ bg_pos`（または ty 差が主観帯で縮小）をログ／数値で示す
+4. 短回帰: 方式2／図A／N=2／`--no-fast_inmemory`／IDLE_BG_ADVANCE／B3 sync Keep 非破壊
+5. 主観: T2 上下ズレ改善（親または子）
+
+**スコープ外:**
+- pose 資産のフル再生成を本因対応にする、Colab 改修、OBS 実装
+- playlist／速度補正／口 FG drop／ジッタ延長／IDLE 廃止
+- 待ち時間 RELOCK 別件の本線化
+
+**Pass 基準:**
+- [x] 適用点特定＋修正（最小）
+- [x] T2 定量改善（pose↔bg 一致または ty 差縮小）— ideal lock で ty absmean 0
+- [x] 短回帰・Keep 非破壊
+- [ ] 主観で T2 残ズレ改善 → **Fail**（悪化。方式は正しい）
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-11）:**
+- 方式: `bg_cursor.json` → turn 初回 `pose_base_frame` → pose のみ絶対 t_ms。mouth は turn 局所のまま。
+- 定量: T2 ideal lock で ty 差 0。selfcheck 群 PASS。
+- 主観 Fail（232331／232453）: T1 で idle 初回 freeze が RELOCK と恒常 Δ≈−27；T4 で `bg_cursor=missing`→`pose_base=0`（gap 数百）。T2/T3 の turn RELOCK 時は gap≈−2 で方向正しい。
+
+**親判定（2026-08-11）:**
+- **主観 Fail／方式 Keep。** 正しい設計＝pose も BGV 継続絶対 index。悪化は snapshot／missing→0 の運用バグ。
+- 次=**B5hf**（下記）。方式破棄しない。検証不能時のみ B5 一時 Revert 可（親指示時）。
+- OBS・Colab・資産再生成は今やらない。
+
+---
+
+## Phase B5hf: pose_base snapshot／missing→0 Hotfix
+
+**目的:** B5 方式（pose＝BGV 継続絶対 index）を維持したまま、誤 `pose_base` 固定を潰し主観の上下ズレ悪化を戻す／改善する。
+
+**スコープ:**
+1. **cursor 欠落時 `pose_base=0` 禁止** — retry／last-good／失敗時は turn ローカルへ**明示**フォールバック（黙って 0 にしない）
+2. **T1:** idle 初回即 freeze やめ、PLAYING／RELOCK 系の `ideal_base`（≈`bg − audio/step`）へ寄せる（または等価）
+3. 回帰: 主観再測＋ターンごと `|B5_POSE_BASE − 直後 RELOCK bg|` を定量（数フレーム以内を目標）
+4. Keep: 方式 A／IDLE_BG_ADVANCE／B3hf2／図A／N=2／`--no-fast_inmemory`／品質凍結。mouth は turn 局所のまま
+
+**スコープ外:** 方式破棄、OBS、Colab／資産再生成、playlist／速度補正／口 FG drop／ジッタ延長／IDLE 廃止
+
+**Pass 基準:**
+- [x] missing→0 経路が閉じている（ログ根拠）
+- [x] T1 の恒常 Δ（idle freeze vs RELOCK）が解消／大幅縮小
+- [x] ターンごと |POSE_BASE−RELOCK| 定量表
+- [x] 主観: 前 B5 比で悪化なし／T2 残ズレ改善 — T1/T2/T4 OK、**T3 残**
+- [x] 短回帰・Keep 非破壊
+
+**子報告要約（2026-08-11）:**
+- missing→0 禁止（retry／last-good／`turn_local`）。`ok_audio` で ideal_base freeze。cursor に audio_ms／ideal_base 追加。
+- 主観 162517: T1/T2/T4 顔位置ほぼ一致。T3 のみ大ズレ。|gap| T1/T2/T4≈0–4、**T3≈156**（pose_base=301 vs RELOCK ideal=457）。
+- T3 根因: 前ターン PLAYING のまま新ターンが旧 cursor を `ok_audio` freeze → 後の enter_playing RELOCK と恒常Δ。
+
+**親判定（2026-08-11）:**
+- **Pass-with-defer。** Keep = B5hf。次=**B5hf2**（ターン境界の誤 freeze）。方式破棄しない。OBS・資産再生成はまだ不要。
+
+---
+
+## Phase B5hf2: ターン境界の誤 pose_base freeze
+
+**目的:** 前ターン PLAYING 残留 cursor を新ターンで即 `ok_audio` freeze しない。新 fo の RELOCK／整合後にだけ絶対 `pose_base` を固定する。
+
+**スコープ:**
+1. `ok_audio` freeze は **当ターン fo と cursor／RELOCK が整合した後のみ**（cursor に fo 付与、または fo↑後は当面 seq／provisional `turn_local`）
+2. ターン開始後、新 fo の `enter_playing`／`turn` RELOCK 前は freeze 禁止（provisional turn_local 維持）
+3. 短回帰＋主観: T3 相当（待ち短く前ターン PLAYING 残留）＋ BGV 上下大振幅帯
+4. Keep: 方式 A／IDLE_BG_ADVANCE／B3hf2／図A／N=2／`--no-fast_inmemory`／mouth turn 局所／B5 絶対 index 方式／B5hf missing→0 禁止
+
+**スコープ外:** 方式破棄、OBS、Colab／資産再生成、playlist／速度補正／口 FG drop／ジッタ／IDLE 廃止
+
+**Pass 基準:**
+- [x] T3 型 |POSE_BASE−RELOCK| が数フレーム級（ログ）
+- [x] T1/T2/T4 非回帰
+- [x] 主観で T3 大ズレ改善（親再測可）
+- [x] Keep 非破壊
+
+**子報告要約（2026-08-11）:**
+- cursor に `frame_offset`。`ok_audio` freeze は fo 一致時のみ。不一致は `fo_wait` provisional。
+- selfcheck: T3 指紋 |gap| 156→0。主観 164529: T1–T4 OK。T3 大ズレ閉鎖。T2 高速上下で数フレーム遅れ気味（|gap|≈4、必須 Hotfix なし）。
+
+**親判定（2026-08-11）:**
+- **Pass。** Keep = B5hf2。B5 系（絶対 index＋missing0＋fo 整合）クローズ可。
+- T2 数フレームラグは任意バックログ。方式破棄・資産再生成不要。
+- **OBS 本線を次に発行可**（顔ズレ解消目的ではない運用機能として）。
 
 ---
 
@@ -1999,3 +2109,8 @@
 | 2026-08-09 | Phase B3 Pass-with-followup。方式A Keep。Turn2 bg_pos固着→B3hf |
 | 2026-08-10 | Phase B3hf Pass-with-followup。二重読取閉鎖・T1停滞解消。T2先頭残→B3hf2 |
 | 2026-08-10 | Phase B3hf2 Pass。falsy-0 閉鎖。BGV runtime 同期クローズ可。次=B4 pose/幾何分析。OBSはB4後可 |
+| 2026-08-10 | B2–B3hf2 commit `87ecb2d` / tag `phase-b3-pass` |
+| 2026-08-10 | Phase B4 Pass。主因B（turnローカル pose）。次=B5 適用修正。OBSはB5後 |
+| 2026-08-11 | Phase B5 主観 Fail・方式 Keep。pose絶対indexは正しい。snapshot/missing0 →B5hf |
+| 2026-08-11 | Phase B5hf Pass-with-defer。T1/missing閉じ。T3境界誤freeze→B5hf2 |
+| 2026-08-11 | Phase B5hf2 Pass。fo整合でT3閉鎖。B5系クローズ可。OBS発行可。T2数フレームは任意BL |

@@ -224,6 +224,70 @@ def _read_json_file_retry(path: Path | None, *, attempts: int = 3) -> dict | Non
     return last
 
 
+def _write_bg_cursor(
+    path: Path | None,
+    *,
+    bg_pos: int,
+    bg_mode: str,
+    audio_ms: int | None = None,
+    step_ms: int = 40,
+    frame_offset: int | None = None,
+    last_written_key: tuple | None = None,
+) -> tuple | None:
+    """Phase B5/B5hf/B5hf2: publish continuing BGV index for pose slice clock.
+
+    Writes when bg_pos/mode/audio/fo signature changes (not 25Hz spam).
+    Includes ideal_base_frame≈bg−audio/step and frame_offset so M0 freezes
+    pose_base only after the current turn fo aligns with VirtualCam RELOCK.
+    Returns last successfully published key (or prior last_written_key on skip/fail).
+    """
+    if path is None:
+        return last_written_key
+    pos = int(bg_pos)
+    if pos < 0:
+        return last_written_key
+    mode = str(bg_mode or "seq")
+    step = max(1, int(step_ms))
+    a_ms = int(audio_ms) if audio_ms is not None else None
+    if a_ms is None:
+        ideal = int(pos)
+        a_pub = -1
+    else:
+        ideal = int(pos) - int(a_ms) // int(step)
+        a_pub = int(a_ms)
+    fo_pub = int(frame_offset) if frame_offset is not None else -1
+    key = (int(pos), str(mode), int(a_pub), int(ideal), int(fo_pub))
+    if last_written_key is not None and tuple(last_written_key) == key:
+        return last_written_key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "type": "bg_cursor",
+        "bg_pos": int(pos),
+        "bg_mode": str(mode),
+        "audio_ms": int(a_pub),
+        "step_ms": int(step),
+        "ideal_base_frame": int(ideal),
+        "frame_offset": int(fo_pub),
+        "updated_mono_s": float(time.monotonic()),
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(path)
+        return key
+    except Exception:
+        try:
+            path.write_text(text, encoding="utf-8")
+            return key
+        except Exception:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return last_written_key
+
+
 def _resolve_ssot_target(
     *,
     playback_state: dict | None,
@@ -501,6 +565,11 @@ def main() -> int:
         help="session_loop JSON: frame_offset / base_played_samples / step_ms.",
     )
     ap.add_argument(
+        "--bg_cursor_file",
+        default=None,
+        help="Phase B5: publish continuing bg_pos for M0 pose slice clock.",
+    )
+    ap.add_argument(
         "--step_ms",
         type=int,
         default=40,
@@ -544,6 +613,12 @@ def main() -> int:
     sync_meta_file = (
         Path(args.sync_meta_file).resolve() if args.sync_meta_file else None
     )
+    bg_cursor_file = (
+        Path(args.bg_cursor_file).resolve() if args.bg_cursor_file else None
+    )
+    if bg_cursor_file is None and sync_meta_file is not None:
+        # Default beside sync_meta so session_loop can share one sync/ dir.
+        bg_cursor_file = sync_meta_file.parent / "bg_cursor.json"
 
     cap = _open_bg_capture(bg_video)
 
@@ -558,6 +633,7 @@ def main() -> int:
     sent = 0
     bg_read_n = 0
     bg_pos = -1
+    bg_cursor_last_written: tuple | None = None
     bg_total = _bg_frame_count(cap)
     last_rgb = None
     last_fg = None
@@ -595,6 +671,7 @@ def main() -> int:
         f"mode={'audio_ms' if ssot_enabled else 'idle_only_no_playback_state'}",
         f"playback_state_file={playback_state_file}",
         f"sync_meta_file={sync_meta_file}",
+        f"bg_cursor_file={bg_cursor_file}",
         f"step_ms={int(args.step_ms)}",
         "sequential_idx=disabled",
         flush=True,
@@ -874,6 +951,29 @@ def main() -> int:
                     continue
                 raise RuntimeError("failed to read bg frame")
             bg_read_n += 1
+            bg_cursor_audio_ms = (
+                int(b3_a_ms_bg)
+                if str(b3_bg_mode) == "audio" and b3_a_ms_bg is not None
+                else None
+            )
+            # B5hf2: publish applied/playing fo so M0 rejects stale prior-turn audio cursor.
+            if tick_target is not None:
+                bg_cursor_fo: int | None = int(
+                    tick_target.get("frame_offset", 0) or 0
+                )
+            elif applied_sync_meta is not None:
+                bg_cursor_fo = int(applied_sync_meta.get("frame_offset", 0) or 0)
+            else:
+                bg_cursor_fo = int(args.frame_offset)
+            bg_cursor_last_written = _write_bg_cursor(
+                bg_cursor_file,
+                bg_pos=int(bg_pos),
+                bg_mode=str(b3_bg_mode),
+                audio_ms=bg_cursor_audio_ms,
+                step_ms=int(args.step_ms),
+                frame_offset=bg_cursor_fo,
+                last_written_key=bg_cursor_last_written,
+            )
 
             bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
 
