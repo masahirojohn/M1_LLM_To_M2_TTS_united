@@ -1403,17 +1403,31 @@
 | B4 | T2 残ズレ：pose／幾何切り分け（分析のみ） | `pass` | 2026-08-10（主因 **B**） |
 | B5 | pose スライス時計を BGV 継続 index へ結ぶ | `pass` | 2026-08-11（主観 Fail・方式 Keep→B5hf） |
 | B5hf | pose_base snapshot／missing→0 Hotfix | `pass` | 2026-08-11（Pass-with-defer→B5hf2） |
-| B5hf2 | ターン境界の誤 pose_base freeze | `pass` | 2026-08-11 |
-| （任意） | T2 高速帯の数フレームラグ詰め | — | バックログ。必須 Hotfix ではない |
-| （予約） | OBS 制御 | — | **今から発行可**（B5 系主観完了。顔ズレ本線は閉じた前提） |
-| （予約） | OBS 制御（BGM／背景等） | — | BGV 本線後 |
+| B5hf2 | ターン境界の誤 pose_base freeze | `pass` | 2026-08-11（Bライン **Pass-with-defer**・運用 Keep） |
+| （defer） | B 仕上げ（新BGV/新pose回帰・数フレームラグ） | — | Colab高精度pose後 or ズレ再発時。方式破棄しない |
+| O1 | OBS WebSocket＋管理画面＋背景静止画/BGM切替 | `pass` | 2026-08-12（flat local Hotfix Keep） |
+| O2 | 当てフリ（OBS事前配置ソースの見せ消し） | `pass` | 2026-08-13 |
+| O3 | エージェントスミス＋音声フィルタ | `pass` | 2026-08-14 |
+| （後続可） | スミス増殖加速（順次表示・delay短縮） | — | 管理画面側のみ。session_loop sleep 禁止 |
+
+### Bライン申し送り（2026-08-11・Pass-with-defer）
+
+- 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／IDLE_BG_ADVANCE 等（tag `phase-b5-pass`）
+- 残差（今はやらない）: 高速上下帯の数フレーム級ラグ；代表 BGV 1本のみで新資産は未回帰
+- 再開条件: Colab 高精度 pose 後、またはズレ再発時。方式破棄せず回帰＋必要ならラグ詰めのみ
+- **VirtualCam 内 BGV（猫の体・合成用動画）≠ OBS「背景」**。後者は OBS 側静止画（将来は OBS 側背景動画もありうる）。OBS 制御は VirtualCam BGV を切替対象にしない
+
+### OBS 音声ルーティング（親定義・子へ固定）
+
+**AI 音声**は現行 player→PC 再生デバイスのまま OBS が音声ソースとして拾う。**BGM**は OBS メディアソースのみを WebSocket で切替し、AI PCM／VirtualCam／M0 に混ぜない。
 
 ### 当面の非本線（今は実装させない）
 
 - API `end→first` 短縮
-- OBS BGM／背景切替
+- B 仕上げ（多BGV総当たり・Colab待ち仕上げ）
 - Phase12 系の idle silent PCM／縫い目の品質本線化
-- BGV 同期の実装修正（B1 は調査のみ。300ms 決め打ち禁止）
+- 当てフリの Python scale／座標拡大（OBS 事前配置見せ消しのみ）
+- Slack トリガ本番化（本番は管理画面）
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -1979,9 +1993,120 @@
 - selfcheck: T3 指紋 |gap| 156→0。主観 164529: T1–T4 OK。T3 大ズレ閉鎖。T2 高速上下で数フレーム遅れ気味（|gap|≈4、必須 Hotfix なし）。
 
 **親判定（2026-08-11）:**
-- **Pass。** Keep = B5hf2。B5 系（絶対 index＋missing0＋fo 整合）クローズ可。
-- T2 数フレームラグは任意バックログ。方式破棄・資産再生成不要。
-- **OBS 本線を次に発行可**（顔ズレ解消目的ではない運用機能として）。
+- **Pass-with-defer（Bライン運用 Keep）。** B5hf2 まで合格。仕上げは Colab/新資産後に再開可。
+- 次本線=**OBS 制御（O1→O2→O3）**。
+
+---
+
+## Phase O1: OBS WebSocket＋管理画面＋背景静止画/BGM切替
+
+**目的:** 既存管理画面（Streamlit／`battle_runtime_admin_api`）から OBS WebSocket で、**OBS側背景静止画**と **BGM** を配信中に指定・切替できる。
+
+**確定前提:**
+- OBS「背景」＝OBS 側静止画ソース（将来 OBS 側背景動画もありうる）。**VirtualCam 内 BGV（M0 合成用・透過）は切替対象外・触らない**
+- 音声: **AI＝player→PC デバイスを OBS が拾う／BGM＝OBS メディアソースのみ**（AI PCM に混ぜない）
+- 本番トリガ＝管理画面（Slack 例は参考のみ）。パスワード等は設定化（ハードコード禁止）
+- session_loop を `sleep` でブロックしない（OBS I/O は別タスク／プロセス／非ブロッキング）
+
+**スコープ:**
+1. `obsws-python`（または同等）で OBS WebSocket 接続（host/port/password 設定化）
+2. 管理画面に背景静止画・BGM の一覧指定／切替 UI（既存 panel 共通化）
+3. メディア／画像ファイル配置方針（リポ内 or 設定パス）と OBS ソース名マッピング
+4. 接続失敗時の安全なログ／UI 表示（Live パイプラインは継続）
+5. 短確認: 切替が OBS に反映。図A／方式2／Bライン／VirtualCam・pose・口形 **非触**
+
+**スコープ外（O2/O3）:** 当てフリ、スミス、音声フィルタ、Python scale、VirtualCam BGV 切替
+
+**Pass 基準:**
+- [x] WebSocket 接続（設定化）＋管理画面から背景静止画切替
+- [x] 管理画面から BGM 切替（OBS メディアソース）
+- [x] AI/BGM ルーティング遵守・session_loop 非ブロック・B/VCam 非破壊
+- [x] 親向けサマリーのみ。O2 提案 3 行以内
+
+**子報告要約（2026-08-12〜13）:**
+- Admin Streamlit→OBS WS 直結。`obs_control_config.json`＋local／env。既定ソース `OBS_BG_Still`／`OBS_BGM`。
+- 実機: 背景静止画／BGM 切替成功。flat local の password 非マージ → Hotfix（websocket.* 正規化）。example から実パスワード除去。
+- session_loop／VirtualCam／B 非触。
+
+**親判定（2026-08-13）:**
+- **Pass。** Keep = O1＋local schema Hotfix。パスワードは gitignore local か env（コミット禁止）。
+- 次=**O2** 当てフリ（事前配置見せ消しのみ）。
+
+---
+
+## Phase O2: 当てフリ（OBS 事前配置ソースの見せ消し）
+
+**目的:** AI 発話開始に合わせ、OBS 上の通常ソース⇔事前ドアップソースを **見せ消しのみ**で切替する。default ON・管理画面で OFF。
+
+**確定前提:**
+- Python scale／座標拡大 **禁止**。M0／VirtualCam で拡大しない
+- OBS に通常用・ズーム用を事前配置。制御は可視性切替のみ
+- トリガ: AI 発話開始（既存 first_audio／PLAYING 相当の観測点を子が特定→最小配線）。本番 UI は管理画面（ON/OFF）
+- Slack 本番トリガ禁止。session_loop を sleep でブロックしない
+- VirtualCam 内 BGV・Bライン・口形パイプライン非触
+- 音声ルーティングは O1 どおり（AI＝player→OBS拾い／BGM＝OBS メディア）
+
+**スコープ:**
+1. 設定に通常／ズームソース名＋当てフリ default ON
+2. 管理画面トグル OFF で無効化
+3. AI 発話開始→ズームソース表示／通常非表示（終了または次境界での戻し方針を短く決めて実装）
+4. OBS 未接続時は失敗しても Live 継続
+5. 短確認: ON で発話開始時に切替／OFF で切替なし。O1 背景/BGM 非破壊
+
+**スコープ外:** スミス（O3）、増殖加速、Python transform アニメ、B 仕上げ
+
+**Pass 基準:**
+- [x] default ON で発話開始時に見せ消し切替（実機または同等確認）
+- [x] 管理画面 OFF で無効
+- [x] scale/座標拡大なし・session_loop 非ブロック・B/VCam 非破壊
+- [x] 親向けサマリー＋O3 申し送り 3 行
+
+**子報告要約（2026-08-13）:**
+- IN=`first_audio`（bootstrap/warmup 除外）→ `to_thread` 見せ消し。OUT=ターン終了。live overlay OFF で無効＋即通常戻し。
+- 実機 `sess_phase11_subj_20260813_152850`: turn1–4 すべて zoomed=1→0。OFF テストも正常。
+- Keep: 見せ消しのみ／O1 非触／B・VCam・図A 非破壊。
+
+**親判定（2026-08-13）:**
+- **Pass。** Keep = O2。次=**O3** スミス＋音声フィルタ（増殖加速は後続可）。
+
+---
+
+## Phase O3: エージェントスミス＋音声フィルタ
+
+**目的:** 管理画面 **1 ボタン**で、OBS 事前配置クローンソースを表示し、OBS 音声フィルタを ON にして「群唱感」を出す。
+
+**確定前提:**
+- クローンは OBS 事前配置（同一 VirtualCam／映像ソースの参照コピー想定）。Python で動的ソース生成は必須にしない
+- 制御は可視性＋フィルタ enable（必要なら最小の transform は親承認後のみ。連続 scale アニメ禁止）
+- 当てフリ `first_audio` トリガは流用しない（明示ボタン／コマンド）
+- AI PCM と BGM メディアは混ぜない（O1 ルーティング維持）
+- session_loop を sleep でブロックしない（増殖間隔は管理画面プロセス／別タスク側）
+- VirtualCam 内 BGV・Bライン・口形・図A・方式2 非触
+- 増殖加速（delay 短縮）は **後続可**（O3 では固定間隔 or 全表示の最小版で可）
+
+**スコープ:**
+1. 設定: クローンソース名リスト＋音声ソース名＋フィルタ名（例「スミス効果」）
+2. 管理画面 1 ボタン: フィルタ ON＋クローンを順に（または一斉に）表示
+3. OFF／リセットボタン（表示解除＋フィルタ OFF）推奨
+4. OBS 未接続時は失敗しても Live 継続
+5. O1/O2 非破壊の確認
+
+**スコープ外:** 増殖加速の本格演出、Slack 本番トリガ、B 仕上げ、当てフリ改修
+
+**Pass 基準:**
+- [x] 1 ボタンでクローン表示＋音声フィルタ ON（実機確認）
+- [x] リセット／OFF で元に戻せる
+- [x] session_loop 非ブロック・AI/BGM 非混線・B/VCam/O1/O2 非破壊
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-14）:**
+- 最小版: 一斉表示＋`SetSourceFilterEnabled`。`audio_source` は AI 拾いのみ（BGM 拒否）。session_loop／first_audio 非流用。
+- 実機 `sess_phase11_subj_20260814_143226`: 音声・リップ OK。O2 当てフリ維持。turn4 でスミス完了（admin WS）。
+- 既定フィルタ名 **`Smith_Effect`**（ASCII）。OBS 側も同名に揃える。
+
+**親判定（2026-08-14）:**
+- **Pass。** Keep = O3。OBS 本線（O1–O3）クローズ可。
+- 増殖加速は後続可（管理画面側のみ）。次本線は別途親定義（B仕上げ／API end→first 等は今強制しない）。
 
 ---
 
@@ -2114,3 +2239,8 @@
 | 2026-08-11 | Phase B5 主観 Fail・方式 Keep。pose絶対indexは正しい。snapshot/missing0 →B5hf |
 | 2026-08-11 | Phase B5hf Pass-with-defer。T1/missing閉じ。T3境界誤freeze→B5hf2 |
 | 2026-08-11 | Phase B5hf2 Pass。fo整合でT3閉鎖。B5系クローズ可。OBS発行可。T2数フレームは任意BL |
+| 2026-08-11 | B5〜B5hf2 commit `9b1466c` / tag `phase-b5-pass`。Bライン Pass-with-defer |
+| 2026-08-11 | 次本線=OBS。O1=WS+管理画面+背景静止画/BGM。O2=当てフリ見せ消し。O3=スミス。子プロンプト発行 |
+| 2026-08-13 | Phase O1 Pass。実切替OK＋flat local Hotfix Keep。次=O2 当てフリ |
+| 2026-08-13 | Phase O2 Pass。実機4ターン見せ消しOK＋OFF確認。Keep=first_audio IN／turn-end OUT。次=O3 スミス |
+| 2026-08-14 | Phase O3 Pass。スミス一斉表示＋Smith_Effect。OBS本線(O1–O3)クローズ可。増殖加速は後続 |

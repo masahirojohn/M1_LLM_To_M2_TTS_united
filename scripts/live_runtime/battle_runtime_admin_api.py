@@ -4,6 +4,22 @@ import json
 from pathlib import Path
 from typing import Any
 
+from scripts.live_runtime.obs_runtime_control import (
+    DEFAULT_ATEFURI_LIVE_FILE,
+    DEFAULT_CONFIG_FILE as DEFAULT_OBS_CONFIG_FILE,
+    DEFAULT_LOCAL_CONFIG_FILE as DEFAULT_OBS_LOCAL_CONFIG_FILE,
+    is_atefuri_enabled,
+    list_catalog_items,
+    load_obs_config,
+    parse_ws_settings,
+    probe_connection,
+    set_atefuri_zoom,
+    set_background_image,
+    set_bgm_media,
+    set_smith_effect,
+    write_atefuri_live_enabled,
+)
+
 
 DEFAULT_ROOT = Path(r"C:\dev\M1_LLM_To_M2_TTS_united")
 DEFAULT_CONTROL_FILE = DEFAULT_ROOT / "in" / "battle_control_live.txt"
@@ -255,3 +271,150 @@ def read_status(
         "event": read_text_file(event_file),
         "vad_profile": read_text_file(vad_profile_file),
     }
+
+
+def read_obs_admin_state(
+    *,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    """Load OBS catalog + connection probe for admin UI (never raises)."""
+    try:
+        cfg = load_obs_config(obs_config_file, obs_local_config_file)
+        backgrounds = list_catalog_items(cfg, "backgrounds")
+        bgm = list_catalog_items(cfg, "bgm")
+        sources = cfg.get("sources") or {}
+        ws = cfg.get("websocket") or {}
+        settings = parse_ws_settings(cfg)
+        atefuri = {
+            "enabled": is_atefuri_enabled(
+                config_file=obs_config_file,
+                local_config_file=obs_local_config_file,
+            ),
+            "enabled_default": settings.atefuri_enabled_default,
+            "normal_source": settings.atefuri_normal,
+            "zoom_source": settings.atefuri_zoom,
+            "scene": settings.atefuri_scene,
+            "live_file": str(DEFAULT_ATEFURI_LIVE_FILE),
+        }
+        smith = {
+            "clone_sources": list(settings.smith_clone_sources),
+            "audio_source": settings.smith_audio_source,
+            "filter_name": settings.smith_filter_name,
+            "scene": settings.smith_scene,
+        }
+        config_error = ""
+    except Exception as e:
+        backgrounds = []
+        bgm = []
+        sources = {}
+        ws = {}
+        atefuri = {
+            "enabled": True,
+            "enabled_default": True,
+            "normal_source": "",
+            "zoom_source": "",
+            "scene": "",
+            "live_file": str(DEFAULT_ATEFURI_LIVE_FILE),
+        }
+        smith = {
+            "clone_sources": [],
+            "audio_source": "",
+            "filter_name": "",
+            "scene": "",
+        }
+        config_error = f"{type(e).__name__}: {e}"
+
+    probe = probe_connection(
+        config_file=obs_config_file,
+        local_config_file=obs_local_config_file,
+    )
+    return {
+        "backgrounds": backgrounds,
+        "bgm": bgm,
+        "sources": sources,
+        "websocket": {
+            "host": ws.get("host", ""),
+            "port": ws.get("port", ""),
+            # never expose password to UI status
+            "password_set": bool(str(ws.get("password") or "")),
+        },
+        "probe": probe,
+        "config_error": config_error,
+        "config_file": str(obs_config_file),
+        "atefuri": atefuri,
+        "smith": smith,
+    }
+
+
+def write_obs_background(
+    *,
+    item_id: str,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    return set_background_image(
+        item_id=item_id,
+        config_file=obs_config_file,
+        local_config_file=obs_local_config_file,
+    )
+
+
+def write_obs_bgm(
+    *,
+    item_id: str,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    return set_bgm_media(
+        item_id=item_id,
+        config_file=obs_config_file,
+        local_config_file=obs_local_config_file,
+    )
+
+
+def write_atefuri_enabled(
+    *,
+    enabled: bool,
+    live_file: Path | str = DEFAULT_ATEFURI_LIVE_FILE,
+    restore_when_off: bool = True,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    """Admin toggle. OFF also restores normal source visibility (best-effort)."""
+    live = write_atefuri_live_enabled(bool(enabled), live_file=live_file)
+    restore: dict[str, Any] | None = None
+    if restore_when_off and not bool(enabled):
+        restore = set_atefuri_zoom(
+            zoomed=False,
+            config_file=obs_config_file,
+            local_config_file=obs_local_config_file,
+        )
+    return {"live": live, "restore": restore}
+
+
+def write_atefuri_zoom(
+    *,
+    zoomed: bool,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    return set_atefuri_zoom(
+        zoomed=zoomed,
+        config_file=obs_config_file,
+        local_config_file=obs_local_config_file,
+    )
+
+
+def write_smith_effect(
+    *,
+    active: bool,
+    obs_config_file: Path | str = DEFAULT_OBS_CONFIG_FILE,
+    obs_local_config_file: Path | str | None = DEFAULT_OBS_LOCAL_CONFIG_FILE,
+) -> dict[str, Any]:
+    """Admin smith start/reset. Visibility + filter only. Never raises."""
+    return set_smith_effect(
+        active=active,
+        config_file=obs_config_file,
+        local_config_file=obs_local_config_file,
+    )

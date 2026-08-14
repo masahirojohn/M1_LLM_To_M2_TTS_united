@@ -82,6 +82,118 @@ def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def _atefuri_is_live_turn(active_turn: Any) -> bool:
+    if isinstance(active_turn, bool):
+        return False
+    if isinstance(active_turn, int):
+        return True
+    if isinstance(active_turn, str) and active_turn.isdigit():
+        return True
+    return False
+
+
+_atefuri_cmd_seq = 0
+_atefuri_aio_lock: asyncio.Lock | None = None
+
+
+def _schedule_atefuri_zoom(*, zoomed: bool, turn: Any) -> None:
+    """OBS visibility only. Never await in the caller (receive loop / turn end)."""
+    global _atefuri_cmd_seq
+    _atefuri_cmd_seq += 1
+    seq = _atefuri_cmd_seq
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(
+        _atefuri_zoom_task(zoomed=zoomed, turn=turn, seq=seq),
+        name=f"atefuri_{int(bool(zoomed))}_{seq}",
+    )
+
+
+async def _atefuri_zoom_task(*, zoomed: bool, turn: Any, seq: int) -> None:
+    global _atefuri_aio_lock
+    if _atefuri_aio_lock is None:
+        _atefuri_aio_lock = asyncio.Lock()
+    async with _atefuri_aio_lock:
+        if (not zoomed) and seq != _atefuri_cmd_seq:
+            print(
+                "[atefuri] skip stale restore",
+                f"seq={seq}",
+                f"cur={_atefuri_cmd_seq}",
+                f"turn={turn}",
+                flush=True,
+            )
+            return
+        try:
+            try:
+                from obs_runtime_control import set_atefuri_zoom
+            except ImportError:
+                from scripts.live_runtime.obs_runtime_control import (
+                    set_atefuri_zoom,
+                )
+            result = await asyncio.to_thread(set_atefuri_zoom, zoomed=bool(zoomed))
+            ok = bool(result.get("ok"))
+            err = str(result.get("error") or "")
+            print(
+                "[atefuri]",
+                f"zoomed={int(bool(zoomed))}",
+                f"turn={turn}",
+                f"ok={int(ok)}",
+                f"scene={result.get('scene') or ''}",
+                f"err={err}" if not ok else "err=",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                "[atefuri][WARN]",
+                f"zoomed={int(bool(zoomed))}",
+                f"turn={turn}",
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
+
+
+def _maybe_arm_atefuri_on_first_audio(turn_state: dict[str, Any]) -> None:
+    """Hook at first_audio_sec SSOT. Skip bootstrap/warmup. Do not block."""
+    active_turn = turn_state.get("active_turn")
+    if not _atefuri_is_live_turn(active_turn):
+        return
+    if turn_state.get("atefuri_armed"):
+        return
+    try:
+        try:
+            from obs_runtime_control import is_atefuri_enabled
+        except ImportError:
+            from scripts.live_runtime.obs_runtime_control import is_atefuri_enabled
+        if not is_atefuri_enabled():
+            print(
+                "[atefuri] skip (disabled)",
+                f"turn={active_turn}",
+                flush=True,
+            )
+            return
+    except Exception as e:
+        print(
+            f"[atefuri][WARN] enabled_check {type(e).__name__}: {e}",
+            flush=True,
+        )
+        return
+    turn_state["atefuri_armed"] = True
+    _schedule_atefuri_zoom(zoomed=True, turn=active_turn)
+
+
+def _maybe_restore_atefuri_on_turn_end(
+    turn_state: dict[str, Any],
+    *,
+    turn: Any,
+) -> None:
+    if not turn_state.get("atefuri_armed"):
+        return
+    turn_state["atefuri_armed"] = False
+    _schedule_atefuri_zoom(zoomed=False, turn=turn)
+
+
 def _decode_audio_bytes(data: bytes) -> bytes:
     if not data:
         return b""
@@ -4594,6 +4706,7 @@ async def _receive_loop(
                                 f"turn={active_turn}",
                                 flush=True,
                             )
+                            _maybe_arm_atefuri_on_first_audio(turn_state)
 
                         playback_audio = audio
                         if drop_initial_audio_bytes_remaining > 0:
@@ -7064,6 +7177,8 @@ async def _run(args: argparse.Namespace) -> int:
                 battle_file_pending_lines.clear()
 
             m0_result_box.clear()
+
+            _maybe_restore_atefuri_on_turn_end(turn_state, turn=turn_no)
 
             return bool(turn_audio_ok)
 

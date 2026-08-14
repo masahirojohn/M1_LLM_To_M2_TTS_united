@@ -1,0 +1,52 @@
+{
+  "websocket": {
+    "host": "localhost",
+    "port": 4455,
+    "password": "",
+    "timeout_sec": 3.0
+  },
+  "sources": {
+    "background_image": "OBS_BG_Still",
+    "bgm_media": "OBS_BGM",
+    "atefuri_normal": "OBS_AI_Normal",
+    "atefuri_zoom": "OBS_AI_Zoom"
+  },
+  "atefuri": {
+    "enabled": true,
+    "scene": ""
+  },
+  "smith": {
+    "clone_sources": [
+      "OBS_Smith_1",
+      "OBS_Smith_2",
+      "OBS_Smith_3"
+    ],
+    "audio_source": "OBS_AI_Audio",
+    "filter_name": "Smith_Effect",
+    "scene": ""
+  },
+  "backgrounds": [
+    {
+      "id": "bg_default",
+      "label": "Default",
+      "path": "media/obs_bg/bg_default.png"
+    },
+    {
+      "id": "bg_battle",
+      "label": "Battle",
+      "path": "media/obs_bg/bg_battle.png"
+    }
+  ],
+  "bgm": [
+    {
+      "id": "bgm_calm",
+      "label": "Calm",
+      "path": "media/obs_bgm/bgm_calm.wav"
+    },
+    {
+      "id": "bgm_battle",
+      "label": "Battle",
+      "path": "media/obs_bgm/bgm_battle.wav"
+    }
+  ]
+}

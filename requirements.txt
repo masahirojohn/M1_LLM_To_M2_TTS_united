@@ -5,3 +5,5 @@ PyYAML
 simplejson
 sounddevice
 pyvirtualcam
+obsws-python
+streamlit

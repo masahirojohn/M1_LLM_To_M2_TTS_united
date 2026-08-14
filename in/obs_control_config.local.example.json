@@ -1,0 +1,5 @@
+{
+  "websocket": {
+    "password": "YOUR_OBS_WEBSOCKET_PASSWORD"
+  }
+}

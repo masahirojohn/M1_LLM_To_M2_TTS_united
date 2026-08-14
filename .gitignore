@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 .env
+in/obs_control_config.local.json
+in/obs_atefuri_live.json
 
 out/
 **/out/
