@@ -874,11 +874,142 @@ def _inline_emo_id_to_expression(emo_id: str | None) -> str:
     return mapping.get(str(emo_id or "1_1"), "happy")
 
 
+# Phase X1b: same intervals as X1 / M3 `_insert_blinks`. Live chunks are ~120ms,
+# so blinks are selected by absolute playback time (not +interval inside a chunk).
+_SLEEPY_EMO_IDS = frozenset({"9_1", "9_2"})
+_SLEEPY_BLINK_INTERVAL_MS = 3000
+_DEFAULT_BLINK_INTERVAL_MS = 5000
+
+
+def _blink_interval_ms_from_emo_id(emo_id: str | None) -> int:
+    if str(emo_id or "") in _SLEEPY_EMO_IDS:
+        return _SLEEPY_BLINK_INTERVAL_MS
+    return _DEFAULT_BLINK_INTERVAL_MS
+
+
+def _emo_id_at_abs_ms(
+    *,
+    fallback_emo_id: str | None,
+    abs_t_ms: int,
+    live_emo_events: list[dict[str, Any]] | None,
+) -> str:
+    emo_id = str(fallback_emo_id or "1_1")
+    for ev in live_emo_events or []:
+        try:
+            ev_t = int(ev.get("t_ms", 0))
+        except Exception:
+            continue
+        if ev_t <= int(abs_t_ms):
+            emo_id = str(ev.get("emo_id") or emo_id)
+    return emo_id
+
+
+def _insert_live_auto_blinks(
+    timeline: list[dict[str, Any]],
+    *,
+    chunk_start_ms: int,
+    chunk_end_ms: int,
+    step_ms: int,
+    fallback_emo_id: str | None,
+    live_emo_events: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Insert at most one blink whose absolute t falls in [chunk_start, chunk_end).
+
+    First blink is at +interval (never abs t=0). Restore uses step_ms duration.
+    """
+    cs = int(chunk_start_ms)
+    ce = int(chunk_end_ms)
+    step = max(1, int(step_ms))
+    if ce <= cs:
+        return timeline, False
+
+    # Probe both grids; keep the hit whose emo_id actually uses that interval.
+    hit_abs: int | None = None
+    hit_emo = str(fallback_emo_id or "1_1")
+    hit_interval = _DEFAULT_BLINK_INTERVAL_MS
+    for interval_ms in (_SLEEPY_BLINK_INTERVAL_MS, _DEFAULT_BLINK_INTERVAL_MS):
+        first = ((cs + interval_ms - 1) // interval_ms) * interval_ms
+        if first <= 0:
+            first = interval_ms
+        if first < ce:
+            emo_id = _emo_id_at_abs_ms(
+                fallback_emo_id=fallback_emo_id,
+                abs_t_ms=first,
+                live_emo_events=live_emo_events,
+            )
+            if _blink_interval_ms_from_emo_id(emo_id) == interval_ms:
+                hit_abs = int(first)
+                hit_emo = emo_id
+                hit_interval = int(interval_ms)
+                break
+
+    if hit_abs is None:
+        return timeline, False
+
+    t_aligned = (int(hit_abs) // step) * step
+    if t_aligned <= 0 or t_aligned < cs or t_aligned >= ce:
+        return timeline, False
+
+    rel_t = t_aligned - cs
+    base_expression = _inline_emo_id_to_expression(hit_emo)
+    for ev in timeline:
+        try:
+            ev_rel = int(ev.get("t_ms", 0))
+        except Exception:
+            continue
+        if ev_rel <= rel_t and str(ev.get("expression") or "") != "blink":
+            base_expression = str(ev.get("expression") or base_expression)
+
+    blink_ev: dict[str, Any] = {
+        "t_ms": rel_t,
+        "expression": "blink",
+        "source": "auto_blink",
+        "emo_id": hit_emo,
+    }
+    out = list(timeline)
+    if rel_t == 0 and out and int(out[0].get("t_ms", 0) or 0) == 0:
+        out[0] = {**out[0], **blink_ev}
+    else:
+        out.append(blink_ev)
+
+    restore_abs = t_aligned + step
+    if restore_abs < ce:
+        out.append(
+            {
+                "t_ms": restore_abs - cs,
+                "expression": base_expression,
+                "source": "auto_blink_restore",
+                "emo_id": hit_emo,
+            }
+        )
+
+    out = sorted(
+        out,
+        key=lambda x: (
+            int(x.get("t_ms", 0)),
+            1 if str(x.get("source", "")) == "auto_blink" else 0,
+        ),
+    )
+    print(
+        "[sync][auto_blink]",
+        "source=auto_blink",
+        f"abs_t={t_aligned}",
+        f"rel_t={rel_t}",
+        f"interval_ms={hit_interval}",
+        f"emo_id={hit_emo}",
+        f"chunk_ms=[{cs},{ce})",
+        flush=True,
+    )
+    return out, True
+
+
 def _default_expr_chunk(
     *,
     session_id: str,
     step_ms: int,
     inline_emo_id: str | None = None,
+    chunk_start_ms: int = 0,
+    chunk_end_ms: int | None = None,
 ) -> dict[str, Any]:
     emo_to_expression = {
         "1_0": "normal",
@@ -890,22 +1021,36 @@ def _default_expr_chunk(
     }
 
     expression = emo_to_expression.get(str(inline_emo_id), "normal")
+    timeline: list[dict[str, Any]] = [
+        {
+            "t_ms": 0,
+            "expression": expression,
+            "source": "inline_emo_tag_mode" if inline_emo_id else "stream_mouth_m0_default",
+            "emo_id": inline_emo_id,
+        }
+    ]
+    inserted = False
+    if chunk_end_ms is not None:
+        timeline, inserted = _insert_live_auto_blinks(
+            timeline,
+            chunk_start_ms=int(chunk_start_ms),
+            chunk_end_ms=int(chunk_end_ms),
+            step_ms=int(step_ms),
+            fallback_emo_id=inline_emo_id,
+        )
 
     return {
         "schema_version": "session_expression_timeline_v0.1",
         "session_id": str(session_id),
         "step_ms": int(step_ms),
-        "timeline": [
-            {
-                "t_ms": 0,
-                "expression": expression,
-                "source": "inline_emo_tag_mode" if inline_emo_id else "stream_mouth_m0_default",
-                "emo_id": inline_emo_id,
-            }
-        ],
+        "timeline": timeline,
         "meta": {
             "source": "inline_emo_tag_mode" if inline_emo_id else "stream_mouth_m0_default",
-            "auto_blink": False,
+            "auto_blink": True,
+            "blink_interval_ms": _blink_interval_ms_from_emo_id(inline_emo_id),
+            "chunk_start_ms": int(chunk_start_ms),
+            "chunk_end_ms": int(chunk_end_ms) if chunk_end_ms is not None else None,
+            "auto_blink_inserted": bool(inserted),
         },
     }
 
@@ -966,6 +1111,14 @@ def _expr_chunk_from_live_emo_events(
             )
 
     timeline = sorted(timeline, key=lambda x: int(x.get("t_ms", 0)))
+    timeline, inserted = _insert_live_auto_blinks(
+        timeline,
+        chunk_start_ms=int(chunk_start_ms),
+        chunk_end_ms=int(chunk_end_ms),
+        step_ms=int(step_ms),
+        fallback_emo_id=effective_emo_id,
+        live_emo_events=events,
+    )
 
     return {
         "schema_version": "session_expression_timeline_v0.1",
@@ -974,7 +1127,9 @@ def _expr_chunk_from_live_emo_events(
         "timeline": timeline,
         "meta": {
             "source": "live_emo_events",
-            "auto_blink": False,
+            "auto_blink": True,
+            "blink_interval_ms": _blink_interval_ms_from_emo_id(effective_emo_id),
+            "auto_blink_inserted": bool(inserted),
             "chunk_start_ms": int(chunk_start_ms),
             "chunk_end_ms": int(chunk_end_ms),
         },
@@ -1283,6 +1438,8 @@ def _m0_pipeline_render_one_chunk_sync(
             session_id=str(m0_pipeline_ref["session_id"]),
             step_ms=step_ms,
             inline_emo_id=effective_emo_id,
+            chunk_start_ms=int(t0_ms),
+            chunk_end_ms=int(t1_ms),
         )
     _m0_timing_add(timing_acc, "m0_slice_ms", (time.perf_counter() - t_slice0) * 1000.0)
 
@@ -2016,6 +2173,8 @@ def _watch_stream_mouth_and_render_m0(
                 session_id=session_id,
                 step_ms=step_ms,
                 inline_emo_id=effective_emo_id,
+                chunk_start_ms=int(t0_ms),
+                chunk_end_ms=int(t1_ms),
             )
 
         pose_chunk_json.write_text(json.dumps(pose_chunk, ensure_ascii=False, indent=2), encoding="utf-8")

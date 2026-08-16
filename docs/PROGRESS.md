@@ -1409,6 +1409,12 @@
 | O2 | 当てフリ（OBS事前配置ソースの見せ消し） | `pass` | 2026-08-13 |
 | O3 | エージェントスミス＋音声フィルタ | `pass` | 2026-08-14 |
 | （後続可） | スミス増殖加速（順次表示・delay短縮） | — | 管理画面側のみ。session_loop sleep 禁止 |
+| X1 | blink 頻度（emo_id 分岐・M3生成） | `pass` | 2026-08-15（Pass-with-defer→X1b Live） |
+| X1b | Live expression に blink 挿入配線 | `pass` | 2026-08-15 |
+| F1 | M0 FG 黒縁除去（unpremultiply 試行） | `pass` | 2026-08-15（Fail→Revert。blit Keep） |
+| F1s | 現行スプライトで合成主観（黒縁まだ問題か） | `pass` | 2026-08-16（**A**＝目立たない→F1クローズ） |
+| （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。英語版に混ぜない |
+| （予約） | 英語版ブランチ | — | **X1+X1b+F1s クローズ後**。別ブランチ・JP Keep 巻き込み禁止 |
 
 ### Bライン申し送り（2026-08-11・Pass-with-defer）
 
@@ -1424,10 +1430,13 @@
 ### 当面の非本線（今は実装させない）
 
 - API `end→first` 短縮
-- B 仕上げ（多BGV総当たり・Colab待ち仕上げ）
+- B 仕上げ（多BGV総当たり・Colab待ち仕上げ）— 再開は Colab高精度pose後 or ズレ再発時
 - Phase12 系の idle silent PCM／縫い目の品質本線化
-- 当てフリの Python scale／座標拡大（OBS 事前配置見せ消しのみ）
-- Slack トリガ本番化（本番は管理画面）
+- 英語版ブランチ（X1+F1 後）
+- スミス増殖加速（任意）
+- 当てフリの Python scale／座標拡大
+- Slack トリガ本番化
+- B全面再オープン／リップ品質本線化
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -2105,8 +2114,132 @@
 - 既定フィルタ名 **`Smith_Effect`**（ASCII）。OBS 側も同名に揃える。
 
 **親判定（2026-08-14）:**
-- **Pass。** Keep = O3。OBS 本線（O1–O3）クローズ可。
-- 増殖加速は後続可（管理画面側のみ）。次本線は別途親定義（B仕上げ／API end→first 等は今強制しない）。
+- **Pass。** Keep = O3。OBS 本線（O1–O3）クローズ可。commit `62798bf` / tag `phase-o3-pass`。
+- 増殖加速は後続可。次本線=**X1 blink → F1 黒縁**（英語版は X1+F1 後）。
+
+---
+
+## Phase X1: blink 頻度（emo_id 分岐）
+
+**目的:** expression 生成の blink 間隔を emo_id で分岐する。新ファイル不要・最小分岐のみ。
+
+**仕様（正式）:**
+| emo_id | `blink_interval_ms` |
+| --- | ---: |
+| `9_1` / `9_2` | **3000** |
+| それ以外 | **5000**（現行 10000 から変更） |
+
+**スコープ:**
+1. Live／生成経路で `emo_id` が blink 挿入に届くか **1行確認**（届かない場合は到達点を特定してから分岐）
+2. M3: `build_session_expression_timeline_from_chunks.py` または `_insert_blinks` 系に最小分岐
+3. 生成 expression で間隔が仕様どおり（数値）
+4. 短回帰: 異常な増減なし。主観: 明らかに速すぎ／遅すぎない
+5. 図A／口形／OBS／Bライン非破壊
+
+**スコープ外:** F1 黒縁、英語版、B 仕上げ、リップ品質本線化
+
+**Pass 基準:**
+- [x] emo_id 到達確認（1行）
+- [x] 9_1/9_2→3s、他→5s の生成根拠
+- [x] 短回帰＋主観 OK — **生成パス**。Live 主観は未到達
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-15）:**
+- M3 `build_session_expression_timeline_from_chunks.py`: `--auto_blink` 時 `_insert_blinks`＋emo 分岐。数値 PASS。
+- Live: `auto_blink=False`、expr ほぼ t=0 n=1。主観で定期 blink なし（未配線）。idle_silent も同じビルダ経由で未挿入。
+
+**親判定（2026-08-15）:**
+- **Pass-with-defer。** Keep = X1 M3 生成分岐。次=**X1b** Live 配線。F1 は X1b 後。
+
+---
+
+## Phase X1b: Live expression に blink 挿入配線
+
+**目的:** Live 経路でも X1 と同じ間隔（9_1/9_2=3000、他=5000）で blink を入れる。待機中（idle_silent）も対象。
+
+**スコープ:**
+1. step1 の `_default_expr_chunk`／`_expr_chunk_from_live_emo_events`（または同等到達点）に最小挿入
+2. 間隔は X1 と同一。120ms チャンク内の単純 +interval は不可 → **絶対時刻（chunk_start_ms 等）で間引き**
+3. idle_silent も同じビルダ経由（待機 6s+ で blink≥1 が主観条件）
+4. ログに `source=auto_blink`（または同等）で識別可能に
+5. 図A／口形／OBS／B／F1 非破壊。新ファイル不要が原則
+
+**スコープ外:** M0 黒縁、英語版、B 仕上げ、リップ本線化、OBS 改修、M3 生成パスの再設計
+
+**Pass 基準:**
+- [x] 待機 6s+ で blink ≥1（ログ根拠）
+- [x] 発話中 3s/5s で異常増減なし
+- [x] X1 仕様どおりの emo 分岐
+- [x] 短回帰・Keep 非破壊・主観 OK
+
+**子報告要約（2026-08-15）:**
+- step1: `_insert_live_auto_blinks`＋絶対グリッド。idle_silent も対象。`source=auto_blink`。
+- 主観 165005: 待機 blink あり（T1–3）。発話 3s/5s 正常。図A／OBS／B 非破壊。
+
+**親判定（2026-08-15）:**
+- **Pass。** Keep = X1b Live 配線。次=**F1** 黒縁（比較レビュー→親 Go→実装）。
+
+---
+
+## Phase F1: M0 FG 黒縁除去（render_core 最小移植）
+
+**目的:** ローカル現行 `render_core.py` を SSOT とし、合格版から **straight-alpha 復元（黒縁対策）差分のみ**を最小移植する。合格版フル置換禁止。
+
+**推奨フロー:**
+1. **現行スプライト**で unpremultiply 移植 → edge RGB が黒潰れでない（数値 Pass）
+2. **最新スプライト差替**（検証前までに実施可）→ M3.5 合成主観（黒縁・緑白フリンジ・位置）
+
+**手順:** まず現行 vs 合格版の比較レビューのみ → 親 Go 後に実装。
+
+**スコープ:**
+- 黒縁差分のみ（warp は現行経路で使う場合のみ）
+- edge RGB 数値＋M3.5 合成主観
+- 25fps・4ch・位置・view 維持
+
+**禁止:** 合格版フル置換、left7/atlas/disable_fg 等の別機能混入、M0常駐・cache・render loop 破壊、図A／OBS／B 破壊
+
+**Pass 基準:**
+- [x] 比較レビューが親承認済み
+- [x] 現行スプライトで edge RGB 数値 — **過補正で Revert**（黒潰れは現行で非再現）
+- [ ] 最新スプライト差替後の合成主観 — **未着手（不要になった可能性）**
+- [x] 位置・view・25fps・4ch 維持（Revert 後）
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-15）:**
+- unpremultiply → edge 白飽和（sat 全画素）。即 Revert。
+- 実装前 Live FG edge は既に黒でない（≈[54–63,130–173,66–75]）。資料の premul≈[7,17,8] は現行 `_blit_bgra` では再現せず。
+
+**親判定（2026-08-15）:**
+- **Pass-with-defer（手法 Fail・経路 Keep）。** unpremultiply は現行経路では不適。Keep = 実装前 `render_core`（`_blit_bgra`）。
+- **unpremultiply を差替スプライトで再試行しない。**
+- 次=**F1s**: 現行スプライトのまま M3.5／VirtualCam 合成主観 1 本。「黒縁がまだ問題か」だけ判定。
+  - 目立たない → F1 クローズ。きれいスプライトは後日資産更新。
+  - まだ目立つ → きれいスプライト差替 A/B（資産仮説）。render_core 再改修は原因再定義後。
+
+---
+
+## Phase F1s: 現行スプライトで合成主観（実装なし）
+
+**目的:** 現行 `_blit_bgra`＋現行スプライトで、合成時の黒縁が運用上まだ問題かを主観 1 本で決める。コード変更なし。
+
+**Pass 分岐:**
+- [x] **A:** 黒縁目立たない → F1 クローズ
+- [ ] B: まだ目立つ → きれいスプライト差替（今回は未達）
+
+**子／親主観要約（2026-08-16）:**
+- 親 SSOT: `sess_phase11_subj_20260816_141008`（緑バック）。黒縁／白／緑とも運用上目立たず。
+- 子オフライン拡大の緑フリンジは運用距離では問題なし。口後半軽止まりは F1s 対象外。
+
+**親判定（2026-08-16）:**
+- **F1s Pass（A）。** F1 ラインクローズ。Keep = `_blit_bgra`＋現行スプライト。
+- 出さない: render_core 再改修、unpremultiply 再試行、必須差替 A/B。
+- きれいスプライトは後日任意。英語版は X1+X1b+F1s 後に検討可。
+
+---
+
+## 変更履歴
+
+X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP 本線 Keep 巻き込み禁止。オリエン／差分は改めて添付。
 
 ---
 
@@ -2244,3 +2377,10 @@
 | 2026-08-13 | Phase O1 Pass。実切替OK＋flat local Hotfix Keep。次=O2 当てフリ |
 | 2026-08-13 | Phase O2 Pass。実機4ターン見せ消しOK＋OFF確認。Keep=first_audio IN／turn-end OUT。次=O3 スミス |
 | 2026-08-14 | Phase O3 Pass。スミス一斉表示＋Smith_Effect。OBS本線(O1–O3)クローズ可。増殖加速は後続 |
+| 2026-08-14 | O1–O3 commit `62798bf` / tag `phase-o3-pass` |
+| 2026-08-15 | 次本線=X1 blink（9_1/9_2=3s・他=5s）→F1 黒縁。英語版はX1+F1後。子プロンプト発行 |
+| 2026-08-15 | Phase X1 Pass-with-defer。M3生成分岐 Keep。Live未配線→X1b。F1はX1b後 |
+| 2026-08-15 | Phase X1b Pass。Live auto_blink。次=F1 黒縁（比較レビュー→Go→実装） |
+| 2026-08-15 | Phase F1 比較レビュー Go。unpremultiply 1箇所のみ。過補正なら即Revert |
+| 2026-08-15 | F1 unpremultiply Fail→Revert。現行blitは既にstraight。次=F1s合成主観1本 |
+| 2026-08-16 | F1s Pass（A）。黒縁運用上問題なし。F1クローズ。英語版はX1+X1b+F1s後可 |
