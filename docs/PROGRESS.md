@@ -1413,8 +1413,8 @@
 | X1b | Live expression に blink 挿入配線 | `pass` | 2026-08-15 |
 | F1 | M0 FG 黒縁除去（unpremultiply 試行） | `pass` | 2026-08-15（Fail→Revert。blit Keep） |
 | F1s | 現行スプライトで合成主観（黒縁まだ問題か） | `pass` | 2026-08-16（**A**＝目立たない→F1クローズ） |
-| （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。英語版に混ぜない |
-| （予約） | 英語版ブランチ | — | **X1+X1b+F1s クローズ後**。別ブランチ・JP Keep 巻き込み禁止 |
+| （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
+| （本線移管） | 英語版 Realtime | → EN-RT | **X1+X1b+F1s クローズ済（2026-08-16）**。番号は `EN-RT0/1/2`（下節）。JP リポ現状維持 |
 
 ### Bライン申し送り（2026-08-11・Pass-with-defer）
 
@@ -1432,7 +1432,7 @@
 - API `end→first` 短縮
 - B 仕上げ（多BGV総当たり・Colab待ち仕上げ）— 再開は Colab高精度pose後 or ズレ再発時
 - Phase12 系の idle silent PCM／縫い目の品質本線化
-- 英語版ブランチ（X1+F1 後）
+- 英語版 CTC（EN-RT3。当面やらない）
 - スミス増殖加速（任意）
 - 当てフリの Python scale／座標拡大
 - Slack トリガ本番化
@@ -2233,7 +2233,261 @@
 **親判定（2026-08-16）:**
 - **F1s Pass（A）。** F1 ラインクローズ。Keep = `_blit_bgra`＋現行スプライト。
 - 出さない: render_core 再改修、unpremultiply 再試行、必須差替 A/B。
-- きれいスプライトは後日任意。英語版は X1+X1b+F1s 後に検討可。
+- きれいスプライトは後日任意。英語版本線は下節 **EN-RT**（2026-08-17 着手）。
+
+---
+
+## 新ライン: 英語版 Realtime（EN-RT・2026-08-17〜）
+
+> **進捗ファイル方針:** 別ファイルは作らない。本節＋下表で EN ラインを管理する（親のみ編集。子は直接編集しない）。
+> JP 品質凍結（Phase0–33／freeze）および R/I/B/O/X/F とは **番号空間を分離**（`EN-RT0`, `EN-RT1`, `EN-RT2`）。
+> **計画 SSOT:** `C:\Users\john\Desktop\EN_m3\english_m3_local_integration_precheck.md`（親は計画を作り直さない）。Phase2 オフライン口形パイプライン詳細は `english_mouth_pipeline_phase2.md`。
+> JP リポは **現状維持（サブ運用）**。英語は **別リポをメイン運用**。同一リポ `if language==ja/en` は採用しない。
+
+### 前提（実装 SSOT・Keep）
+
+| 項目 | 内容 |
+| --- | --- |
+| M1 | 同一リポ `C:\dev\M1_LLM_To_M2_TTS_united`（`feature/local-vad-restore`）。JP コマンド同形＋ `--m3_repo_root` / `--m0_repo_root` 切替のみ |
+| M3 JP（触らない） | `C:\dev\M3_Live_API_1_united` |
+| M3 EN（本線） | `C:\dev\M3_Live_API_1_english`（EN-RT0 で作成） |
+| M0 JP（触らない） | `C:\dev\M0_session_renderer_final_1` |
+| M0 EN（本線） | `C:\dev\M0_session_renderer_final_1_english`（EN-RT0 で骨格。9 mouth スプライトは EN tree 作成後・EN-RT1 前） |
+| Sync | `audio_ms` / `played_audio_ms` が唯一の時刻 ID。変更禁止 |
+| 図A / 方式2 | Keep。音声先行 enqueue・口形捨て・ジッタ延長隠し禁止 |
+| 運用ベース | N=2・`--no-fast_inmemory`・B/O/X1 Keep。B/O 本線の不用意再開禁止 |
+| コード内パス | 新規ハードコード絶対パスを増やさない。EN リポ内は JP と同様の相対構造 |
+| CTC | **当面やらない**（資料 EN-RT3。必要時のみ） |
+
+### EN フェーズ一覧
+
+| Phase | 名称 | 状態 | Pass 日 |
+| --- | --- | --- | --- |
+| EN-RT0 | リポ骨格＋成果物配置＋パス確認 | `pass` | 2026-08-18（Pass-with-defer → EN-RT0b） |
+| EN-RT0b | atlas.en.json 配置＋ mouth_ch.png ファイル名 SSOT | `pass` | 2026-08-18 |
+| EN-RT1 | English kNN → 9 mouth → M0（Realtime） | `pass` | 2026-08-18（Pass-with-defer: Live主観→EN-LIVE1、id6 GT→EN-DB1） |
+| EN-RT2 | Primary Stress Event → kNN 未送信 frame → 160ms Hold | `pass` | 2026-08-18 |
+| （予約） | EN-LIVE1 Live主観 | — | `prompts_en`＋`--prompt_dir`＋`--output_audio_transcription`＋親承認後。今は不要 |
+| （backlog） | EN-DB1 knn GT 穴（id6=0 / id4=1） | — | Hold の前提ではない。DB 再作成時 |
+| （backlog） | angry `leftdown` / `rightup` 欠 | — | 資産追加時は `_` なし。今は捏造しない |
+| EN-RT3 | CTC Alignment（Wav2Vec2 等） | `deferred` | 当面やらない |
+
+### 日本語併用（切替のみ）
+
+```text
+JP: --m3_repo_root C:\dev\M3_Live_API_1_united  --m0_repo_root C:\dev\M0_session_renderer_final_1
+EN: --m3_repo_root C:\dev\M3_Live_API_1_english --m0_repo_root C:\dev\M0_session_renderer_final_1_english
+    --stream_mouth_gt_glob data/knn_db/en_10files.phoneme_gt.f1f2.json
+EN Live 時のみ: --prompt_dir <m1>/configs/prompts_en
+```
+
+Live API 自体は共通。切替は repo root・gt_glob・（Live時）prompt_dir。JP 既定 `configs/prompts` は上書きしない。
+
+### Desktop 成果物ギャップ（親確認・2026-08-17）
+
+ルート: `C:\Users\john\Desktop\EN_m3`
+
+| 項目 | 判定 |
+| --- | --- |
+| `mouth_schema.py` / `knn_predictor.py` | **Desktop 直下に存在**（当初「未同梱」懸念は解消。正規先は `src/m3p/live/`） |
+| `english-m3-phase2-snapshot.bundle` | **検出済**（子・`C:\Users\john\Desktop\EN_m3\english-m3-phase2-snapshot.bundle`、約20.5MB）。EN-RT0 は未展開で正（配置リスト外） |
+| 9 mouth PNG | `EN_m3` 未検出は正しい。一次ソース `C:\Users\john\Desktop\EN_img9` → M0 EN `assets/` 構造維持コピー済（+576、合計774） |
+| スプライトファイル名 | **PNG SSOT = `mouth_ch.png`**（親追記 2026-08-18）。`mouth_sh.png` は今後使わない。論理 key / mouth_id 6 は `mouth_sh` 維持（knn_db 互換）。atlas は `mouth_sh`→`mouth_ch.png` |
+| スプライト view 名 | **`_` なしに統一**（angry も leftdown 等。ユーザーが EN_img9 と M0 EN を手動正規化済）。欠: angry `leftdown`（用意漏れ）と `rightup`。追加時も `_` なし |
+| `atlas.en.json` | front 最小＋欠 view は同 mouth の front fallback（EN-RT1）。他 view フォルダは実在。全 view 展開は任意 |
+
+正規相対配置（資料準拠・EN リポ内）:
+
+```text
+src/m3p/live/mouth_schema.py
+src/m3p/live/knn_predictor.py
+src/m3p/live/primary_stress_text_events.py
+tools/run_english_mouth_pipeline.py
+tools/knn_from_formant_raw_to_mouth_timeline.py
+tools/apply_g2p_override_to_mouth_id_timeline_stress_hold.py
+tools/apply_silence_gate_to_m0_mouth_timeline.py
+tools/convert_mouth_id_to_m0_mouth.py
+tools/offset_mouth_timeline.py
+tools/smooth_mouth_timeline.py
+data/knn_db/en_10files.phoneme_gt.f1f2.json
+data/knn_db/en_1.phoneme_gt.f1f2.json … en_10.…
+data/phonemes/1.phonemes.json … 10.…
+data/formant_raw/1.formant.raw.json … 10.…
+```
+
+M0 EN（資料準拠）:
+
+```text
+configs/smoke_pose_english_front.yaml
+timelines/mouth/en/mouth_current_en.json
+```
+
+---
+
+## Phase EN-RT0: リポ骨格＋成果物配置＋パス確認
+
+**目的:** 英語メイン運用の箱を作る。Realtime kNN 配線・Hold・M1 ロジック変更はしない。
+
+**設計決定:**
+- JP `M3_Live_API_1_united` / `M0_session_renderer_final_1` / M1 作業ツリーへ EN 成果物を混入しない
+- M3 EN は JP M3 をベースに **`.git` 除外コピー** → 新規 `git init`（JP origin を共有しない）。bundle があれば補助、無くても Desktop ファイルで可
+- EN リポ内パスは JP と同じ相対構造。新規絶対パス・`if language` 切替は禁止
+- 9 mouth スプライト一次ソースは `C:\Users\john\Desktop\EN_img9`。M0 EN `assets/` へ **構造維持コピー**（子実施・手作業不要）。口形ファイル名は `mouth_schema` と突合し、不一致は捏造せず欠落表へ。JP 6 mouth 流用禁止
+
+**Pass 基準:**
+- [x] `C:\dev\M3_Live_API_1_english` が存在し、上表の正規相対パスに成果物が載っている
+- [x] `C:\dev\M0_session_renderer_final_1_english` 骨格あり（yaml / mouth_current_en を正規名で配置）
+- [x] JP M3/M0/M1 に EN ファイル追加なし（確認方法をサマリーに明記）
+- [x] `mouth_schema.py` が `src/m3p/live/` から import できる（9 id = 0–8）
+- [x] 教師 DB `data/knn_db/en_10files.phoneme_gt.f1f2.json` が存在する
+- [x] `(8)` `(1)` `(3)` が正規名に整理済み
+- [x] `EN_img9` → M0 EN `assets/` 構造維持コピー済み（件数・代表パス・mouth_schema 突合をサマリー）
+- [x] M1 / session_loop / 図A / 方式2 を変更していない
+- [x] 親向けサマリーのみ（diff/ログ全文なし）
+
+**子報告要約（2026-08-18）:**
+- M3 EN initial commit `2f961bc`（孤立 git）。M0 EN は `.git` なし。
+- PNG: コピー前198（JP sprites 残）→ 後774（+576）。代表 `assets/normal/front/mouth_o.png`。M3 EN PNG=0。
+- 突合時: `mouth_sh.png` は `normal/front` のみ1、他63は `mouth_ch.png`。親追記で **ファイル名は mouth_ch に統一済**（`mouth_sh.png` 不使用）。
+- bundle 検出・未展開は正。`atlas.en.json` 当時未配置。`<expr>/<view>/` 維持（JP の `<expr>_<view>` 未平坦化は正）。
+
+**親判定（2026-08-18）:**
+- **Pass-with-defer。** 箱・配置・JP非混入は達成。Keep = 別リポ＋相対構造＋PNG構造維持。
+- defer → **EN-RT0b:** Desktop `atlas.en.json` を M0 EN へ配置。PNG SSOT=`mouth_ch.png`。論理 key `mouth_sh`（id 6）は維持。
+- 出さない: 平坦化、bundle 展開、Realtime kNN、knn_db の mouth_key 一括リネーム、JP 混入。
+- M0 EN に git なしは残メモ（EN-RT0 Fail にしない）。
+
+---
+
+## Phase EN-RT0b: atlas.en.json 配置＋ mouth_ch.png ファイル名 SSOT
+
+**目的:** EN-RT0 の defer を閉じ、EN-RT1 の M0 参照がファイルとして解決できるようにする。Realtime 配線はしない。
+
+**設計決定:**
+- `C:\Users\john\Desktop\atlas.en.json` → `C:\dev\M0_session_renderer_final_1_english\assets\atlas.en.json`
+- **PNG ファイル名 SSOT = `mouth_ch.png`。`mouth_sh.png` は使わない。**
+- **論理 key / mouth_id 6 は `mouth_sh` のまま**（`convert_mouth_id_to_m0_mouth` と knn_db の `mouth_key` を一括変更しない）
+- `mouth_schema.sprite_name` と atlas のパス末尾だけ `mouth_ch.png` にする。atlas キー `mouth_sh` は残し、同じ PNG を指す。`mouth_ch` キーを足してよい
+- Desktop atlas は `front/mouth_*.png`。実体は `assets/<expr>/<view>/`。**平坦化禁止。** atlas パスが 0 件ヒットなら `normal/front/` 接頭辞の最小修正のみ（EN コピー。Desktop 原本は触らなくてよい）
+- JP M0/M3/M1 書き込み禁止。M3 EN に PNG を置かない
+
+**Pass 基準:**
+- [x] M0 EN `assets/atlas.en.json` が存在し、yaml の `atlas.atlas_json` と一致
+- [x] M0 EN に `mouth_sh.png` が 0。`mouth_ch.png` が view 横断で存在する
+- [x] `mouth_schema` の id6 `sprite_name` が `mouth_ch.png`。import で id 0–8 維持
+- [x] atlas 上の mouth パスが、少なくとも `normal/front` の 9 枚に Test-Path で当たる（sh ではなく ch）
+- [x] knn_db の `mouth_key` は未一括リネーム
+- [x] 構造維持（`<expr>/<view>/`）。Realtime / 図A / 方式2 / M1 未変更
+- [x] JP 非混入。親向けサマリーのみ
+
+**子報告要約（2026-08-18）:**
+- atlas コピー後 `front/` は 0 件 → EN コピーのみ `normal/front/` 接頭辞。Desktop 原本未編集。
+- `mouth_sh.png`=0 / `mouth_ch.png`=64（`normal/front` の1枚をリネーム、捏造なし）。
+- schema id6 `(mouth_sh, mouth_ch.png)`。atlas 9/9 HIT。`mouth_ch` キーも HIT。
+- 残差: `{expr}_{view}` vs `<expr>/<view>/`、angry の `left_down` vs 他 `leftdown`、`rightup` 欠、atlas は front のみ。
+
+**親判定（2026-08-18）:**
+- **Pass。** ファイル名 SSOT と atlas front 接続は閉じた。Keep = `mouth_ch.png`＋論理 key `mouth_sh`＋`<expr>/<view>/`。
+- 次=**EN-RT1**。平坦化しない。renderer/atlas 側でパス解決。Stress Hold / CTC は対象外。
+
+---
+
+## Phase EN-RT1: English kNN → 9 mouth → M0（Realtime）
+
+**目的:** 資料どおり Realtime kNN を主経路にする。English 9 mouth で chunk 生成し M0 EN が描けること。Primary Stress Hold は EN-RT2。CTC はやらない。
+
+**設計決定:**
+- 経路: Formant → Realtime kNN（`k=9`、DB=`data/knn_db/en_10files.phoneme_gt.f1f2.json` のみ）→ mouth_id 0–8 → 120ms chunk → M0 EN
+- M1 起動は JP と同形＋ `--m3_repo_root` / `--m0_repo_root` を EN へ。`if language` 禁止
+- session_loop の `data/knn_db/*.f1f2.json` は EN では JP 残骸＋ `en_1..10` とマージ DB が混ざる。**EN 起動は `en_10files` 単独**（CLI 追加は可。JP default は変えない）
+- M1 は EN knn を `mod._load_knn_db` で読む。EN ツール側にエイリアスを足してよい（M1 の図Aは触らない）
+- スプライトは **平坦化しない**。M0 EN のみ `<expr>/<view>/` を解決。欠 view は atlas fallback（front）。`left_down` vs `leftdown`、`rightup` 欠は捏造せず欠落表
+- atlas は front 最小で Pass 可。全 view 展開は必須にしない
+- PNG SSOT=`mouth_ch.png`。論理 key は `mouth_sh`
+- 運用 Keep: 方式2、図A、N=2、`--no-fast_inmemory`、audio_ms、音声先行 enqueue 禁止
+- JP M3/M0 と M1 の JP 経路は壊さない。EN 専用変更に閉じる
+
+**Pass 基準:**
+- [ ] EN kNN が mouth_id 0–8 を出す（`en_10files`、k=9）。JP 6 mouth DB を混在させていない
+- [ ] M0 EN が 9 mouth PNG を `<expr>/<view>/` から読める（少なくとも normal/front）
+- [ ] 図A維持: KNN→M0完了→enqueue。AUDIO_BEFORE_M0=0
+- [ ] Live 1 ターン、または同等の realtime chunk 経路（親は Live 1 ターン推奨）
+- [ ] Stress Hold / CTC 未配線
+- [ ] JP 非混入。親向けサマリーのみ
+
+**Pass 基準:**
+- [x] EN kNN が mouth_id 0–8 を出す（`en_10files`、k=9）。JP 6 mouth DB を混在させていない — **接続済。分布は DB 偏りで 4/6 未出**
+- [x] M0 EN が 9 mouth PNG を `<expr>/<view>/` から読ける（少なくとも normal/front）
+- [x] 図A維持: KNN→M0完了→enqueue。AUDIO_BEFORE_M0=0 — **enqueue 順未変更として確認**
+- [x] Live 1 ターン、または同等の realtime chunk 経路 — **同等経路で確認。Live 主観は defer**
+- [x] Stress Hold / CTC 未配線
+- [x] JP 非混入。親向けサマリーのみ
+
+**子報告要約（2026-08-18）:**
+- DB 219 points / k=9 / EN は `--stream_mouth_gt_glob` で `en_10files` のみ。JP glob default 維持。
+- M0 EN は `<expr>/<view>/`。欠 view は同 mouth の front。id6 key=`mouth_sh` → PNG=`mouth_ch.png`。
+- 代替検証 mouth_id: `{0:833,1:9,2:61,3:8,5:14,7:94,8:33}` n=1052。4/6 未出。en_10files は id6=0 / id4=1。
+- Live 1ターン未実施（この子セッションに mic/VCam/OBS なし）。
+- 親追記: angry view 名はユーザーが `_` なしへ正規化済。欠は angry `leftdown` と `rightup`。
+
+**親判定（2026-08-18）:**
+- **Pass-with-defer。** Realtime kNN→9 mouth→M0 EN は接続。Keep = en_10files / k=9 / `<expr>/<view>/` / JP default glob 維持 / `--stream_mouth_gt_glob`。
+- defer の整理（下表）。**次本線=EN-RT2**（Hold）。Live 主観は EN-LIVE1。id6 GT は EN-RT2 の Gate にしない（Hold は primary stress 母音）。
+
+| 残件 | 扱い |
+| --- | --- |
+| angry view `_` なし正規化 | **済（ユーザー手動）。Keep。** 子作業なし |
+| angry `leftdown` / `rightup` 欠 | backlog。資産追加まで捏造しない |
+| atlas 非 front 展開 | 任意。fallback Keep |
+| en_10files id6=0 / id4=1 | **EN-DB1 backlog。** RT2 非Gate |
+| Live 主観 | **EN-LIVE1。** 先に `--prompt_dir configs/prompts_en`（同名 txt）。JP `configs/prompts` は触らない。親承認後 |
+
+**EN プロンプト切替（親確定・Live 前必須）:**
+- 既存 CLI `--prompt_dir` を使う。`if language` も JP ファイル上書きも禁止
+- JP 既定: `<m1>/configs/prompts`
+- EN: `<m1>/configs/prompts_en` に **同名ファイル一式** を新規作成し、起動時だけ `--prompt_dir` を向ける
+- EN-RT2 では prompt 作業をしない
+
+---
+
+## Phase EN-RT2: Primary Stress Event → 未送信 kNN frame → 160ms Hold
+
+**目的:** 資料 EN-RT2。G2P は主経路にしない。Realtime kNN の結果に対し、**未送信 frame だけ** Primary Stress 母音を 160ms Hold する。
+
+**設計決定:**
+- 経路: Transcript → g2p_en → Primary Stress Event → 未送信 kNN frame → 160ms Hold → chunk / M0
+- 既存 `src/m3p/live/primary_stress_text_events.py` を使う。word onset は OFF。`min_hold_ms=160`
+- revision は検知のみ。既送信 chunk の取消しはしない
+- Hold は **enqueue 前の未送信 mouth frame のみ**。図A（KNN→M0→enqueue）と音声先行 enqueue 禁止は維持
+- id6 GT 空は本 Phase の Fail 理由にしない（Hold 対象は primary stress 母音）
+- JP プロンプト / `--prompt_dir` / Live 主観は対象外。CTC 禁止
+- `if language` 禁止。JP M3/M0 書き込み禁止
+
+**Pass 基準:**
+- [x] Primary Stress Event が incremental transcript から出る
+- [x] 未送信 kNN frame に 160ms Hold が乗る（既送信は不変）
+- [x] 図A / AUDIO_BEFORE_M0=0 / 方式2 維持
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-18）:**
+- Hold は `_process_audio_chunk_knn_sync` 末尾（KNN 後、M0/enqueue 前）。JP は hold モジュール無し → no-op。
+- sent = 当該 chunk push 直前の `pipeline_audio_end_ms`。未送信 = `t_ms >= sent_ms`。VAD 非活性 / mouth_id=0 は Hold しない。revision は検知のみ。
+- オフライン: 母音 run 40ms→160ms。`t_ms < sent_ms` 不変。windows=6 / applied=6 / lengthened=4。
+- Live 未実施。`--output_audio_transcription` 既定 OFF。runtime に g2p-en + nltk。
+
+**親判定（2026-08-18）:**
+- **Pass。** Keep = 未送信のみ 160ms Hold、図A順（KNN→Hold→M0→enqueue）、JP no-op。
+- **Live 主観はまだ不要。** EN-LIVE1 は prompt 切替と親承認のあと。CTC / EN-DB1 / 欠 view はやらない。
+
+**EN-LIVE1 前提（予約・今は子を出さない）:**
+- `configs/prompts_en/` 同名 txt ＋ `--prompt_dir`（JP `configs/prompts` 非上書き）
+- EN 起動に `--output_audio_transcription`
+- g2p-en + nltk（M1 `.venv` は子が投入済）
+- transcript 遅れは仕様（既送信は戻せない）
+
+---
+
+---
 
 ---
 
@@ -2384,3 +2638,10 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-15 | Phase F1 比較レビュー Go。unpremultiply 1箇所のみ。過補正なら即Revert |
 | 2026-08-15 | F1 unpremultiply Fail→Revert。現行blitは既にstraight。次=F1s合成主観1本 |
 | 2026-08-16 | F1s Pass（A）。黒縁運用上問題なし。F1クローズ。英語版はX1+X1b+F1s後可 |
+| 2026-08-17 | 英語版本線着手。計画SSOT=`english_m3_local_integration_precheck.md`。EN-RT0/1/2 を PROGRESS 対応づけ（CTC=EN-RT3 defer）。M3 EN=`C:\dev\M3_Live_API_1_english` / M0 EN=`C:\dev\M0_session_renderer_final_1_english`。JP 現状維持。EN-RT0 子プロンプト発行 |
+| 2026-08-17 | 9 mouth PNG 一次ソース確定 `C:\Users\john\Desktop\EN_img9`（576枚・emotion/view）。M0 EN `assets/` へ構造維持コピーを EN-RT0 に含める。EN-RT1 の未着 Blocker は解消見込み。子プロンプト手順5差し替え |
+| 2026-08-18 | EN-RT0 Pass-with-defer。M3 EN `2f961bc` / M0 EN 骨格 / PNG +576。JP 非混入。次=EN-RT0b（`C:\Users\john\Desktop\atlas.en.json` 配置＋ PNG SSOT=`mouth_ch.png`、論理 key `mouth_sh` 維持）。子プロンプト発行 |
+| 2026-08-18 | EN-RT0b Pass。atlas `normal/front` 9/9、`mouth_ch.png`=64 / `mouth_sh.png`=0。次=EN-RT1（Realtime kNN→9 mouth→M0。平坦化しない） |
+| 2026-08-18 | EN-RT0/0b を EN リポに commit+tag。M3 `2f961bc`/`en-rt0-pass`、`3817a79`/`en-rt0b-pass`。M0 EN `baf0052`/`en-rt0b-pass`（PNG は JP 同様 gitignore）。M1 未 commit。push なし |
+| 2026-08-18 | EN-RT1 Pass-with-defer。kNN en_10files/k=9 と M0 `<expr>/<view>/` 接続。Live主観は EN-LIVE1（`--prompt_dir configs/prompts_en`、JP prompts 非上書き）。id6 GT は EN-DB1。次本線=EN-RT2 |
+| 2026-08-18 | EN-RT2 Pass。未送信 frame に 160ms Hold。図A=KNN→Hold→M0→enqueue。Live主観はまだ不要。次予約=EN-LIVE1 |

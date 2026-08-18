@@ -636,6 +636,183 @@ def _load_knn_from_raw_obj_fn(*, knn_script: Path) -> Any:
     return _KNN_FUNC_CACHE[str(knn_script.resolve())]
 
 
+def _resolve_stream_mouth_gt_glob(
+    *,
+    m3_repo: Path,
+    stream_mouth_gt_glob: str | None,
+) -> str:
+    """JP default remains data/knn_db/*.f1f2.json. EN launch should pass en_10files."""
+    if stream_mouth_gt_glob:
+        raw = str(stream_mouth_gt_glob).strip()
+        if raw:
+            p = Path(raw)
+            if p.is_absolute() or "*" in raw:
+                return raw if p.is_absolute() else str(m3_repo / raw)
+            return str((m3_repo / raw).resolve())
+    return str(m3_repo / "data" / "knn_db" / "*.f1f2.json")
+
+
+_PRIMARY_STRESS_MOD_CACHE: dict[str, Any] = {}
+
+
+def _load_module_from_path(*, name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module: {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _try_load_primary_stress_mods(knn_script: Path) -> dict[str, Any] | None:
+    """Load EN Primary Stress Hold if present beside this knn_script. JP repo → None."""
+    key = str(knn_script.resolve())
+    if key in _PRIMARY_STRESS_MOD_CACHE:
+        return _PRIMARY_STRESS_MOD_CACHE[key]
+
+    m3_root = knn_script.resolve().parent.parent
+    live_dir = m3_root / "src" / "m3p" / "live"
+    hold_py = live_dir / "primary_stress_hold.py"
+    events_py = live_dir / "primary_stress_text_events.py"
+    schema_py = live_dir / "mouth_schema.py"
+    if not hold_py.is_file() or not events_py.is_file() or not schema_py.is_file():
+        _PRIMARY_STRESS_MOD_CACHE[key] = None
+        return None
+
+    src = str(m3_root / "src")
+    if src not in sys.path:
+        sys.path.insert(0, src)
+
+    try:
+        if "m3p.live.mouth_schema" not in sys.modules:
+            schema_mod = _load_module_from_path(
+                name="m3p.live.mouth_schema",
+                path=schema_py,
+            )
+            sys.modules["m3p.live.mouth_schema"] = schema_mod
+        if "m3p.live.primary_stress_text_events" not in sys.modules:
+            events_mod = _load_module_from_path(
+                name="m3p.live.primary_stress_text_events",
+                path=events_py,
+            )
+            sys.modules["m3p.live.primary_stress_text_events"] = events_mod
+        hold_mod = _load_module_from_path(
+            name="m3p_en_primary_stress_hold",
+            path=hold_py,
+        )
+        sys.modules.setdefault("m3p.live.primary_stress_hold", hold_mod)
+        mods = {
+            "Session": hold_mod.PrimaryStressHoldSession,
+            "MIN_HOLD_MS": int(getattr(hold_mod, "MIN_HOLD_MS", 160)),
+        }
+    except (Exception, SystemExit) as exc:
+        print(
+            "[primary_stress][skip]",
+            type(exc).__name__,
+            str(exc)[:160],
+            flush=True,
+        )
+        _PRIMARY_STRESS_MOD_CACHE[key] = None
+        return None
+
+    _PRIMARY_STRESS_MOD_CACHE[key] = mods
+    print(
+        "[primary_stress][loaded]",
+        f"min_hold_ms={mods['MIN_HOLD_MS']}",
+        "word_onset=0",
+        flush=True,
+    )
+    return mods
+
+
+def _pipeline_freeze_ms(turn_state: dict[str, Any]) -> int:
+    """audio_ms already reserved by earlier chunks (KNN done → M0/enqueue owned)."""
+    playback_ref = turn_state.get("audio_playback_state_ref")
+    if not isinstance(playback_ref, dict):
+        return 0
+    lock = playback_ref.get("lock")
+    if lock is not None:
+        with lock:
+            return int(playback_ref.get("pipeline_audio_end_ms", 0) or 0)
+    return int(playback_ref.get("pipeline_audio_end_ms", 0) or 0)
+
+
+def _ingest_primary_stress_transcript(
+    *,
+    turn_state: dict[str, Any],
+    knn_script: Path,
+    accum: str,
+    received_ms: int,
+) -> None:
+    mods = _try_load_primary_stress_mods(knn_script)
+    if mods is None:
+        return
+    session = turn_state.get("primary_stress_hold_session")
+    if session is None:
+        session = mods["Session"](min_hold_ms=int(mods["MIN_HOLD_MS"]))
+        turn_state["primary_stress_hold_session"] = session
+    sent_ms = _pipeline_freeze_ms(turn_state)
+    result = session.ingest_text(
+        accum,
+        received_ms=int(received_ms),
+        sent_ms=int(sent_ms),
+        default_anchor_ms=int(sent_ms),
+    )
+    if result.revision_detected:
+        print(
+            "[primary_stress][revision_detected]",
+            "no_unsend_cancel",
+            f"sent_ms={int(sent_ms)}",
+            flush=True,
+        )
+    if result.events:
+        print(
+            "[primary_stress][events]",
+            f"n={len(result.events)}",
+            f"new_words={list(result.new_words)}",
+            f"sent_ms={int(sent_ms)}",
+            f"windows={len(session.windows)}",
+            flush=True,
+        )
+
+
+def _apply_primary_stress_hold_after_knn(
+    *,
+    job: _AudioPipelineJob,
+    turn_state: dict[str, Any],
+) -> None:
+    """図A: after KNN, before M0/enqueue. Unsent frames only (t_ms >= freeze_ms)."""
+    session = turn_state.get("primary_stress_hold_session")
+    if session is None:
+        return
+    mouth_ref = job.mouth_obj_ref
+    if not isinstance(mouth_ref, dict):
+        return
+    mouth_obj = mouth_ref.get("obj")
+    if not isinstance(mouth_obj, dict):
+        return
+    sent_ms = _pipeline_freeze_ms(turn_state)
+    stats = session.apply(mouth_obj, sent_ms=int(sent_ms))
+    if int(stats.get("applied_frames", 0) or 0) > 0 and not bool(job.knn_inmemory):
+        job.mouth_json.parent.mkdir(parents=True, exist_ok=True)
+        job.mouth_json.write_text(
+            json.dumps(mouth_obj, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    if int(stats.get("windows", 0) or 0) > 0:
+        print(
+            "[primary_stress][hold]",
+            f"chunk_idx={int(job.playback_chunk_idx)}",
+            f"sent_ms={int(sent_ms)}",
+            f"windows={int(stats.get('windows', 0) or 0)}",
+            f"applied={int(stats.get('applied_frames', 0) or 0)}",
+            f"changed={int(stats.get('changed_frames', 0) or 0)}",
+            f"skipped_sent={int(stats.get('skipped_sent_frames', 0) or 0)}",
+            flush=True,
+        )
+
+
 def _ensure_knn_gt_runtime(*, knn_script: Path, gt_glob: str) -> dict[str, Any]:
     """Cache GT DB + z-score once per (knn_script, gt_glob). Phase 7 O(N²) fix."""
     cache_key = f"{knn_script.resolve()}|{gt_glob}"
@@ -653,6 +830,14 @@ def _ensure_knn_gt_runtime(*, knn_script: Path, gt_glob: str) -> dict[str, Any]:
             "db_z": db_z,
             "z": z,
         }
+        print(
+            "[knn][gt]",
+            f"files={len(gt_paths)}",
+            f"points={len(db)}",
+            f"k={int(getattr(mod, 'DEFAULT_K', 5))}",
+            f"gt_glob={gt_glob}",
+            flush=True,
+        )
     return _KNN_GT_CACHE[cache_key]
 
 
@@ -660,13 +845,15 @@ def _knn_mouth_frames_from_raw_frames(
     *,
     frames_in: list[dict[str, Any]],
     gt_runtime: dict[str, Any],
-    k: int = 5,
+    k: int | None = None,
     fallback_id_active: int = 2,
     min_conf_ratio: float = 1.0,
 ) -> list[dict[str, Any]]:
     mod = gt_runtime["mod"]
     db_z = gt_runtime["db_z"]
     z = gt_runtime["z"]
+    if k is None:
+        k = int(getattr(mod, "DEFAULT_K", 5))
     out_frames: list[dict[str, Any]] = []
 
     for fr in frames_in:
@@ -678,7 +865,7 @@ def _knn_mouth_frames_from_raw_frames(
         t_ms = int(t_ms)
         vad = int(vad) if vad is not None else 0
         if vad == 0:
-            out_frames.append({"t_ms": t_ms, "mouth_id": 0})
+            out_frames.append({"t_ms": t_ms, "mouth_id": 0, "vad_active": 0})
             continue
 
         f1 = fr.get("f1_hz")
@@ -692,7 +879,7 @@ def _knn_mouth_frames_from_raw_frames(
             mid = int(fallback_id_active)
             if mid == 0:
                 mid = 2
-            out_frames.append({"t_ms": t_ms, "mouth_id": mid})
+            out_frames.append({"t_ms": t_ms, "mouth_id": mid, "vad_active": vad})
             continue
 
         qz = mod._z_point(float(f1), float(f2), z)
@@ -700,7 +887,7 @@ def _knn_mouth_frames_from_raw_frames(
         ratio = (top / top2) if top2 > 0 else 999.0
         if ratio < float(min_conf_ratio):
             pred = int(fallback_id_active) if int(fallback_id_active) != 0 else 2
-        out_frames.append({"t_ms": t_ms, "mouth_id": int(pred)})
+        out_frames.append({"t_ms": t_ms, "mouth_id": int(pred), "vad_active": vad})
 
     return out_frames
 
@@ -3266,6 +3453,7 @@ def _process_audio_chunk_knn_sync(
             except Exception:
                 pass
 
+    _apply_primary_stress_hold_after_knn(job=job, turn_state=turn_state)
     return int(frames_n)
 
 
@@ -4583,6 +4771,24 @@ async def _receive_loop(
                         accum += str(transcription_text)
                         turn_state["transcription_accum"] = accum
 
+                        received_ms = 0
+                        if turn_state.get("turn_start_perf") is not None:
+                            received_ms = int(
+                                round(
+                                    (
+                                        time.perf_counter()
+                                        - float(turn_state["turn_start_perf"])
+                                    )
+                                    * 1000.0
+                                )
+                            )
+                        _ingest_primary_stress_transcript(
+                            turn_state=turn_state,
+                            knn_script=knn_script,
+                            accum=accum,
+                            received_ms=int(received_ms),
+                        )
+
                         seen_tags = list(turn_state.get("live_emo_seen_tags") or [])
                         emo_ids = _extract_emo_ids_from_transcription(accum)
 
@@ -5716,6 +5922,11 @@ async def _run(args: argparse.Namespace) -> int:
     )
 
     knn_script = m3_repo / "tools" / "knn_from_formant_raw_to_mouth_timeline.py"
+    gt_glob = _resolve_stream_mouth_gt_glob(
+        m3_repo=m3_repo,
+        stream_mouth_gt_glob=getattr(args, "stream_mouth_gt_glob", None),
+    )
+    print(f"[session_loop] knn gt_glob={gt_glob}", flush=True)
 
     base_cfg_path = (
         Path(args.m0_base_config).resolve()
@@ -6065,7 +6276,7 @@ async def _run(args: argparse.Namespace) -> int:
                     mouth_raw_json=dummy_raw_json,
                     mouth_json=dummy_mouth_json,
                     knn_script=knn_script,
-                    gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                    gt_glob=gt_glob,
                     step_ms=int(args.step_ms),
                     turn_state=turn_state,
                     mouth_updated_event=Event(),
@@ -6197,7 +6408,7 @@ async def _run(args: argparse.Namespace) -> int:
                         mouth_raw_json=dummy_raw_json,
                         mouth_json=dummy_mouth_json,
                         knn_script=knn_script,
-                        gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                        gt_glob=gt_glob,
                         step_ms=int(args.step_ms),
                         turn_state=turn_state,
                         mouth_updated_event=Event(),
@@ -6588,7 +6799,7 @@ async def _run(args: argparse.Namespace) -> int:
                     mouth_raw_json=mouth_raw_json,
                     mouth_json=mouth_json,
                     knn_script=knn_script,
-                    gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                    gt_glob=gt_glob,
                     step_ms=int(args.step_ms),
                     turn_state=turn_state,
                     mouth_updated_event=mouth_updated_event,
@@ -6640,7 +6851,7 @@ async def _run(args: argparse.Namespace) -> int:
                         mouth_raw_json=mouth_raw_json,
                         mouth_json=mouth_json,
                         knn_script=knn_script,
-                        gt_glob=str(m3_repo / "data" / "knn_db" / "*.f1f2.json"),
+                        gt_glob=gt_glob,
                         step_ms=int(args.step_ms),
                         mouth_obj_ref=mouth_obj_ref,
                         knn_inmemory=bool(knn_inmemory),
@@ -7968,6 +8179,14 @@ def main() -> int:
     )
 
     ap.add_argument("--step_ms", type=int, default=40)
+    ap.add_argument(
+        "--stream_mouth_gt_glob",
+        default=None,
+        help=(
+            "kNN GT glob/path. Default: <m3>/data/knn_db/*.f1f2.json. "
+            "EN: pass data/knn_db/en_10files.phoneme_gt.f1f2.json"
+        ),
+    )
     ap.add_argument("--stream_mouth_m0_chunk_len_ms", type=int, default=120)
 
     ap.add_argument(

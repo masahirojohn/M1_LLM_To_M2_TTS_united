@@ -296,7 +296,13 @@ def _run_m0_one_chunk(
     cfg.setdefault("inputs", {})
     cfg.setdefault("atlas", {})
 
-    cfg["io"]["assets_dir"] = str((m0_repo / "assets" / "sprites").resolve())
+    en_atlas = m0_repo / "assets" / "atlas.en.json"
+    if en_atlas.is_file():
+        cfg["io"]["assets_dir"] = str((m0_repo / "assets").resolve())
+        cfg["atlas"]["atlas_json"] = str(en_atlas.resolve())
+    else:
+        cfg["io"]["assets_dir"] = str((m0_repo / "assets" / "sprites").resolve())
+        cfg["atlas"]["atlas_json"] = str((m0_repo / "assets" / "atlas.min.json").resolve())
     cfg["io"]["out_dir"] = str(run_dir.resolve())
     cfg["io"]["exp_name"] = "realtime_step1_chunk"
 
@@ -310,7 +316,6 @@ def _run_m0_one_chunk(
     # Phase 9: raw BGRA FG (~1ms/frame) — VirtualCam reads .bgra (PNG fallback kept).
     cfg["render"]["fg_format"] = "bgra"
 
-    cfg["atlas"]["atlas_json"] = str((m0_repo / "assets" / "atlas.min.json").resolve())
     cfg["atlas"]["affine_points_yaml"] = str((m0_repo / "configs" / "affine_points.yaml").resolve())
     cfg["render"]["affine_points_yaml_rel"] = str((m0_repo / "configs" / "affine_points.yaml").resolve())
 
