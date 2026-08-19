@@ -609,6 +609,29 @@ _KNN_FUNC_CACHE: dict[str, Any] = {}
 _KNN_GT_CACHE: dict[str, dict[str, Any]] = {}
 
 
+def _preload_knn_script_live_deps(*, knn_script: Path) -> None:
+    """If this knn_script's M3 has knn_predictor.py, bind it by file path.
+
+    session_loop already imported JP m3p.live.mouth_streamer_oc, so a later
+    `from m3p.live.knn_predictor import ...` would hit the JP package (no file).
+    JP M3 has no knn_predictor.py → no-op.
+    """
+    m3_root = knn_script.resolve().parent.parent
+    live_dir = m3_root / "src" / "m3p" / "live"
+    knn_predictor_py = live_dir / "knn_predictor.py"
+    if not knn_predictor_py.is_file():
+        return
+    schema_py = live_dir / "mouth_schema.py"
+    if schema_py.is_file() and "m3p.live.mouth_schema" not in sys.modules:
+        _load_module_from_path(name="m3p.live.mouth_schema", path=schema_py)
+    _load_module_from_path(name="m3p.live.knn_predictor", path=knn_predictor_py)
+    print(
+        "[knn][preload]",
+        f"knn_predictor={knn_predictor_py}",
+        flush=True,
+    )
+
+
 def _load_knn_runtime_module(*, knn_script: Path) -> Any:
     key = str(knn_script.resolve())
     if key not in _KNN_MODULE_CACHE:
@@ -619,6 +642,7 @@ def _load_knn_runtime_module(*, knn_script: Path) -> Any:
         if spec is None or spec.loader is None:
             raise RuntimeError(f"failed to load knn module: {knn_script}")
 
+        _preload_knn_script_live_deps(knn_script=knn_script)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
 

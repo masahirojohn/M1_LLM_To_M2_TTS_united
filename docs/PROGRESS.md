@@ -2267,7 +2267,8 @@
 | EN-RT0b | atlas.en.json 配置＋ mouth_ch.png ファイル名 SSOT | `pass` | 2026-08-18 |
 | EN-RT1 | English kNN → 9 mouth → M0（Realtime） | `pass` | 2026-08-18（Pass-with-defer: Live主観→EN-LIVE1、id6 GT→EN-DB1） |
 | EN-RT2 | Primary Stress Event → kNN 未送信 frame → 160ms Hold | `pass` | 2026-08-18 |
-| （予約） | EN-LIVE1 Live主観 | — | `prompts_en`＋`--prompt_dir`＋`--output_audio_transcription`＋親承認後。今は不要 |
+| EN-LIVE1 | 英語 Live 主観 | `pass` | 2026-08-19（Fail→hf 再走 Pass） |
+| EN-LIVE1hf | EN kNN ファイル経路 load | `pass` | 2026-08-19 |
 | （backlog） | EN-DB1 knn GT 穴（id6=0 / id4=1） | — | Hold の前提ではない。DB 再作成時 |
 | （backlog） | angry `leftdown` / `rightup` 欠 | — | 資産追加時は `_` なし。今は捏造しない |
 | EN-RT3 | CTC Alignment（Wav2Vec2 等） | `deferred` | 当面やらない |
@@ -2278,7 +2279,10 @@
 JP: --m3_repo_root C:\dev\M3_Live_API_1_united  --m0_repo_root C:\dev\M0_session_renderer_final_1
 EN: --m3_repo_root C:\dev\M3_Live_API_1_english --m0_repo_root C:\dev\M0_session_renderer_final_1_english
     --stream_mouth_gt_glob data/knn_db/en_10files.phoneme_gt.f1f2.json
-EN Live 時のみ: --prompt_dir <m1>/configs/prompts_en
+EN Live:
+  --prompt_dir C:\dev\M1_LLM_To_M2_TTS_united\configs\prompts_en
+  --output_audio_transcription
+pose/bg は当面 JP/M3.5 絶対パスのまま（口スプライトだけ M0 EN）。
 ```
 
 Live API 自体は共通。切替は repo root・gt_glob・（Live時）prompt_dir。JP 既定 `configs/prompts` は上書きしない。
@@ -2479,11 +2483,84 @@ timelines/mouth/en/mouth_current_en.json
 - **Pass。** Keep = 未送信のみ 160ms Hold、図A順（KNN→Hold→M0→enqueue）、JP no-op。
 - **Live 主観はまだ不要。** EN-LIVE1 は prompt 切替と親承認のあと。CTC / EN-DB1 / 欠 view はやらない。
 
-**EN-LIVE1 前提（予約・今は子を出さない）:**
+**EN-LIVE1 前提（親承認済み・2026-08-18 発行）:**
 - `configs/prompts_en/` 同名 txt ＋ `--prompt_dir`（JP `configs/prompts` 非上書き）
 - EN 起動に `--output_audio_transcription`
 - g2p-en + nltk（M1 `.venv` は子が投入済）
 - transcript 遅れは仕様（既送信は戻せない）
+- pose/bg は JP/M3.5 資産のまま可
+
+---
+
+## Phase EN-LIVE1: 英語 Live 主観
+
+**目的:** JP 実働主観コマンドを差分だけで英語 Live に通し、口形・Hold が破綻しないことを見る。実装本線（RT）の新規設計はしない。
+
+**設計決定:**
+- 起動は JP 確認済みコマンドがベース。作り直さない
+- 必須差分: m3/m0 EN、`--prompt_dir` EN、`--output_audio_transcription`、`--stream_mouth_gt_glob` = `en_10files` のみ
+- `configs/prompts_en` は同名 txt の新規。JP `configs/prompts` は無断上書き禁止。`if language` 禁止
+- pose/bg/m35 は **JP 絶対パスのまま**（口スプライトは `--m0_repo_root` EN）
+- Keep: 方式2 VAD、N=2、`--no-fast_inmemory`、jitter 300/240、talkover/event/OBS 系ファイル、mic/audio device
+- スコープ外: CTC、EN-DB1、欠 view、B/O 再開、ジッタ延長
+
+**Pass 基準:**
+- [x] `configs/prompts_en` が同名で存在し、JP `configs/prompts` が未変更
+- [x] 英語で音声返答する（4 ターン想定、主観） — hf 再走で Pass
+- [x] 口形が変化する（固着しない） — 短いフリーズは観察（Gate にしない）
+- [x] Hold でクラッシュ／図A破壊なし。AUDIO_BEFORE_M0 悪化なし
+- [x] JP 経路を壊す変更なし
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-08-18）:**
+- SESSION `sess_en_live1_subj_20260818_222706`。transcription は英語 4 ターン。player/OBS は無音。mouth/M0 未生成。
+- AUDIO_BEFORE_M0=0 だが emitted=0 / PLAYING=0（enqueue なし）。
+- Blocker: Live KNN が `ModuleNotFoundError: m3p.live.knn_predictor` を 475 回。session_loop が先に JP `m3p` を bind し、EN knn スクリプトの import が JP パッケージを見る。
+
+**親判定（2026-08-18）:**
+- **Fail。** prompts_en と起動差分は Keep。KNN import を **EN-LIVE1hf** で直す。
+- 採用: Hold と同様の **ファイル経路 load**（`knn_predictor` / 必要なら `mouth_schema`）。`sys.path` 追加だけでは既 import の JP `m3p` を解けない。
+- 出さない: JP M3 へ EN ファイル混入、`if language`、PYTHONPATH で `m3p` 全体差替（MouthStreamerOC が壊れる）、ジッタ延長、CTC。
+
+**親再判定（2026-08-19）:**
+- **Pass。** Blocker は EN-LIVE1hf で解消。SESSION `sess_en_live1_subj_20260819_140651`。
+- Keep: prompts_en / en_10files / EN m3・m0 切替 / `_preload_knn_script_live_deps`
+- 観察（非Gate）: ターン後半の短い口フリーズ（turn2 tail の M0 lock/png_wait 候補）。トーク被りは応答が速いため。ジッタ延長しない。
+
+---
+
+---
+
+## Phase EN-LIVE1hf: EN kNN をファイル経路 load
+
+**目的:** EN knn スクリプトが JP `m3p` に吸い込まれないようにする。主観は hotfix 後に同じ EN コマンドで再走。
+
+**設計決定:**
+- 挿入点: `_load_knn_runtime_module` の `exec_module` 前
+- `knn_script` の M3 root に `src/m3p/live/knn_predictor.py` があれば、Hold と同じ `_load_module_from_path` で `mouth_schema` → `knn_predictor` を `sys.modules` に載せてから knn スクリプトを exec
+- ファイルが無い JP M3 は no-op（現行どおり）
+- 図A・gt_glob・prompts・jitter は触らない
+
+**Pass 基準:**
+- [x] EN Live で `knn_predictor` ModuleNotFoundError が 0
+- [x] chunks_n / mouth が生成される
+- [x] JP knn 経路を壊す変更なし（ファイル無しなら preload しない）
+- [x] 同じ EN-LIVE1 コマンドで再走。親向けサマリー＋主観
+
+**子報告要約（2026-08-19）:**
+- `_preload_knn_script_live_deps` を `_load_knn_runtime_module` の exec 直前。Hold と同じ `_load_module_from_path`。JP は no-op。
+- ModuleNotFoundError=0。`[knn][preload]` 1 回。chunks_n=262。knn_done=enqueue_done=m0_done=483。AUDIO_BEFORE_M0=0。
+- Hold applied>0 が 21。MouthStreamerOC は JP bind のまま。
+
+**親判定（2026-08-19）:**
+- **Pass。** Keep = `_preload_knn_script_live_deps`。EN-LIVE1 を Pass に戻す。
+- 英語本線（RT+LIVE1）はクローズ可。次本線なし。CTC / EN-DB1 / 欠 view は出さない。
+
+---
+
+---
+
+---
 
 ---
 
@@ -2645,3 +2722,6 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-18 | EN-RT0/0b を EN リポに commit+tag。M3 `2f961bc`/`en-rt0-pass`、`3817a79`/`en-rt0b-pass`。M0 EN `baf0052`/`en-rt0b-pass`（PNG は JP 同様 gitignore）。M1 未 commit。push なし |
 | 2026-08-18 | EN-RT1 Pass-with-defer。kNN en_10files/k=9 と M0 `<expr>/<view>/` 接続。Live主観は EN-LIVE1（`--prompt_dir configs/prompts_en`、JP prompts 非上書き）。id6 GT は EN-DB1。次本線=EN-RT2 |
 | 2026-08-18 | EN-RT2 Pass。未送信 frame に 160ms Hold。図A=KNN→Hold→M0→enqueue。Live主観はまだ不要。次予約=EN-LIVE1 |
+| 2026-08-18 | EN-LIVE1 発行。JP 主観コマンド差分。prompts_en 新規、pose/bg は JP のまま。CTC/DB1/欠view 対象外 |
+| 2026-08-18 | EN-LIVE1 Fail。transcription 英語4tだが KNN が JP m3p を見て knn_predictor 欠。prompts_en Keep。hotfix=ファイル経路 load |
+| 2026-08-19 | EN-LIVE1hf Pass。Hold と同じファイル経路で knn_predictor を EN 先載せ。再走 `sess_en_live1_subj_20260819_140651`。ModuleNotFoundError=0、chunks_n=262、英語4t 主観 Pass。EN-LIVE1 を Pass に戻す。短い口フリーズとトーク被りは観察。英語本線クローズ可 |
