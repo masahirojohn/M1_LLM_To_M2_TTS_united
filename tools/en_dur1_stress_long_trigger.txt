@@ -1,0 +1,8 @@
+[STRESS LONG TURN] Do not answer briefly. Speak in English without pausing for at least 90 seconds.
+Cover these topics in order, a few sentences each, and keep going:
+1) today's weather and how it makes your body feel
+2) a breakfast you remember, including taste and texture
+3) a long recap of a funny clip or scene you liked
+4) a favorite walking route, street by street, and what you see
+5) tonight's plans and why they matter
+End with a two-sentence recap of everything you said. Call set_emotion once before you start speaking.

@@ -1414,7 +1414,8 @@
 | F1 | M0 FG 黒縁除去（unpremultiply 試行） | `pass` | 2026-08-15（Fail→Revert。blit Keep） |
 | F1s | 現行スプライトで合成主観（黒縁まだ問題か） | `pass` | 2026-08-16（**A**＝目立たない→F1クローズ） |
 | （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
-| （本線移管） | 英語版 Realtime | → EN-RT | **X1+X1b+F1s クローズ済（2026-08-16）**。番号は `EN-RT0/1/2`（下節）。JP リポ現状維持 |
+| （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
+| （本線） | 英語検証／配信 | → EN-DUR / Z | **クローズ（2026-08-21）**。DUR + Z1 Pass。次本線なし。push/merge は本線外 |
 
 ### Bライン申し送り（2026-08-11・Pass-with-defer）
 
@@ -1427,12 +1428,22 @@
 
 **AI 音声**は現行 player→PC 再生デバイスのまま OBS が音声ソースとして拾う。**BGM**は OBS メディアソースのみを WebSocket で切替し、AI PCM／VirtualCam／M0 に混ぜない。
 
+### Zoom 運用（Z1 Keep・2026-08-21）
+
+音声: USB mic → session_loop → `--audio_device` = **今クエリした CABLE Input**（この機は 6。14/19 決め打ち禁止）→ Zoom Microphone = CABLE Output / Speaker = CABLE Input。`--mic_input_device` は実マイク（通常 1）。
+
+映像: Zoom カメラは **最初から `Unity Video Capture`**（`pyvirtualcam` backend=`unitycapture` の実デバイス名）。OBS VirtualCam は OBS が Unity を拾って仮想カメラ開始しているときだけ。起動順: ログ `[virtualcam_persistent][OK] device=Unity Video Capture` を確認してから Zoom がカメラを掴む（先に Zoom を開いているならオフ→オン）。
+
+主導権 mute+interrupt は Zoom では使わない。ハウリングは設定見直し（Gate にしない）。
+
 ### 当面の非本線（今は実装させない）
 
 - API `end→first` 短縮
 - B 仕上げ（多BGV総当たり・Colab待ち仕上げ）— 再開は Colab高精度pose後 or ズレ再発時
 - Phase12 系の idle silent PCM／縫い目の品質本線化
 - 英語版 CTC（EN-RT3。当面やらない）
+- EN-DB1 / 欠 view / EN 本番システムプロンプト運用
+- EN で顔上下動時の BGV↔M0 位置ズレ（B 残差の EN 再発。B 再開はしない）
 - スミス増殖加速（任意）
 - 当てフリの Python scale／座標拡大
 - Slack トリガ本番化
@@ -2240,7 +2251,7 @@
 ## 新ライン: 英語版 Realtime（EN-RT・2026-08-17〜）
 
 > **進捗ファイル方針:** 別ファイルは作らない。本節＋下表で EN ラインを管理する（親のみ編集。子は直接編集しない）。
-> JP 品質凍結（Phase0–33／freeze）および R/I/B/O/X/F とは **番号空間を分離**（`EN-RT0`, `EN-RT1`, `EN-RT2`）。
+> JP 品質凍結（Phase0–33／freeze）および R/I/B/O/X/F とは **番号空間を分離**（`EN-RT0`, `EN-RT1`, `EN-RT2`, `EN-LIVE1`, `EN-DUR1`, `EN-DUR2`, `Z1`）。
 > **計画 SSOT:** `C:\Users\john\Desktop\EN_m3\english_m3_local_integration_precheck.md`（親は計画を作り直さない）。Phase2 オフライン口形パイプライン詳細は `english_mouth_pipeline_phase2.md`。
 > JP リポは **現状維持（サブ運用）**。英語は **別リポをメイン運用**。同一リポ `if language==ja/en` は採用しない。
 
@@ -2269,8 +2280,15 @@
 | EN-RT2 | Primary Stress Event → kNN 未送信 frame → 160ms Hold | `pass` | 2026-08-18 |
 | EN-LIVE1 | 英語 Live 主観 | `pass` | 2026-08-19（Fail→hf 再走 Pass） |
 | EN-LIVE1hf | EN kNN ファイル経路 load | `pass` | 2026-08-19 |
+| EN-DUR1 | 英語 1ターン長文ストレス（口頭） | `hold` | 2026-08-20（図A短ターンOK・長文未達） |
+| EN-DUR1b | 英語 1ターン無人長尺（trigger 例外） | `hold` | 2026-08-20（trigger到達・90s未達） |
+| EN-DUR1c | DUR専用 prompt_dir＋idle 0 無人長尺 | `pass` | 2026-08-20（Pass-with-defer。手元長文・無人PCM未着） |
+| EN-DUR2 | 英語 多ターン（12t。4t 延長） | `pass` | 2026-08-20 |
+| Z1 | Zoom 配信検証（JP + EN） | `pass` | 2026-08-21 |
 | （backlog） | EN-DB1 knn GT 穴（id6=0 / id4=1） | — | Hold の前提ではない。DB 再作成時 |
 | （backlog） | angry `leftdown` / `rightup` 欠 | — | 資産追加時は `_` なし。今は捏造しない |
+| （backlog） | EN 顔上下動時 BGV↔M0 ズレ | — | B 残差の EN 再発。EN-DUR2 T6 / Z1 でも観察。今は再開しない |
+| （backlog） | EN 本番システムプロンプト運用 | — | 方針のみ確定（下節）。**今は prompts_en / JP prompts 非編集** |
 | EN-RT3 | CTC Alignment（Wav2Vec2 等） | `deferred` | 当面やらない |
 
 ### 日本語併用（切替のみ）
@@ -2554,17 +2572,295 @@ timelines/mouth/en/mouth_current_en.json
 
 **親判定（2026-08-19）:**
 - **Pass。** Keep = `_preload_knn_script_live_deps`。EN-LIVE1 を Pass に戻す。
-- 英語本線（RT+LIVE1）はクローズ可。次本線なし。CTC / EN-DB1 / 欠 view は出さない。
+- 英語実装本線（RT+LIVE1）はクローズ。**次本線=検証ライン EN-DUR1 → EN-DUR2 → Z1**（2026-08-20）。CTC / EN-DB1 / 欠 view は出さない。push/merge は本線外（ユーザー判断）。
 
 ---
 
----
+## 新ライン: 英語検証／配信（EN-DUR / Z・2026-08-20〜）
+
+> 実装本線（EN-RT / EN-LIVE1）はクローズ。以降は **運用確認**（長尺→多ターン→Zoom）。図A非破壊。品質 Phase の再開ではない。
+> コマンドは **一から作らない**。EN-DUR は EN-LIVE1 4t をベース。JP 長尺の synth / `response_trigger` / `silence 600` は盲目コピー禁止。
+> Zoom は別 Phase。着手時にユーザーが旧コマンドを添付する。
+
+### コマンド差分（親固定・EN-DUR1）
+
+ベース = EN-LIVE1 4t（Pass）。JP 長尺は「1ターン長文」の意図だけ借りる。
+
+| 項目 | EN-LIVE1 4t | JP 長尺 | EN-DUR1 |
+| --- | --- | --- | --- |
+| `--m3_repo_root` / `--m0_repo_root` | EN | JP | **EN Keep** |
+| `--prompt_dir` | `configs/prompts_en` | `configs/prompts` | **prompts_en Keep**（JP prompts 非上書き） |
+| `--output_audio_transcription` | ON | ON | Keep |
+| `--stream_mouth_gt_glob` | `en_10files` | （なし） | **en_10files Keep** |
+| `--turns` | 4 | 1 | **1** |
+| `--gap_s` | 1.0 | 0.5 | 1.0 Keep（1t では実質無影響） |
+| `--turn_idle_wait_s` | 2.5 | 3.0 | 2.5 Keep |
+| `--turn_first_audio_timeout_s` | 60 | 90 | **90**（長文生成待ち。ジッタではない） |
+| `--mic_send_max_s` | 25 | 18 | **25 Keep**（EN 運用。JP 18 に下げない） |
+| `--mic_vad_silence_ms` | 350 | 600 | **350 Keep**（R クローズ後の通常。600 に戻さない） |
+| synth cable | なし | あり | **なし**（実 mic。EN-LIVE1 と同じ） |
+| `--response_trigger` | なし | JP 長文 txt | **なし**（盲目コピー禁止。オペレーターが英語で長返答を依頼） |
+| `--audio_priority_mode` / `--no-knn_inmemory` / `--skip_archive_pcm` / `--knn_incremental` / `--m0_worker_port` / `--mic_vad_debug` | なし | あり | **なし** |
+| 出力デバイス CLI | `--audio_device 19` | `--ai_audio_output_device 19` | **`--audio_device 19` Keep** |
+| N=2 / `--no-fast_inmemory` / jitter 300/240 | あり | あり | Keep |
+| battle / event / bg_override ファイル | あり | なし | **EN-LIVE1 Keep** |
+| pose / bg / m35 | JP 絶対パス | 同 | Keep（口スプライトだけ M0 EN） |
+
+EN-DUR2（予約）: 同じ EN-LIVE1 4t を `--turns 12` へ。必要なら `gap_s` / `turn_idle_wait_s` のみ。通常パスへ trigger を残さない。
+Z1（予約）: JP と EN の両方。コマンドはユーザー添付後に親が固定。今は着手しない。
 
 ---
 
----
+## Phase EN-DUR1: 英語 1ターン長文ストレス
+
+**目的:** EN-LIVE1（短 4t）の延長として、**1 ターン長文**で口・供給・図Aが破綻しないことを主観＋ログ要約で確認する。新規設計・品質チューニングはしない。
+
+**設計決定:**
+- 起動は EN-LIVE1 4t コマンドがベース。上表の差分以外は変えない
+- JP 長尺の synth / trigger / silence 600 はコピーしない
+- オペレーターが英語で「長く話して」と依頼する（テキストトリガ新設禁止）
+- Keep: 方式2、図A、N=2、`--no-fast_inmemory`、audio_ms SSOT、jitter 300/240、silence 350
+- 短い口フリーズ（EN-LIVE1 観察）は Gate にしない。ジッタ延長で隠さない
+- スコープ外: EN-DUR2、Z1、CTC、EN-DB1、欠 view、B/O 再開、本番システムプロンプト、push/merge
+- 実装は **Blocker があるときだけ**親へ報告。勝手に直さない（LIVE1hf 型は親承認後）
+
+**Pass 基準:**
+- [ ] 1 ターンで英語の長め返答が最後まで鳴る（主観）
+- [ ] 口形が変化する（全程固着しない）。短い局所フリーズは観察メモ可
+- [ ] 図A非破壊: AUDIO_BEFORE_M0=0、enqueue 到着順、通常 `clear_queue` 0（割り込み例外以外）
+- [ ] 方式2 / N=2 / `--no-fast_inmemory` / jitter 300/240 / silence 350 維持
+- [ ] JP M3/M0 / `configs/prompts` 非破壊。親向けサマリーのみ（diff/ログ全文なし）
+
+**Fail:** クラッシュ、無音、口が全程固着、AUDIO_BEFORE_M0>0、JP 経路破壊、ジッタ延長や口形捨てで症状隠し。
+
+**子報告（2026-08-20）:**
+- 142252 / 143157。AI 音声・口変化あり。AUDIO_BEFORE_M0=0、clear 実体 0、ModuleNotFound 0。Keep 維持。コード差分なし。
+- 長文未達。transcription は短文（世間話／tuna 2文途中切れ）。
+- 主因候補: (1) `prompts_en/00_base_system.txt` が "Keep replies short, about one sentence."（JP prompts も1文。未編集） (2) `turn_idle_wait_s=2.5` 対 player pending（tail 未 drain でプロセス終了しうる）。図A破壊ではない。
+- 運用メモ: EN 主観はオペレーター手元起動を推奨。
+
+**親判定（2026-08-20）:**
+- **Hold。** 短ターンとしての口・供給・図Aは動く。1ターン長文ストレスは未達。EN-DUR2 に進まない。
+- 口頭「長く」だけでは `prompts_en` の1文制約を越えられない。`prompts_en` 本番は触らない（B 不採用。本番プロンプト運用は backlog）。
+- ユーザー希望 = **無人長尺のあと手元主観**。次 = **EN-DUR1b**（C+D の DUR 専用例外）。通常ターンの trigger 本線復活はしない。
 
 ---
+
+## Phase EN-DUR1b: 英語 1ターン無人長尺（DUR 専用 trigger 例外）
+
+**目的:** EN-DUR1 の長文未達を、**無人 1 ターン長尺**で再現し、その後オペレーター手元主観も取る。図A非破壊。品質チューニング・prompts_en 本番変更はしない。
+
+**設計決定（親 Go・C+D）:**
+- 通常パスは `--skip_response_trigger` default True のまま。argparse 既定を変えない
+- DUR 起動だけ `--no-skip_response_trigger` + **EN 専用** 英語長文 txt（新ファイル。JP `phase10_stress_long_trigger.txt` を使わない／日本語で話せと書かない）
+- 無人: 既存 `tools/phase1_play_synth_speech_to_cable.py` で VAD 窓に入れる。**方式2は維持**（synth は activity 用。server VAD 復活禁止）
+- `turn_idle_wait_s` を **20**（再生 tail drain 待ち。ジッタ 300/240 は変えない）
+- 入れない: silence 600、`audio_priority_mode`、`--no-knn_inmemory`、`--skip_archive_pcm`、`--knn_incremental`、`--m0_worker_port`、`--mic_vad_debug`
+- `prompts_en` / JP `configs/prompts` / JP M3/M0 は触らない
+- session_loop 本線ロジック変更なし（既存 CLI のみ）
+
+### コマンド差分（親固定・EN-DUR1b）
+
+ベース = EN-DUR1 コマンド。追加例外だけ。
+
+| 項目 | EN-DUR1 | EN-DUR1b |
+| --- | --- | --- |
+| `--turns` | 1 | 1 Keep |
+| `--mic_vad_silence_ms` | 350 | **350 Keep** |
+| jitter | 300/240 | Keep |
+| `--turn_idle_wait_s` | 2.5 | **20**（drain。ジッタではない） |
+| `--response_trigger` | なし | **DUR 起動のみ** `tools/en_dur1_stress_long_trigger.txt` |
+| `--skip_response_trigger` | default True | この起動だけ `--no-skip_response_trigger` |
+| synth | なし | **無人ランのみ**。delay_s=4 / voice_s=2.5 / tail_silence_s=1.0 |
+| 無人 mic / synth device | mic=1（実マイク） | **ケーブル組**。案: synth `--device 6` → `--mic_input_device 4`（JP 長尺と同じ組）。EN-LIVE1 の mic 1 は手元主観用。違うならユーザーが番号置換 |
+| 手元主観 | — | synth なし、`--mic_input_device 1`、trigger は残す（prompts_en 1文のまま口頭だけでは長文にならない） |
+
+**手順:** (1) 無人ラン → ログ要約 (2) 同じ trigger で手元主観（synth なし）。EN-DUR2 にはまだ進まない。
+
+**Pass 基準:**
+- [ ] 無人 1 ターンで英語が **短文で終わらず** 長く続く（目安: 数十秒以上。90s 未達は観察可、2〜3言で終わりは Fail）
+- [ ] 口形が変化する。短い局所フリーズは観察メモ（Gate にしない）
+- [ ] 最後まで鳴る／プロセスが tail 前に殺して切らない（`pending_ms` 対 idle 20 を要約）
+- [ ] AUDIO_BEFORE_M0=0、通常 clear 0、方式2 / N=2 / no-fast_inmemory / jitter 300/240 / silence 350
+- [ ] default skip_trigger 未変更。JP prompts / prompts_en 未変更
+- [ ] 手元主観メモ（ユーザー実施。子はコマンドを渡す）
+- [ ] 親向けサマリーのみ
+
+**Fail:** 短文のまま、無音、図A破壊、既定 skip を False に恒久化、silence 600 混入、prompts_en 上書き。
+
+**子報告（2026-08-20）:**
+- 無人 `sess_en_dur1b_unatt_20260820_145056`: Fail。synth delay 4 より先に I1 `idle_utterance_s=3` が発火。`first_turn_prime` が JP idle 短文を text 送信。`--no-skip` でも `already_fired_in_mic` で EN 長尺 trigger 未送。mic `has_spoken=False`。transcription 2文数秒。AUDIO_BEFORE_M0=0。
+- 手元 `sess_en_dur1b_subj_20260820_145614`: trigger 送信。体感 4–5文。モデルが「short のみ許可」と明言。90s なし。queued≈25s / [OK] played≈15s pending≈10s。AUDIO_BEFORE_M0=0。図A/口/音声は短〜中ターンとして動く。
+- コード: `tools/en_dur1_stress_long_trigger.txt` 新規のみ。session_loop / argparse skip 既定 / prompts_en 未変更。
+- 観察（本線外）: EN 化後の BGV↔M0 上下ズレが JP より大きい気がする → 既存 backlog。DUR では触らない。
+
+**親判定（2026-08-20）:**
+- **Hold。** trigger 例外パスは手元で到達。無人は I1 競合で未到達。90s Gate は `prompts_en` 一文制約が勝つ。EN-DUR2 に進まない。
+- 本番 `prompts_en` は触らない（backlog「EN 本番システムプロンプト」）。I1 default 3.0 も変えない。
+- 次=**EN-DUR1c**: DUR 専用 `configs/prompts_en_dur`（コピー＋長さ行のみ）＋無人は `--idle_utterance_s 0`（既存 CLI。I1 Keep 破壊ではない）。
+
+---
+
+## Phase EN-DUR1c: DUR専用 prompt_dir＋idle 0 無人長尺
+
+**目的:** 長文ストレスを、本番 `prompts_en` を変えずに通す。I1 競合を無人ランだけ既存 CLI で避ける。図A非破壊。session_loop 本線は触らない。
+
+**設計決定:**
+- `configs/prompts_en` は **コピーして** `configs/prompts_en_dur` を新設。同名ファイル一式。**長さ行だけ**緩める（"Keep replies short, about one sentence." を長尺許可に置換）。emo 規則はそのまま
+- JP `configs/prompts` と本番 `prompts_en` は非上書き
+- `--prompt_dir` を DUR 起動だけ `prompts_en_dur` へ。`if language` 禁止
+- 無人: `--idle_utterance_s 0`（既存。`<=0` で I1 無効）。default 3.0 は変えない。synth delay 4 はそのまま可
+- trigger 例外は 1b Keep（`--no-skip` + `tools/en_dur1_stress_long_trigger.txt`）
+- `--turn_idle_wait_s 45`（90s 相当の drain。ジッタ 300/240 は据え置き）
+- 入れない: silence 600、session_loop 改修、I1 既定変更、B/O 再開
+- EN BGV↔M0 上下ズレは backlog。本 Phase で触らない
+
+### コマンド差分（親固定・EN-DUR1c）
+
+ベース = EN-DUR1b。追加例外だけ。
+
+| 項目 | EN-DUR1b | EN-DUR1c |
+| --- | --- | --- |
+| `--prompt_dir` | `prompts_en` | **`prompts_en_dur`（DUR 専用）** |
+| `--idle_utterance_s` | default 3 | **無人・手元とも 0**（I1 既定は維持） |
+| `--turn_idle_wait_s` | 20 | **45**（drain） |
+| trigger / --no-skip | DUR のみ | Keep |
+| synth 無人 | delay 4 / device 6 / mic 4 | Keep |
+| 手元 mic | 1 | Keep（synth なし） |
+| jitter / silence 350 / N=2 | Keep | Keep |
+
+**手順:** (1) `prompts_en_dur` 作成 (2) 無人ラン (3) 手元主観コマンドをユーザーへ渡す。EN-DUR2 にはまだ進まない。
+
+**Pass 基準:**
+- [ ] 無人で EN 長尺 trigger が送られる（I1 `already_fired_in_mic` でスキップされない）
+- [ ] 英語が短文拒否で終わらず、**数十秒以上**続く（90s は目標。未達でも 20s+ 連続なら親が Pass-with-defer 可）
+- [ ] 口形変化。短いフリーズは観察。AUDIO_BEFORE_M0=0、通常 clear 0
+- [ ] `prompts_en` / JP prompts / I1 default 3.0 / skip default True 未変更
+- [ ] 手元主観メモ（ユーザー実施）
+- [ ] 親向けサマリーのみ
+
+**Fail:** また 2〜3言、I1 が先に発火、prompts_en 上書き、図A破壊、ジッタ延長。
+
+**子報告（2026-08-20）:**
+- 無人 `sess_en_dur1c_unatt_20260820_151530`: trigger 到達・I1 非発火。実 PCM 0（mic4 `no_speech`）。`first_audio timeout`。再生は idle_silent のみ。AUDIO_BEFORE_M0=0。
+- 手元 `sess_en_dur1c_subj_20260820_222002`: 主観 OK（かなり長文・口・音量）。`audio_ms≈31.6s`。AUDIO_BEFORE_M0=0、clear 実体 0。90s トピック完走ではない。`generation_complete` なし（drain 観察。本線非接触）。
+- 差分: `configs/prompts_en_dur/` 新規（長さ行のみ）。`prompts_en` / session_loop / I1 default / skip default 未変更。
+
+**親判定（2026-08-20）:**
+- **Pass-with-defer。** 長文能力は手元で証明（支配層= system 長さ行）。無人 Fail はケーブル/mic PCM 未着であり、長文欠如ではない。90s 完走は非Gate。
+- Keep: `prompts_en_dur` は **DUR 検証用**。通常パスへ残さない。`prompts_en` 一文は DUR 検証 Keep であり、プロダクト最終形ではない。
+- defer: 無人ケーブル、90s 完走、`generation_complete` なし、BGV delta。
+- 次本線=**EN-DUR2**（12t・本番 `prompts_en`）。prompt 本番化は backlog。
+
+### 本番長さ方針（backlog・今は実装しない）
+
+相談方針を親が採用。session_loop 新スイッチは作らない。今は `prompts_en` / JP prompts を触らない。
+
+| 層 | 内容 |
+| --- | --- |
+| 長さ SSOT | prompt。将来 `00_base` から1文硬拘束を外す。通常=`20_normal`（1〜2文）。バトル=さえぎられるまで話してよい |
+| 起動切替 | 長尺配信だけ `--prompt_dir`（DUR の 60–90s テスト文面は本番に使わない） |
+| 主導権 | 床取り（mic mute＋割り込み）。定型「短く話せ」は用途と逆 → 後で直す。単独では一文のまま終わる |
+| やらない | `prompts_en` 恒久を 60–90s にする、`--no-skip` 本線化、I1 を長文装置化、案2（00_base 都度編集） |
+
+---
+
+## Phase EN-DUR2: 英語 多ターン（12t）
+
+**目的:** EN-LIVE1 の 4t 運用確認を **12 turns** へ延長する。長尺ストレスではない。図A非破壊。
+
+**設計決定:**
+- ベース = EN-LIVE1 4t。差分は `--turns 12` のみ
+- `--prompt_dir` = 本番 `configs/prompts_en`（一文のまま。短返信は Fail にしない）
+- DUR 例外を残さない: `prompts_en_dur` / `--idle_utterance_s 0` / `--no-skip_response_trigger` / `--response_trigger`
+- I1 default 3.0・skip default True・jitter 300/240・silence 350・N=2・`--no-fast_inmemory`
+- `gap_s=1.0` / `turn_idle_wait_s=2.5` / `turn_first_audio_timeout_s=60` は LIVE1 Keep
+- session_loop 非変更。prompts_en / JP prompts 非編集
+- 手元 mic=1。synth なし。子は mic 非占有
+- BGV↔M0 / 本番プロンプト運用は backlog
+
+**Pass 基準:**
+- [x] 12 ターン完走（またはオペレーターが実施したターン数を明記。途中落ちは Fail）
+- [x] 各ターンで英語音声と口変化（短文でよい）
+- [x] AUDIO_BEFORE_M0=0、通常 clear 0、方式2 / N=2 / no-fast_inmemory 維持
+- [x] DUR 例外フラグなし（prompt_dir=prompts_en、idle 既定、skip True）
+- [x] 親向けサマリーのみ。コード差分なしが正
+
+**Fail:** クラッシュ、無音連続、口全程固着、AUDIO_BEFORE_M0>0、DUR 例外の持ち込み、prompts_en 編集。
+
+**子報告（2026-08-20）:**
+- SESSION `sess_en_dur2_subj_20260820_231430`。12/12。AUDIO_BEFORE_M0=0、clear 実体 0、timeout 0、pipeline 1479 揃い。hang/mouth_closed/supply_gap=0。
+- 主観: 音声・口は大きな問題なし。各ターンは自然な数文。T12 は I1 自発（本番相当）。後半固着・無音なし。
+- 観察（非Gate）: T6 BGV↔M0 上下ずれ。返答のかぶり／~2s ばらつき。idle fire 2（T7, T12）。REBUFFERING 実体 35（後半偏りなし）。
+- コード差分なし。DUR 例外なし。
+
+**親判定（2026-08-20）:**
+- **Pass。** Keep = EN-LIVE1 4t と同形の EN 12t 運用（`prompts_en` / skip True / I1=3 / N=2 / no-fast_inmemory / jitter 300/240 / silence 350）。
+- T6 上下ずれ → 既存 backlog。かぶり・遅延ばらつきは Gate にしない。
+- 次本線=**Z1**（ユーザーが Zoom 旧コマンドを添付するまで着手しない）。prompt 本番化は backlog。
+
+### DUR 検証成果物（Keep All / commit / tag）
+
+運用 Keep All（session_loop を DUR 例外付きにする）は **不要**。EN-DUR2 はコード差分なし。本番起動は `prompts_en`。
+
+検証ファイル（`configs/prompts_en_dur/`、`tools/en_dur1_stress_long_trigger.txt`）は **任意のローカル commit 可**（再現用。本番 default にはしない）。tag / push は必須ではない。ユーザー判断。
+
+---
+
+## Phase Z1: Zoom 配信検証（JP + EN）
+
+**目的:** JP と EN の両方で、Zoom 相手に AI 音声＋VirtualCam 映像／口が届くこと。コード改造しない。図A非破壊。品質 Phase ではない。
+
+**設計決定:**
+- 資料 `Zoomテスト用フルコマンド.md` は **ルーティングのみ採用**。旧 client-VAD フルコマンドは丸ごと復元禁止
+- 中心 = VB-CABLE ＋ `--audio_device`。USB mic → session_loop → Live API → AI 音声 → CABLE Input → Zoom
+- Zoom: Microphone = CABLE Output / Speaker = CABLE Input。カメラ = **Unity Video Capture**（OBS VirtualCam 決め打ちは誤り。下節 Keep）
+- ベース = 現行合格（JP 凍結 Live ／ EN = EN-LIVE1 4t 同形＝EN-DUR2 から `--turns 4`）。核の差分は `--audio_device` のみ
+- CABLE Input 番号は `sounddevice.query_devices()` で今取る。旧 14 も今の 19 も決め打ちしない
+- `--mic_input_device` は現行どおり実マイク（通常 1）。CABLE にしない
+- JP 4t → EN 4t。12t／DUR 長尺は出さない
+- 主導権 mute+interrupt は Zoom では使わない（資料どおり。Gate にしない）
+- ハウリングは観察メモ（Gate にしない。設定見直しは親）
+
+### コマンド差分（親固定・Z1）
+
+| 項目 | 現行合格 | 旧 Zoom md | Z1 |
+| --- | --- | --- | --- |
+| `--audio_device` | 19（ローカル再生） | 14（当時 CABLE Input） | **クエリした CABLE Input** |
+| `--mic_input_device` | 1（実マイク） | 1 | **1 Keep** |
+| `--turns` | EN-DUR2 は 12 | 4 | **4** |
+| `--mic_vad_silence_ms` | 350 | 900 | **350 Keep** |
+| `--mic_send_max_s` | 25 | 8 | **25 Keep** |
+| `--turn_first_audio_timeout_s` | 60 | 12 | **60 Keep** |
+| `--gap_s` | 1.0 | 2.0 | **1.0 Keep** |
+| skip / trigger | default True | `--response_trigger` | **skip True。trigger 禁止** |
+| `drop_initial_audio_ms` | 強制 0 | 40 | **触らない（強制0 Keep）** |
+| `prompts_en_dur` / idle 0 | 使わない | — | **使わない** |
+| JP m3/m0 | united / JP M0 | united | **JP Keep** |
+| EN m3/m0 | english + prompts_en + en_10files | — | **EN Keep** |
+| jitter / N=2 / no-fast_inmemory | 300/240 / 2 / OFF | なし | Keep |
+
+**コピー禁止（旧 md）:** `drop_initial_audio_ms`、`response_trigger` / `--no-skip`、silence 900、`mic_send_max_s 8`、timeout 12、`gap_s 2.0`、`mic_vad_debug`、旧 `--audio_device 14`、JP/EN リポ取り違え。
+
+**Pass 基準:**
+- [x] device 番号をクエリで確定し、旧 14 を使っていない
+- [x] JP Zoom: 相手に日本語音声。VirtualCam 映像・口が変化
+- [x] EN Zoom: 同上（英語）。`prompts_en` Keep
+- [x] AUDIO_BEFORE_M0=0、通常 clear 0、方式2 / N=2 / `--no-fast_inmemory` 維持
+- [x] コード差分なし。短文・短い口フリーズは Fail にしない
+
+**Fail:** 旧フルコマンド復元、図A破壊、session_loop 改修、CABLE を mic にする、prompts_en_dur、B/O 再開。
+
+**子報告（2026-08-21）:**
+- CABLE Input = **6**（MME Output）。旧 14 未使用。コード差分なし。
+- JP `sess_z1_jp_subj_20260821_140722`: 初回 Zoom=OBS VirtualCam は映像なし。カメラを **Unity Video Capture** にして再走。4t とも相手側に JP 音声＋リップ。AUDIO_BEFORE_M0=0、clear 0、`real_audio_started=4`。
+- EN 実体 `sess_z1_jp_subj_20260821_141501`（SESSION 名は JP のまま。ログは EN Keep）。先頭十数秒無反応のあと 4t EN 音声＋リップ。AUDIO_BEFORE_M0=0、clear 0、`real_audio_started=4`。
+- 観察（非Gate）: 顔上下動時の M0↔BGV 位置ずれ（既存 backlog）。EN 再走の session_id 未置換。
+
+**親判定（2026-08-21）:**
+- **Pass。** Keep = クエリした CABLE Input への `--audio_device` ＋ Zoom カメラ **Unity Video Capture** ＋ 起動順（`[virtualcam_persistent][OK]` 後に Zoom が掴む）。O1–O3 は OBS 制御 Keep のまま。B/O 再開しない。
+- 運用メモ: EN 再走は `$session_id = "sess_z1_en_subj_$ts"` を置換する（今回未置換は Gate にしない）。
+- 検証ライン（EN-DUR + Z1）クローズ。次本線なし。prompt 本番化・BGV ずれは backlog。push/merge 本線外。
 
 ---
 
@@ -2725,3 +3021,10 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-18 | EN-LIVE1 発行。JP 主観コマンド差分。prompts_en 新規、pose/bg は JP のまま。CTC/DB1/欠view 対象外 |
 | 2026-08-18 | EN-LIVE1 Fail。transcription 英語4tだが KNN が JP m3p を見て knn_predictor 欠。prompts_en Keep。hotfix=ファイル経路 load |
 | 2026-08-19 | EN-LIVE1hf Pass。Hold と同じファイル経路で knn_predictor を EN 先載せ。再走 `sess_en_live1_subj_20260819_140651`。ModuleNotFoundError=0、chunks_n=262、英語4t 主観 Pass。EN-LIVE1 を Pass に戻す。短い口フリーズとトーク被りは観察。英語本線クローズ可 |
+| 2026-08-20 | 検証ライン着手。EN-DUR1（1t 長文）→ EN-DUR2（12t）→ Z1（Zoom JP+EN）。コマンドは EN-LIVE1 4t ベース。JP 長尺の synth/trigger/silence600 はコピーしない。push/merge 本線外。EN-DUR1 子プロンプト発行 |
+| 2026-08-20 | EN-DUR1 Hold。142252/143157 は口・図A OK だが短文のみ。主因=prompts_en 1文＋ idle 2.5 の tail。次=EN-DUR1b（C+D: EN 専用 trigger＋synth 無人＋idle 20）。通常 trigger 本線化・prompts_en 本番変更・silence 600 は禁止。子プロンプト発行 |
+| 2026-08-20 | EN-DUR1b Hold。無人は I1 3s が synth 4s より先→trigger 未送。手元は trigger 到達だが prompts_en 一文が勝ち 90s Fail。図A Keep。次=EN-DUR1c（prompts_en_dur コピー＋idle 0＋drain 45）。BGV↔M0 ズレは backlog |
+| 2026-08-20 | EN-DUR1c Pass-with-defer。手元 222002 長文・口OK（audio_ms≈31.6s）。無人は PCM 未着。支配層=system 長さ行。本番 prompt 方針は backlog（案1主＋案3補助・今は非編集）。次=EN-DUR2（12t・prompts_en）。子プロンプト発行 |
+| 2026-08-20 | EN-DUR2 Pass。`sess_en_dur2_subj_20260820_231430` 12/12。AUDIO_BEFORE_M0=0。DUR 例外なし・差分なし。T6 BGV ずれは backlog。次=Z1（Zoom 旧コマンド添付後）。DUR1c の Keep All/tag は必須ではない |
+| 2026-08-21 | Z1 Go。資料=ルーティングのみ。現行合格 4t の `--audio_device` をクエリした CABLE Input へ。旧 client-VAD フルコマンド復元禁止。子プロンプト発行 |
+| 2026-08-21 | Z1 Pass。CABLE Input=6。JP 140722 / EN 実体 141501。相手側に音声＋リップ。カメラ SSOT=Unity Video Capture（OBS VirtualCam 決め打ちは誤り）。コード差分なし。検証ラインクローズ。次本線なし |
