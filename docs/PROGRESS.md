@@ -1415,7 +1415,7 @@
 | F1s | 現行スプライトで合成主観（黒縁まだ問題か） | `pass` | 2026-08-16（**A**＝目立たない→F1クローズ） |
 | （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
-| （本線） | 英語検証／配信 | → EN-DUR / Z | **クローズ（2026-08-21）**。DUR + Z1 Pass。次本線なし。push/merge は本線外 |
+| （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。push/merge 本線外 |
 
 ### Bライン申し送り（2026-08-11・Pass-with-defer）
 
@@ -1428,13 +1428,23 @@
 
 **AI 音声**は現行 player→PC 再生デバイスのまま OBS が音声ソースとして拾う。**BGM**は OBS メディアソースのみを WebSocket で切替し、AI PCM／VirtualCam／M0 に混ぜない。
 
-### Zoom 運用（Z1 Keep・2026-08-21）
+### Zoom 運用（Z1 出＋Z2b 入・2026-08-22）
 
-音声: USB mic → session_loop → `--audio_device` = **今クエリした CABLE Input**（この機は 6。14/19 決め打ち禁止）→ Zoom Microphone = CABLE Output / Speaker = CABLE Input。`--mic_input_device` は実マイク（通常 1）。
+この機は **AI/OBS 専用**。人間は Zoom/SNS にこの機から参加しない。USB mic はローカル検証のみ（`mic=1` だけなら Banana 不要）。本番会話入力は遠隔の相手声。当面 Zoom。本線は YouTube / TikTok（音声ゲストなら同じ「受信再生 → 仮想 mic → `--mic_input_device`」）。コメント／text interrupt のみなら音声受信バスは本番必須ではない。
 
-映像: Zoom カメラは **最初から `Unity Video Capture`**（`pyvirtualcam` backend=`unitycapture` の実デバイス名）。OBS VirtualCam は OBS が Unity を拾って仮想カメラ開始しているときだけ。起動順: ログ `[virtualcam_persistent][OK] device=Unity Video Capture` を確認してから Zoom がカメラを掴む（先に Zoom を開いているならオフ→オン）。
+**毎回:** 先に **Voicemeeter Banana** を起動して開いたまま（`voicemeeterpro.exe`。Standard は使わない）。Zoom の Mic/Speaker を確認。主導権 mute+interrupt は Zoom では使わない。
 
-主導権 mute+interrupt は Zoom では使わない。ハウリングは設定見直し（Gate にしない）。
+**Banana:** 中央 VIRTUAL INPUTS 左（`Voicemeeter VAIO` / Voicemeeter Input）だけ **B1 点灯**。B2/A2/A3 オフ。CABLE を Hardware In に足さない。A1=ヘッドホンは遠隔モニター任意。USB mic を B1 に足してよいが Gate には使わない。
+
+**Zoom:** Microphone = **CABLE Output**。Speaker = **Voicemeeter Input (VAIO)**。禁止: CABLE Input / システムと同じ / VAIO3 / AUX / In 1–5。カメラ = **Unity Video Capture**（`[virtualcam_persistent][OK]` のあと）。
+
+**M1:** `--audio_device` / `--mic_input_device` は **再クエリ**（決め打ち禁止）。この機の導入後スナップショット: CABLE Input **23** / Voicemeeter Out B1 **9** / CABLE Output **8**（mic 禁止）/ VAIO **19**。旧 CABLE Input=6 は Banana 後に `Voicemeeter Out A4` へずれた。CABLE Output を mic にしない。
+
+**やらない:** session_loop ミックス、ジッタ延長、B/O 再開、`prompts_en_dur`、部屋スピーカー拾い。
+
+遅延は継続観察（Gate にしない）。
+
+第三者向け抜き出し（SSOT は本節）: `docs/ops_zoom_third_party.md`
 
 ### 当面の非本線（今は実装させない）
 
@@ -2284,7 +2294,9 @@
 | EN-DUR1b | 英語 1ターン無人長尺（trigger 例外） | `hold` | 2026-08-20（trigger到達・90s未達） |
 | EN-DUR1c | DUR専用 prompt_dir＋idle 0 無人長尺 | `pass` | 2026-08-20（Pass-with-defer。手元長文・無人PCM未着） |
 | EN-DUR2 | 英語 多ターン（12t。4t 延長） | `pass` | 2026-08-20 |
-| Z1 | Zoom 配信検証（JP + EN） | `pass` | 2026-08-21 |
+| Z1 | Zoom 配信検証（JP + EN） | `pass` | 2026-08-21（片方向。再開しない） |
+| Z2 | Zoom 受信→M1 mic（OS 分離ミックス） | `hold` | 2026-08-22（受信 virtual mic 無し。Fail ではない） |
+| Z2b | Voicemeeter Banana 導入＋JP スマホ確認 | `pass` | 2026-08-22 |
 | （backlog） | EN-DB1 knn GT 穴（id6=0 / id4=1） | — | Hold の前提ではない。DB 再作成時 |
 | （backlog） | angry `leftdown` / `rightup` 欠 | — | 資産追加時は `_` なし。今は捏造しない |
 | （backlog） | EN 顔上下動時 BGV↔M0 ズレ | — | B 残差の EN 再発。EN-DUR2 T6 / Z1 でも観察。今は再開しない |
@@ -2860,7 +2872,102 @@ Z1（予約）: JP と EN の両方。コマンドはユーザー添付後に親
 **親判定（2026-08-21）:**
 - **Pass。** Keep = クエリした CABLE Input への `--audio_device` ＋ Zoom カメラ **Unity Video Capture** ＋ 起動順（`[virtualcam_persistent][OK]` 後に Zoom が掴む）。O1–O3 は OBS 制御 Keep のまま。B/O 再開しない。
 - 運用メモ: EN 再走は `$session_id = "sess_z1_en_subj_$ts"` を置換する（今回未置換は Gate にしない）。
-- 検証ライン（EN-DUR + Z1）クローズ。次本線なし。prompt 本番化・BGV ずれは backlog。push/merge 本線外。
+- 検証ライン（EN-DUR + Z1 片方向）クローズ。**次本線=Z2**（2026-08-22。受信→M1。Z1 再開しない）。prompt 本番化・BGV ずれは backlog。push/merge 本線外。
+
+---
+
+## Phase Z2: Zoom 受信→M1 mic（OS 分離ミックス）
+
+**目的:** スマホ遠隔参加者が AI と会話できること。Zoom 受信音声を M1 `--mic_input_device` に載せる。AI 出力（CABLE Input）と混ぜない。session_loop で PCM ミックスしない。図A非破壊。
+
+**事実（Z1 再走・採用）:**
+- `sess_z1_jp_subj_20260822_164959` / `131201`。AI は USB `--mic_input_device 1` しか聞いていない
+- 164959: T1 のみ USB 720ms でかみ合い。T2–T3 は ACTIVITY なし・`input_audio_ms=0`・idle
+- 131201: 4t とも idle（USB に有声音なし）
+- Zoom Speaker=CABLE Input のため相手声は仮想ケーブル側に落ち、USB に乗らない。ヘッドホン可聴 ≠ Live API
+
+**設計決定:**
+- 第一手段 = **OS 音声グラフ**（Voicemeeter 等）。M1 第二入力実装ではない
+- Z1 Keep（出）：`--audio_device` = クエリした CABLE Input（この機は 6）。Zoom Microphone = CABLE Output。カメラ = Unity Video Capture
+- Z2 新設（入）：Zoom Speaker を CABLE Input にしない。Zoom 受信だけを virtual mic へ（USB 手元を同じ bus に足してよい）。`--mic_input_device` = その virtual mic（クエリ。決め打ち禁止）
+- **CABLE Output を `--mic_input_device` にしない**（AI 声が戻る）。旧 docs のその配線は使わない
+- EN は JP Pass 後の短確認（親が書く）。今は JP 4t＋スマホ参加
+- 主導権 mute+interrupt は Zoom では使わない
+
+### 配線（親固定・番号はクエリで埋める）
+
+```text
+[出・Z1]  M1 --audio_device --> CABLE Input
+          Zoom Microphone   --> CABLE Output
+
+[入・Z2]  Zoom Speaker      --> 受信専用デバイス（Voicemeeter VAIO 等）
+                              NEVER CABLE Input
+          M1 --mic_input_device --> 受信(+任意 USB) の virtual mic
+                              NEVER CABLE Output
+```
+
+**コピー禁止:** `drop_initial_audio` / `response_trigger` / silence 900 / 旧フルコマンド / CABLE Output を mic / ジッタ延長 / B/O / `prompts_en_dur` / `if language` / session_loop PCM ミックス
+
+**Pass 基準:**
+- [ ] device クエリ表（CABLE / Voicemeeter / USB）と配線レシピ 1 枚
+- [ ] 遠隔スマホ発話で `has_spoken`・`input_audio_ms>0`・transcription が相手内容に一致。idle 連発は Fail
+- [ ] AI 返答がかみ合う（主観）。自己エコーなし（AI 音声で VAD 誤発火しない）
+- [ ] Z1 片方向回帰なし（相手に AI 音声＋口）
+- [ ] AUDIO_BEFORE_M0=0、通常 clear 0。session_loop 非変更
+- [x] Voicemeeter 等が無い／配線不能なら **Hold＋親へ**（コードミックス提案は勝手にしない）
+
+**子報告（2026-08-22）:**
+- コマンド未走行。コード差分なし。Voicemeeter プロセス／VAIO 無し。仮想ケーブルは 1 対（Input 6 / Output 3）のみ。
+- ステレオミキサー(2) は Realtek ループバック。USB ヘッドホン再生は乗らない。CABLE Output=3 を mic にはしていない。
+- `$cableIn=6` は埋まる。`$micIn` は埋められない。
+
+**親判定（2026-08-22）:**
+- **Hold（配線不能）。Fail ではない。** EN に進まない。手段欠落で止めない。
+- 次=**Z2b**: 同じ AI 機に **Voicemeeter Banana** 導入 → 再クエリ → 配線 → JP 4t＋スマホ。ケーブル2本目でも可だが推奨は Banana。
+- 出さない: session_loop ミックス、CABLE Output を mic、部屋スピーカー拾い、Z1 再開、別 PC。
+
+---
+
+## Phase Z2b: Voicemeeter Banana 導入＋JP スマホ確認
+
+**目的:** 受信専用 virtual mic をこの AI 機に作り、Z2 Gate を実施する。session_loop 非変更。図A非破壊。
+
+**設計決定:**
+- 導入対象 = **Voicemeeter Banana**（公式のみ）。同じ AI/OBS 専用機。別 PC は買わない
+- 導入後に再クエリ。番号決め打ち禁止
+- 配線は Z2 親固定のまま。CABLE 1 対は Z1 Keep（**番号は Banana 後に変わる。再クエリ**）
+- USB mic=1 はローカル検証のみ。Gate は **遠隔スマホ発話**
+- EN 短確認は任意（配線は同じ。親がコマンドだけ出す）
+
+### Banana 配線（親固定・この機スナップショット 2026-08-22）
+
+```text
+[出・Z1]  M1 --audio_device --> CABLE Input (23)     ※旧6は使わない
+          Zoom Microphone   --> CABLE Output (8)
+
+[入・Z2b] Zoom Speaker      --> Voicemeeter Input VAIO (19)   NEVER 23 / VAIO3(14)
+          Banana: VAIO strip → B1 のみ。B2/A2/A3 オフ。CABLE を Hardware In に足さない
+          M1 --mic_input_device --> Voicemeeter Out B1 (9)    NEVER CABLE Output (8)
+          A1 = ヘッドホン (15) 任意。USB mic へ戻さない
+```
+
+**Pass 基準:**
+- [x] Banana 導入後のクエリ表に VAIO / Voicemeeter Output がある
+- [x] 配線レシピ 1 枚（番号埋め）
+- [x] JP 4t＋スマホ: 遠隔で `has_spoken`・`input_audio_ms>0`・transcription 一致。idle 連発は Fail
+- [x] かみ合い（主観）。自己エコーなし。Z1 片方向回帰なし
+- [x] AUDIO_BEFORE_M0=0、通常 clear 0。session_loop 非変更
+
+**子報告（2026-08-22）:**
+- Banana 導入後に番号ずれ。CABLE Input **23**（旧6は Voicemeeter Out A4）。`--mic_input_device` **9**（Out B1）。CABLE Output **8** は mic にしていない。
+- `sess_z2b_jp_subj_20260822_223714`: スマホ遠隔 4t。音声＋リップ、会話成立。4t とも `has_spoken=True` / idle 0 / `input_audio_ms` 2400–1600。
+- `220748` は Speaker=CABLE Input で未到達（混線再現。Keep の反証）。
+- 遅延は継続観察。コード差分なし。図A・方式2・N=2・no-fast_inmemory・jitter 300/240・silence 350。
+
+**親判定（2026-08-22）:**
+- **Pass。** Keep = Banana 常駐＋VAIO→B1 のみ＋再クエリ番号。Z1 片方向は維持。
+- 運用マニュアルは上節「Zoom 運用」に統合。
+- EN 短確認は任意（同じ配線。ユーザー希望時）。本線の次はユーザー判断（YouTube/TikTok 受信は同じレシピ）。push/merge 本線外。
 
 ---
 
@@ -3028,3 +3135,7 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-20 | EN-DUR2 Pass。`sess_en_dur2_subj_20260820_231430` 12/12。AUDIO_BEFORE_M0=0。DUR 例外なし・差分なし。T6 BGV ずれは backlog。次=Z1（Zoom 旧コマンド添付後）。DUR1c の Keep All/tag は必須ではない |
 | 2026-08-21 | Z1 Go。資料=ルーティングのみ。現行合格 4t の `--audio_device` をクエリした CABLE Input へ。旧 client-VAD フルコマンド復元禁止。子プロンプト発行 |
 | 2026-08-21 | Z1 Pass。CABLE Input=6。JP 140722 / EN 実体 141501。相手側に音声＋リップ。カメラ SSOT=Unity Video Capture（OBS VirtualCam 決め打ちは誤り）。コード差分なし。検証ラインクローズ。次本線なし |
+| 2026-08-22 | Z2 Go。片方向 Z1 は維持。受信は OS グラフで AI 出力と分離。CABLE Output を mic にしない。session_loop ミックス禁止。JP 4t＋スマホ優先。子プロンプト発行 |
+| 2026-08-22 | Z2 Hold（Fail ではない）。VAIO 無し・ケーブル1対のみ。次=Z2b Banana 導入＋再クエリ＋JP スマホ。子プロンプト発行 |
+| 2026-08-22 | Z2b Pass。`sess_z2b_jp_subj_20260822_223714` 遠隔4t成立。CABLE In=23 / mic=B1=9。Banana 常駐＋VAIO→B1 を運用 SSOT。220748 は Speaker=CABLE In で未到達。EN 短確認は任意 |
+| 2026-08-23 | Zoom 第三者運営手順を `docs/ops_zoom_third_party.md` に抜き出し（PROGRESS「Zoom 運用」が SSOT）。コード非変更 |
