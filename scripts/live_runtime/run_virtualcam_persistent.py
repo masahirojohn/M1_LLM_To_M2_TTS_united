@@ -170,6 +170,130 @@ def _b3_desired_bg_frame(
     return int(lock_bg_frame) + int(advance)
 
 
+def _b7_boundary_reason(
+    *,
+    relock_reason: str | None,
+    idle_enter: bool,
+) -> str | None:
+    """Method C: snap only at idle enter / enter_playing / turn RELOCK."""
+    r = str(relock_reason or "").strip()
+    if r in ("enter_playing", "turn"):
+        return r
+    if idle_enter:
+        return "idle_enter"
+    return None
+
+
+def _b7_snap_target(
+    *,
+    reason: str | None,
+    pose_idx: int | None,
+    display_bg_idx: int,
+) -> int | None:
+    """Rewind display BG to pose at a boundary. None = leave B3 / IDLE_BG_ADVANCE."""
+    if not reason or pose_idx is None:
+        return None
+    want = int(pose_idx)
+    if want < 0:
+        return None
+    if int(display_bg_idx) == want:
+        return None
+    return want
+
+
+def _b7_relock_bg_frame(*, pose_idx: int | None, fallback_bg: int) -> int:
+    """enter_playing / turn RELOCK lock_bg: pose if known, else current bg."""
+    if pose_idx is not None and int(pose_idx) >= 0:
+        return int(pose_idx)
+    return int(fallback_bg) if int(fallback_bg) >= 0 else 0
+
+
+def _b7_rewind_display_bg(
+    cap,
+    *,
+    reason: str | None,
+    pose_idx: int | None,
+    display_bg_idx: int,
+    loop_bg: bool,
+    total: int,
+    lock_bg_frame: int | None,
+    update_lock: bool,
+) -> tuple[object | None, int, int | None]:
+    """Seek cap to pose on a Method C boundary. bg is None when no snap."""
+    want = _b7_snap_target(
+        reason=reason,
+        pose_idx=pose_idx,
+        display_bg_idx=display_bg_idx,
+    )
+    if want is None:
+        return None, int(display_bg_idx), lock_bg_frame
+    ok, bg, actual = _read_bg_at_frame(
+        cap,
+        want,
+        loop_bg=bool(loop_bg),
+        total=int(total),
+    )
+    if not ok:
+        return None, int(display_bg_idx), lock_bg_frame
+    pos = int(actual if actual >= 0 else want)
+    new_lock = int(want) if update_lock else lock_bg_frame
+    print(
+        "[sync][virtualcam][B7_BG_SNAP]",
+        f"reason={reason}",
+        f"from={int(display_bg_idx)}",
+        f"to={int(want)}",
+        f"got={int(pos)}",
+        flush=True,
+    )
+    return bg, pos, new_lock
+
+
+def _b7_overlay_snap_bg(
+    cap,
+    *,
+    bg,
+    bg_pos: int,
+    reason: str | None,
+    pose_idx: int | None,
+    loop_bg: bool,
+    total: int,
+    width: int,
+    height: int,
+    lock_bg_frame: int | None,
+    update_lock: bool,
+    bg_cursor_file: Path | None,
+    bg_cursor_last_written,
+    b3_bg_mode: str,
+    bg_cursor_audio_ms: int | None,
+    step_ms: int,
+    bg_cursor_fo: int | None,
+):
+    """Composite-tick Method C: rewind displayed BG to current pose if needed."""
+    snap_bg, snap_pos, new_lock = _b7_rewind_display_bg(
+        cap,
+        reason=reason,
+        pose_idx=pose_idx,
+        display_bg_idx=int(bg_pos),
+        loop_bg=bool(loop_bg),
+        total=int(total),
+        lock_bg_frame=lock_bg_frame,
+        update_lock=bool(update_lock),
+    )
+    if snap_bg is None:
+        return bg, int(bg_pos), lock_bg_frame, bg_cursor_last_written
+    bg_out = cv2.resize(snap_bg, (width, height), interpolation=cv2.INTER_LINEAR)
+    written = _write_bg_cursor(
+        bg_cursor_file,
+        bg_pos=int(snap_pos),
+        bg_mode=str(b3_bg_mode),
+        audio_ms=bg_cursor_audio_ms,
+        step_ms=int(step_ms),
+        frame_offset=bg_cursor_fo,
+        last_written_key=bg_cursor_last_written,
+    )
+    return bg_out, int(snap_pos), new_lock, written
+
+
 def _read_bg_override(path: Path | None, last_mtime: float) -> tuple[dict | None, float]:
     if path is None:
         return None, last_mtime
@@ -481,6 +605,112 @@ def _b2_obs_maybe_log(
     )
 
 
+class _B6PoseBakeFollow:
+    """B6 obs: follow generation-time pose bake jsonl. No seek/sync control."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._fp = None
+        self._map: dict[int, tuple[int, str]] = {}
+
+    def poll(self) -> None:
+        try:
+            if self._fp is None:
+                if not self.path.exists():
+                    return
+                self._fp = self.path.open("r", encoding="utf-8")
+            while True:
+                line = self._fp.readline()
+                if not line:
+                    break
+                raw = line.strip()
+                if not raw:
+                    continue
+                rec = json.loads(raw)
+                fg0 = int(rec.get("fg0", -1))
+                n = int(rec.get("n", 0) or 0)
+                pose0 = int(rec.get("pose0", 0) or 0)
+                mode = str(rec.get("mode") or "")
+                if fg0 < 0 or n <= 0:
+                    continue
+                for i in range(n):
+                    self._map[int(fg0) + i] = (int(pose0) + i, mode)
+        except Exception:
+            pass
+
+    def lookup(self, fg: int | None) -> tuple[int | None, str]:
+        if fg is None:
+            return None, ""
+        self.poll()
+        hit = self._map.get(int(fg))
+        if hit is None:
+            return None, ""
+        return int(hit[0]), str(hit[1])
+
+
+def _b6_delta_log(
+    *,
+    jsonl_path: Path | None,
+    display_bg_idx: int,
+    pose_idx: int | None,
+    pose_mode: str,
+    shown_fg: int | None,
+    state: str,
+    bg_mode: str,
+    audio_ms: int,
+    frame_offset: int,
+    relock: str,
+    stdout_force: bool,
+    last_stdout_key,
+):
+    """B6 obs at overlay tick. Δ = display_bg_idx − pose_idx. No control."""
+    dlt = None
+    if pose_idx is not None:
+        dlt = int(display_bg_idx) - int(pose_idx)
+    rec = {
+        "display_bg_idx": int(display_bg_idx),
+        "pose_idx": int(pose_idx) if pose_idx is not None else None,
+        "delta": dlt,
+        "pose_mode": str(pose_mode or ""),
+        "shown_fg": int(shown_fg) if shown_fg is not None else None,
+        "state": str(state or ""),
+        "bg_mode": str(bg_mode or ""),
+        "audio_ms": int(audio_ms),
+        "frame_offset": int(frame_offset),
+        "relock": str(relock or ""),
+    }
+    if jsonl_path is not None:
+        try:
+            with jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+        except Exception:
+            pass
+    key = (
+        str(state or ""),
+        str(bg_mode or ""),
+        str(relock or ""),
+        dlt,
+        int(display_bg_idx) // 25,
+    )
+    if stdout_force or last_stdout_key != key:
+        print(
+            "[sync][virtualcam][B6_DELTA]",
+            f"display_bg_idx={int(display_bg_idx)}",
+            f"pose_idx={int(pose_idx) if pose_idx is not None else 'na'}",
+            f"delta={dlt if dlt is not None else 'na'}",
+            f"pose_mode={pose_mode or 'na'}",
+            f"shown_fg={int(shown_fg) if shown_fg is not None else -1}",
+            f"state={state}",
+            f"bg_mode={bg_mode}",
+            f"audio_ms={int(audio_ms)}",
+            f"frame_offset={int(frame_offset)}",
+            f"relock={relock or 'none'}",
+            flush=True,
+        )
+        return key
+    return last_stdout_key
+
+
 def _b3hf2_snap_maybe_log(
     *,
     a_ms_bg: int | None,
@@ -638,6 +868,13 @@ def main() -> int:
     last_rgb = None
     last_fg = None
     last_displayed_frame: int | None = None
+    last_fg_idx: int | None = None
+    last_fg_pose_idx: int | None = None
+    last_fg_pose_mode = ""
+    b6_bake = _B6PoseBakeFollow(fg_dir / "_b6_fg_pose_idx.jsonl")
+    b6_delta_path = fg_dir / "_b6_delta.jsonl"
+    b6_last_stdout_key = None
+    b6_last_relock = ""
     max_existing_frame: int | None = None
     last_logged_target = None
     applied_sync_meta: dict | None = None
@@ -658,6 +895,7 @@ def main() -> int:
     b3_last_playing_frame_offset: int | None = None
     # Phase B3hf: last good PLAYING playback_state dict (BG+FG share on UNKNOWN).
     b3_last_good_playback_state: dict | None = None
+    b7_last_seen_fo: int | None = None
     ssot_enabled = playback_state_file is not None
     frame_period_ms = 1000.0 / float(max(1, fps))
 
@@ -862,6 +1100,13 @@ def main() -> int:
                 use_audio_bg = False
 
             b3_bg_mode = "seq"
+            b7_reason: str | None = None
+            b7_turn_start = False
+            if tick_target is not None:
+                f_seen = int(tick_target.get("frame_offset", 0) or 0)
+                if b7_last_seen_fo is not None and f_seen > int(b7_last_seen_fo):
+                    b7_turn_start = True
+                b7_last_seen_fo = int(f_seen)
             if use_audio_bg:
                 if st_bg == "PLAYING" and tick_target is not None:
                     a_ms = int(tick_target.get("audio_ms", 0) or 0)
@@ -888,9 +1133,17 @@ def main() -> int:
                 ):
                     relock_reason = "turn"
                 if relock_reason is not None:
+                    b7_reason = _b7_boundary_reason(
+                        relock_reason=relock_reason, idle_enter=False
+                    )
                     b3_lock_audio_ms = int(a_ms)
-                    b3_lock_bg_frame = int(bg_pos) if int(bg_pos) >= 0 else 0
+                    prev_bg = int(bg_pos) if int(bg_pos) >= 0 else 0
+                    b3_lock_bg_frame = _b7_relock_bg_frame(
+                        pose_idx=last_fg_pose_idx,
+                        fallback_bg=prev_bg,
+                    )
                     b3_lock_frame_offset = int(f_off)
+                    b6_last_relock = str(relock_reason)
                     print(
                         "[sync][virtualcam][B3_BG_RELOCK]",
                         f"reason={relock_reason}",
@@ -899,6 +1152,18 @@ def main() -> int:
                         f"frame_offset={int(b3_lock_frame_offset)}",
                         flush=True,
                     )
+                    if (
+                        last_fg_pose_idx is not None
+                        and int(b3_lock_bg_frame) != int(prev_bg)
+                    ):
+                        print(
+                            "[sync][virtualcam][B7_BG_SNAP]",
+                            f"reason={b7_reason}",
+                            f"from={int(prev_bg)}",
+                            f"to={int(b3_lock_bg_frame)}",
+                            f"got={int(b3_lock_bg_frame)}",
+                            flush=True,
+                        )
                 # B3hf2: lock_audio_ms=0 is valid (turn relative clock). Never use
                 # `lock or a_ms` — falsy 0 rebinds lock to current a_ms and freezes
                 # desired at lock_bg (T2 bg_pos stick fingerprint).
@@ -927,9 +1192,27 @@ def main() -> int:
                 b3_last_drive_state = "PLAYING"
                 b3_bg_mode = "audio"
             else:
-                ok, bg, bg_pos = _read_bg_sequential(
-                    cap, loop_bg=bool(args.loop_bg)
+                idle_enter = b3_last_drive_state == "PLAYING"
+                b7_reason = _b7_boundary_reason(
+                    relock_reason="turn" if b7_turn_start else None,
+                    idle_enter=idle_enter,
                 )
+                snap_bg, snap_pos, _ = _b7_rewind_display_bg(
+                    cap,
+                    reason=b7_reason,
+                    pose_idx=last_fg_pose_idx,
+                    display_bg_idx=int(bg_pos),
+                    loop_bg=bool(args.loop_bg),
+                    total=int(bg_total),
+                    lock_bg_frame=None,
+                    update_lock=False,
+                )
+                if snap_bg is not None:
+                    ok, bg, bg_pos = True, snap_bg, int(snap_pos)
+                else:
+                    ok, bg, bg_pos = _read_bg_sequential(
+                        cap, loop_bg=bool(args.loop_bg)
+                    )
                 # Clear lock only on explicit non-PLAYING (keep IDLE_BG_ADVANCE).
                 if st_bg != "UNKNOWN" and st_raw != "UNKNOWN":
                     b3_lock_audio_ms = None
@@ -1116,8 +1399,61 @@ def main() -> int:
                     # via the branch above (Phase 14 last-FG preference).
                     try:
                         if last_fg is not None:
+                            shown_idle = (
+                                int(last_fg_idx)
+                                if last_fg_idx is not None
+                                else (
+                                    int(last_displayed_frame)
+                                    if last_displayed_frame is not None
+                                    else None
+                                )
+                            )
+                            pose_i = last_fg_pose_idx
+                            pose_m = last_fg_pose_mode
+                            if pose_i is None and shown_idle is not None:
+                                pose_i, pose_m = b6_bake.lookup(shown_idle)
+                                last_fg_pose_idx = pose_i
+                                last_fg_pose_mode = pose_m
+                            (
+                                bg,
+                                bg_pos,
+                                b3_lock_bg_frame,
+                                bg_cursor_last_written,
+                            ) = _b7_overlay_snap_bg(
+                                cap,
+                                bg=bg,
+                                bg_pos=int(bg_pos),
+                                reason=b7_reason,
+                                pose_idx=pose_i,
+                                loop_bg=bool(args.loop_bg),
+                                total=int(bg_total),
+                                width=width,
+                                height=height,
+                                lock_bg_frame=b3_lock_bg_frame,
+                                update_lock=str(b3_bg_mode) == "audio",
+                                bg_cursor_file=bg_cursor_file,
+                                bg_cursor_last_written=bg_cursor_last_written,
+                                b3_bg_mode=str(b3_bg_mode),
+                                bg_cursor_audio_ms=bg_cursor_audio_ms,
+                                step_ms=int(args.step_ms),
+                                bg_cursor_fo=bg_cursor_fo,
+                            )
                             comp_bgr = _overlay(bg, last_fg)
                             comp_rgb = cv2.cvtColor(comp_bgr, cv2.COLOR_BGR2RGB)
+                            b6_last_stdout_key = _b6_delta_log(
+                                jsonl_path=b6_delta_path,
+                                display_bg_idx=int(bg_pos),
+                                pose_idx=pose_i,
+                                pose_mode=pose_m,
+                                shown_fg=shown_idle,
+                                state=str(target.get("state") if target is not None else "UNKNOWN"),
+                                bg_mode=str(b3_bg_mode),
+                                audio_ms=int(target.get("audio_ms", 0) or 0) if target is not None else 0,
+                                frame_offset=int(target.get("frame_offset", 0) or 0) if target is not None else 0,
+                                relock=b6_last_relock,
+                                stdout_force=(sent % 25 == 0),
+                                last_stdout_key=b6_last_stdout_key,
+                            )
                         else:
                             comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
                         cam.send(comp_rgb)
@@ -1216,9 +1552,69 @@ def main() -> int:
                     continue
             else:
                 last_fg = fg
+                if display_frame_idx is not None:
+                    last_fg_idx = int(display_frame_idx)
+                    last_fg_pose_idx, last_fg_pose_mode = b6_bake.lookup(last_fg_idx)
 
+            shown_now = (
+                int(display_frame_idx)
+                if display_frame_idx is not None
+                else (
+                    int(last_fg_idx)
+                    if last_fg_idx is not None
+                    else (
+                        int(last_displayed_frame)
+                        if last_displayed_frame is not None
+                        else None
+                    )
+                )
+            )
+            pose_i = last_fg_pose_idx
+            pose_m = last_fg_pose_mode
+            if pose_i is None and shown_now is not None:
+                pose_i, pose_m = b6_bake.lookup(shown_now)
+                last_fg_pose_idx = pose_i
+                last_fg_pose_mode = pose_m
+            (
+                bg,
+                bg_pos,
+                b3_lock_bg_frame,
+                bg_cursor_last_written,
+            ) = _b7_overlay_snap_bg(
+                cap,
+                bg=bg,
+                bg_pos=int(bg_pos),
+                reason=b7_reason,
+                pose_idx=pose_i,
+                loop_bg=bool(args.loop_bg),
+                total=int(bg_total),
+                width=width,
+                height=height,
+                lock_bg_frame=b3_lock_bg_frame,
+                update_lock=str(b3_bg_mode) == "audio",
+                bg_cursor_file=bg_cursor_file,
+                bg_cursor_last_written=bg_cursor_last_written,
+                b3_bg_mode=str(b3_bg_mode),
+                bg_cursor_audio_ms=bg_cursor_audio_ms,
+                step_ms=int(args.step_ms),
+                bg_cursor_fo=bg_cursor_fo,
+            )
             comp_bgr = _overlay(bg, fg)
             comp_rgb = cv2.cvtColor(comp_bgr, cv2.COLOR_BGR2RGB)
+            b6_last_stdout_key = _b6_delta_log(
+                jsonl_path=b6_delta_path,
+                display_bg_idx=int(bg_pos),
+                pose_idx=pose_i,
+                pose_mode=pose_m,
+                shown_fg=shown_now,
+                state=str(target.get("state") if target is not None else "UNKNOWN"),
+                bg_mode=str(b3_bg_mode),
+                audio_ms=int(target.get("audio_ms", 0) or 0) if target is not None else 0,
+                frame_offset=int(target.get("frame_offset", 0) or 0) if target is not None else 0,
+                relock=b6_last_relock,
+                stdout_force=(sent % 25 == 0),
+                last_stdout_key=b6_last_stdout_key,
+            )
 
             cam.send(comp_rgb)
             cam.sleep_until_next_frame()

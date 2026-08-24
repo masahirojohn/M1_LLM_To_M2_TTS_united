@@ -1404,7 +1404,9 @@
 | B5 | pose スライス時計を BGV 継続 index へ結ぶ | `pass` | 2026-08-11（主観 Fail・方式 Keep→B5hf） |
 | B5hf | pose_base snapshot／missing→0 Hotfix | `pass` | 2026-08-11（Pass-with-defer→B5hf2） |
 | B5hf2 | ターン境界の誤 pose_base freeze | `pass` | 2026-08-11（Bライン **Pass-with-defer**・運用 Keep） |
-| （defer） | B 仕上げ（新BGV/新pose回帰・数フレームラグ） | — | Colab高精度pose後 or ズレ再発時。方式破棄しない |
+| B6 | 合成瞬間 display_bg↔pose Δ（調査のみ） | `pass` | 2026-08-23（仮説2厚い・方式C採用） |
+| B7 | 境で進んだ BG を pose/M0 と同じ枚へ（方式C） | `pass` | 2026-08-24（Pass-with-defer。② クローズ） |
+| （defer） | 起動 BUFFERING idle Δ／EN turn_local 窓／貼り位置／口−音 | — | 第二手法なし。Colab・貼り・口−音は開かない |
 | O1 | OBS WebSocket＋管理画面＋背景静止画/BGM切替 | `pass` | 2026-08-12（flat local Hotfix Keep） |
 | O2 | 当てフリ（OBS事前配置ソースの見せ消し） | `pass` | 2026-08-13 |
 | O3 | エージェントスミス＋音声フィルタ | `pass` | 2026-08-14 |
@@ -1417,12 +1419,15 @@
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。push/merge 本線外 |
 
-### Bライン申し送り（2026-08-11・Pass-with-defer）
+### Bライン申し送り（2026-08-24・② クローズ）
 
-- 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／IDLE_BG_ADVANCE 等（tag `phase-b5-pass`）
-- 残差（今はやらない）: 高速上下帯の数フレーム級ラグ；代表 BGV 1本のみで新資産は未回帰
-- 再開条件: Colab 高精度 pose 後、またはズレ再発時。方式破棄せず回帰＋必要ならラグ詰めのみ
-- **VirtualCam 内 BGV（猫の体・合成用動画）≠ OBS「背景」**。後者は OBS 側静止画（将来は OBS 側背景動画もありうる）。OBS 制御は VirtualCam BGV を切替対象にしない
+- 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b5-pass` + B7 未 tag）
+- **今の本線 = なし。** ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
+- 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
+- defer: 起動 BUFFERING の idle境最大（115/116）／EN ターン境最大131（turn_local→absolute 窓）。主観の顔Yは JP/EN とも解消
+- 開かない: 貼り位置／口−音／pose 先送り／IDLE 廃止／`audio_ms` オフセット／pose.json／Colab／多BGV
+- JP+EN。代表 BGV 1本。常時「表示枚目=pose枚目」
+- **VirtualCam 内 BGV（猫の体・合成用動画）≠ OBS「背景」**。OBS 制御は VirtualCam BGV を切替対象にしない
 
 ### OBS 音声ルーティング（親定義・子へ固定）
 
@@ -1449,11 +1454,12 @@
 ### 当面の非本線（今は実装させない）
 
 - API `end→first` 短縮
-- B 仕上げ（多BGV総当たり・Colab待ち仕上げ）— 再開は Colab高精度pose後 or ズレ再発時
+- pose 先送り／IDLE_BG_ADVANCE 廃止／`audio_ms` オフセット／pose.json 先修正／多BGV／Colab pose
+- 貼り位置／口−音／起動 BUFFERING idle Δ／EN turn_local 窓（B7 defer。第二手法禁止）
 - Phase12 系の idle silent PCM／縫い目の品質本線化
 - 英語版 CTC（EN-RT3。当面やらない）
 - EN-DB1 / 欠 view / EN 本番システムプロンプト運用
-- EN で顔上下動時の BGV↔M0 位置ズレ（B 残差の EN 再発。B 再開はしない）
+- ① Zoom 運営マニュアル（`docs/ops_zoom_third_party.md` 済み。再発行しない）
 - スミス増殖加速（任意）
 - 当てフリの Python scale／座標拡大
 - Slack トリガ本番化
@@ -2025,6 +2031,110 @@
 **親判定（2026-08-11）:**
 - **Pass-with-defer（Bライン運用 Keep）。** B5hf2 まで合格。仕上げは Colab/新資産後に再開可。
 - 次本線=**OBS 制御（O1→O2→O3）**。
+
+---
+
+## Phase B6: 合成瞬間 display_bg↔pose Δ（調査のみ・実装禁止）
+
+**目的:** 再開条件「ズレ再発」で B 仕上げに入る。B 全面再オープンではない。高速上下で、**合成瞬間**の表示 BGV 枚（`display_bg_idx`）と pose/M0 枚（`pose_idx`）の Δ を測る。オフセット実装は親が Δ を見てから。
+
+**再開前提（ユーザー確定 2026-08-23）:**
+1. 最優先 = BGV顔位置 vs M0顔位置（Y）。口−音は別チケット
+2. JP と EN の両方
+3. 今は代表 BGV 1本。後で複数ランダムループ。1本専用オフセット禁止。常時「表示枚目=pose枚目」
+4. Colab しない。Colab pose は横の微細用。資産の上下が大きく違う問題ではない
+5. pose だけ先送り禁止（体と頭が離れる）。オフセットするなら表示 BGV と pose を同じ index のまま
+
+**設計 SSOT（ユーザー）:**
+- BGV N枚目 → pose.json[N]（40ms）→ M0 も N。`audio_ms` が選ぶ枚は同じ N であるべき
+- 同じ N 同士で目視ズレ → pose/貼り位置（今は第一仮説にしない）
+- Live の上下追従遅れ → 合成瞬間に BGV枚 ≠ pose/M0枚 が本命候補。`pose.json` を先に直さない
+- ユーザーは **仮説2（idle/ターン境で BGV だけ進行）** を厚く見る。計測項目は変えない
+- Δ>0 → 枚を合わせる（方式C）。Δ=0 → 貼り位置
+
+**相談確定（初手・守る）:**
+- 「`audio_ms` がカウンター／OS遅延」は相対 Y ズレの第一因にしない（同じ時計なら相対は保つ）
+- 優先度2の +40〜80ms を初手実装にしない（B1 が禁止した決め打ち）
+- B3 Keep が Live で生きているかを先に見る（PLAYING 中 `played_audio_ms→BG frame`）
+
+**スコープ（調査のみ）:**
+1. B3 Keep が Live で生きているか（PLAYING 中 BG が `played_audio_ms` で選ばれているか。死んでいればその根拠）
+2. 高速上下帯の合成瞬間で `display_bg_idx` と `pose_idx` の Δ 表（JP + EN、代表 BGV 1本）
+3. 仮説2を厚く見るため、idle/ターン境の行を表に分ける（計測式は同じ）
+4. 判定材料のみ: Δ が 1–3 なら遅れ側を同じ枚に合わせる候補／Δ=0 なら貼り位置候補。実装しない
+
+**スコープ外（B6 禁止）:**
+- いかなる同期／オフセット／pose 先送りの実装
+- `audio_ms` 全体 +40〜80、ジッタ延長、口 frame drop、音声先行 enqueue
+- B 全面再設計、方式 A／pose=絶対 index／IDLE_BG_ADVANCE 破棄
+- Colab、新 pose 再生成、多 BGV、1本専用オフセット
+- N↑、図A破壊、本番 prompts 編集、session_loop で Zoom 受信ミックス
+- `docs/PROGRESS.md` 編集
+
+**Pass 基準:**
+- [x] B3 Keep 生死を根拠付きで一つに
+- [x] JP + EN、高速上下、合成瞬間 Δ 表（idle/ターン境を分けてよい）
+- [x] Δ の代表値（中央／最大／境での符号）と「枚合わせ候補 vs 貼り候補」1行
+- [x] コード変更なし（観測ログ追加のみ可。挙動不変）
+- [x] 親向けサマリーのみ（diff／ログ全文禁止）
+
+**子報告要約（2026-08-23）:**
+- B3 Keep **生き**。PLAYING 中 `_b3_desired_bg_frame` → `_read_bg_at_frame`（`bg_mode=audio`）。JP/EN とも `[B3_BG_RELOCK]` と `[B3hf2_SNAP] a_ms_bg=a_ms_fg / desired=bg_pos`
+- Δ=display_bg_idx−pose_idx（+ = BG進み）。定常 PLAYING: JP 中央0 最大11 / EN 中央1 最大275。高速上下: JP 0/11 / EN 2/275
+- idle境: JP 中央4 最大456 / EN 50/696。ターン境: JP 263/626 / EN 18/883。符号はすべて BG進み
+- 結論: **枚合わせ候補**。仮説2が厚い。観測 `[B6_DELTA]` は挙動不変（virtualcam / step1 + 集計 `phase_b6_delta_quant.py`）
+
+**親判定（2026-08-23）:**
+- **Pass。** 表採用。方式 **C** 採用（境で進んだ BG を遅れ側 pose/M0 と同じ枚へ）。
+- 出さない: pose 先送り／IDLE_BG_ADVANCE 廃止／`audio_ms` オフセット／pose.json 先修正。B3 Keep。`[B6_DELTA]` Keep 可
+- EN 定常 PLAYING 最大275は境漏れ候補。次=**B7** で境揃え後に残るか見る。
+
+---
+
+## Phase B7: 境で進んだ BG を pose/M0 と同じ枚へ（方式C）
+
+**目的:** idle/ターン境で BGV だけ進んだ Δ を、**表示 BG を遅れ側の pose/M0 枚に戻す**ことで閉じる。pose は先送りしない。同じ N のまま揃える。
+
+**方式（親確定）:**
+- 方式 C: 境イベント（idle入り／idle明け／ターン開始／enter_playing・RELOCK）で `display_bg_idx = pose_idx`（進んだ BG を戻す）
+- PLAYING 中は B3 Keep（`played_audio_ms→BG frame`）
+- 非 PLAYING の IDLE_BG_ADVANCE（待機モーション）は廃止しない。毎 idle tick で BG を pose に吸い付けて待機 BGV を固着させない
+- pose＝BGV 絶対 index Keep。1本専用オフセット禁止
+
+**スコープ:**
+1. 境での最小実装（表示 BG を pose/M0 と同じ枚へ）。適用点は子が特定（合成 tick または BG 選択）
+2. After を B6 と同じ表で出す（JP+EN、同じ Δ 式、同じ区間分け）。`[B6_DELTA]` 再利用
+3. EN 定常 PLAYING 最大 Δ が境揃え後に残るか（漏れなら境分類の再掲のみ。勝手に第二手法を足さない）
+4. 短回帰: 待機 BGV 固着なし／B3 生き／方式2・図A・N=2・`--no-fast_inmemory`・品質凍結 Keep 非破壊
+5. 主観: 境と高速上下で BGV顔 vs M0顔（Y）。口−音は見ない
+
+**スコープ外（B7 禁止）:**
+- pose 先送り、IDLE_BG_ADVANCE 廃止、`audio_ms` +40〜80／全体オフセット、pose.json 先修正
+- 口 frame drop、音声先行 enqueue、ジッタ延長、N↑、図A破壊
+- Colab、多 BGV、1本専用オフセット、B 全面再設計
+- 本番 prompts、session_loop Zoom ミックス、`docs/PROGRESS.md` 編集
+
+**Pass 基準:**
+- [x] 境（idle / ターン）の Δ 中央が数フレーム級へ縮小（Before は B6 表）。最大は defer
+- [x] 定常 PLAYING が 0〜1 近傍を維持。EN PLAYING 最大の残否を明記 — **消えた**（275→1）
+- [x] IDLE_BG_ADVANCE 維持（待機 BGV が止まらない）
+- [x] B3 Keep 維持（PLAYING 中 `bg_mode=audio`）
+- [x] 短回帰・Keep 非破壊。親向けサマリーのみ
+- [x] 主観: JP 顔Y解消＋ EN `sess_en_live1_subj_20260824_140931` 音声後4t 一致
+
+**子報告要約（2026-08-24）:**
+- 適用: `run_virtualcam_persistent.py` の BG 選択＋合成 tick。境は idle入り / fo↑ターン開始 / enter_playing・turn RELOCK のみ。`display_bg_idx=pose_idx`。pose 非移動
+- After: 定常 PLAYING JP/EN 中央0 最大1。高速上下 中央0 最大1。JP ターン境 中央0 最大7。EN ターン境 中央0 最大131。idle境 JP 中央0 最大115 / EN 中央5 最大116
+- IDLE 固着なし（境後 seq 進行。毎 tick 吸い付けなし）。B3 生き。Revert 悪化なし
+- 残: idle最大=起動 BUFFERING（初回 enter_playing 前）。EN ターン最大=turn_local→absolute 窓。第二手法なし
+- 変更: `run_virtualcam_persistent.py` / `phase_b7_boundary_snap_selfcheck.py`
+- JP 主観ログ Tee 不発（`134238` は rss のみ）。判定は手元主観＋無人定量＋ EN 主観ログ
+
+**親判定（2026-08-24）:**
+- **Pass-with-defer。** 方式C Keep。②（BGV顔Y vs M0顔Y）クローズ。B8／第二手法なし
+- Fail/Revert にしない（冒頭無反応＋ズレは T1 実PCMまで idle_silent＋IDLE_BG_ADVANCE。enter_playing で BG を pose へ戻す）
+- 開かない: 貼り位置／口−音／Colab／pose.json／`audio_ms` オフセット
+- 次本線=なし（ユーザー指名待ち）。commit/tag `phase-b7-pass` は親依頼時
 
 ---
 
@@ -3139,3 +3249,6 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-22 | Z2 Hold（Fail ではない）。VAIO 無し・ケーブル1対のみ。次=Z2b Banana 導入＋再クエリ＋JP スマホ。子プロンプト発行 |
 | 2026-08-22 | Z2b Pass。`sess_z2b_jp_subj_20260822_223714` 遠隔4t成立。CABLE In=23 / mic=B1=9。Banana 常駐＋VAIO→B1 を運用 SSOT。220748 は Speaker=CABLE In で未到達。EN 短確認は任意 |
 | 2026-08-23 | Zoom 第三者運営手順を `docs/ops_zoom_third_party.md` に抜き出し（PROGRESS「Zoom 運用」が SSOT）。コード非変更 |
+| 2026-08-23 | 新親着任。本線=② B仕上げ再開（ズレ再発）。B6=調査のみ（合成瞬間 display_bg↔pose Δ、JP+EN）。実装・+40〜80・pose先送り・Colab禁止。① Zoomマニュアルは触らない |
+| 2026-08-23 | Phase B6 Pass。B3生き。定常PLAYING Δ≈0〜1。idle/ターン境でBG進み（仮説2）。方式C採用。次=B7（境でBGをpose/M0枚へ戻す）。pose先送り/IDLE廃止/audio_msオフセット/pose.json先修正は出さない |
+| 2026-08-24 | Phase B7 Pass-with-defer。方式C Keep。定常PLAYING/高速上下 Δ最大1。EN PLAYING最大275消滅。JP+EN主観で顔Y一致。②クローズ。次本線なし。貼り/口−音/第二手法は開かない |

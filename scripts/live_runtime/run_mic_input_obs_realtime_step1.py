@@ -627,6 +627,41 @@ def _pose_abs_window_ms(
     return int(base_ms + int(t0_ms)), int(base_ms + int(t1_ms))
 
 
+def _b6_append_pose_bake(
+    watch_fg_dir: Path | None,
+    *,
+    fg0: int,
+    n: int,
+    pose0: int,
+    mode: str,
+) -> None:
+    """B6 obs only: record baked pose.json index per FG. No render/sync change."""
+    if watch_fg_dir is None or int(n) <= 0:
+        return
+    rec = {
+        "fg0": int(fg0),
+        "n": int(n),
+        "pose0": int(pose0),
+        "mode": str(mode),
+    }
+    path = Path(watch_fg_dir) / "_b6_fg_pose_idx.jsonl"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            f.flush()
+        print(
+            "[sync][B6_POSE_BAKE]",
+            f"fg0={int(fg0)}",
+            f"n={int(n)}",
+            f"pose0={int(pose0)}",
+            f"mode={mode}",
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _read_bg_cursor_pose_base(path: Path | None) -> int | None:
     """Compat: bg_pos only. Prefer _read_bg_cursor_info for B5hf."""
     info = _read_bg_cursor_info(path)
@@ -1412,6 +1447,14 @@ def _m0_pipeline_render_one_chunk_sync(
         m0_pipeline_ref["pose_obj"], pose_t0_ms, pose_t1_ms
     )
     mouth_chunk = _slice_shift_timeline(mouth_obj, t0_ms, t1_ms)
+    # B6 obs: bake map for VirtualCam overlay Δ. Does not change slice/render.
+    _b6_append_pose_bake(
+        m0_pipeline_ref.get("watch_fg_dir"),
+        fg0=int(m0_pipeline_ref.get("frame_offset", 0) or 0) + int(frame0),
+        n=int(frame1) - int(frame0),
+        pose0=int(pose_t0_ms) // max(1, int(step_ms)),
+        mode=str(pose_clock_mode),
+    )
 
     effective_emo_id = m0_pipeline_ref.get("inline_emo_id")
     if live_emo_id_getter is not None:
