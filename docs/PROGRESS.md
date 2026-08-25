@@ -1418,11 +1418,12 @@
 | （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
+| V1 | Live 声 Kore 固定 | `in_progress` | 2026-08-25 着手（希望順①） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** 次本線はユーザー指名待ち（下の希望順。①以降はまだ出さない）
+- **今の本線 = V1（Live 声 Kore 固定）。** 希望順①。②以降は出さない
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
 - defer: 起動 BUFFERING の idle境最大（115/116）／EN ターン境最大131（turn_local→absolute 窓）。主観の顔Yは JP/EN とも解消
@@ -1430,12 +1431,12 @@
 - JP+EN。代表 BGV 1本。常時「表示枚目=pose枚目」
 - **VirtualCam 内 BGV（猫の体・合成用動画）≠ OBS「背景」**。OBS 制御は VirtualCam BGV を切替対象にしない
 
-### 次本線希望順（書くだけ。子プロンプト・実装は出さない）
+### 次本線希望順（②以降は出さない）
 
 | # | 内容 | 状態 |
 | --- | --- | --- |
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
-| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | 指名待ち。ブランチ未作成 |
+| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **in_progress = V1**。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | 指名待ち |
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
@@ -2147,7 +2148,41 @@
 - **Pass-with-defer。** 方式C Keep。②（BGV顔Y vs M0顔Y）クローズ。B8／第二手法なし
 - Fail/Revert にしない（冒頭無反応＋ズレは T1 実PCMまで idle_silent＋IDLE_BG_ADVANCE。enter_playing で BG を pose へ戻す）
 - 開かない: 貼り位置／口−音／Colab／pose.json／`audio_ms` オフセット
-- 次本線=なし（ユーザー指名待ち。希望順は上表 1→4）。commit/tag `phase-b7-pass`（`813c641`）＋ `main` FF は **完了**（2026-08-25）
+- 次本線=**V1**（2026-08-25 着手）。commit/tag `phase-b7-pass`（`813c641`）＋ `main` FF は **完了**（2026-08-25）
+
+---
+
+## Phase V1: Live 声 Kore 固定
+
+**目的:** Live 本番の声を女性 prebuilt **Kore** に一本化する。prompt に「女性」と書くだけでは足りない。`LiveConnectConfig.speech_config` で固定する。
+
+**確定事実:**
+- 本番 = `run_mic_input_obs_realtime_session_loop.py` の `_build_live_config`
+- 現状 `speech_config` 未設定 → 声が混在（Live 未指定の既定は Puck＝男性）
+- JP/EN は同じ Live 接続。`if language` 禁止。`language_code` の JP/EN 分岐も出さない（声だけ固定）
+- 非 Live TTS 既定は Kore。公式 Live 例も Kore。**声名は Kore 固定**（Aoede 等の試聴・A/B・CLI 切替は本 Phase 外）
+- Kore がこの model（既定 `gemini-3.1-flash-live-preview`）で拒否されたときだけ 1 行で止めて親へ。30 声を漁らない
+
+**スコープ:**
+1. `_build_live_config` の両分岐（tools あり/なし）に  
+   `speech_config=SpeechConfig(voice_config=VoiceConfig(prebuilt_voice_config=PrebuiltVoiceConfig(voice_name="Kore")))`
+2. 既存 `[session_loop][live_config]` に `voice_name=Kore` を出す
+3. 本番経路だけ。死んでいる probe / worker の LiveConnectConfig は触らない（まだ Live 音声を出しているなら同じ Kore。推測で広げない）
+4. `--voice_name` CLI は作らない（一本化＝固定）
+
+**スコープ外（V1 禁止）:**
+- prompt / prompts_en / JP prompts 編集（希望順②）
+- B 再開、貼り、口−音、N↑、ジッタ延長、音声先行 enqueue、session_loop Zoom ミックス、二重 Live
+- 言語 if、Puck 残置、声のランダム、Aoede A/B
+- `docs/PROGRESS.md` 編集
+
+**Pass 基準:**
+- [ ] ログに `voice_name=Kore`
+- [ ] 主観: JP 2–3t と EN 2–3t が同じ女性（Kore）。EN は必須3フラグ（`--prompt_dir configs/prompts_en`・`--output_audio_transcription`・`--stream_mouth_gt_glob data/knn_db/en_10files.phoneme_gt.f1f2.json`）
+- [ ] Keep 非破壊: 方式2・図A・N=2・`--no-fast_inmemory`・jitter 300/240・silence 350・B7 方式C・B3
+- [ ] 親向けサマリーのみ
+
+**親判定:** （子サマリー待ち）
 
 ---
 
@@ -3266,3 +3301,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-23 | Phase B6 Pass。B3生き。定常PLAYING Δ≈0〜1。idle/ターン境でBG進み（仮説2）。方式C採用。次=B7（境でBGをpose/M0枚へ戻す）。pose先送り/IDLE廃止/audio_msオフセット/pose.json先修正は出さない |
 | 2026-08-24 | Phase B7 Pass-with-defer。方式C Keep。定常PLAYING/高速上下 Δ最大1。EN PLAYING最大275消滅。JP+EN主観で顔Y一致。②クローズ。次本線なし。貼り/口−音/第二手法は開かない |
 | 2026-08-25 | `main` へ `feature/local-vad-restore` を FF-only マージ（`813c641` / `phase-b7-pass`）。希望順のみ記録（1=女性声 2=EN本番prompt 3=event catalog 4=第三者コマンドdocs）。①以降はまだ出さない |
+| 2026-08-25 | 希望順①着手。Phase V1=Live 声 Kore 固定。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`）。②以降は出さない |
