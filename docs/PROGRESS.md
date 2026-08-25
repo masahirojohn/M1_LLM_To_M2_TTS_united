@@ -1417,17 +1417,30 @@
 | F1s | 現行スプライトで合成主観（黒縁まだ問題か） | `pass` | 2026-08-16（**A**＝目立たない→F1クローズ） |
 | （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
-| （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。push/merge 本線外 |
+| （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 
-### Bライン申し送り（2026-08-24・② クローズ）
+### Bライン申し送り（2026-08-25・main マージ済）
 
-- 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b5-pass` + B7 未 tag）
-- **今の本線 = なし。** ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
+- 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
+- **今の本線 = なし。** 次本線はユーザー指名待ち（下の希望順。①以降はまだ出さない）
+- ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
 - defer: 起動 BUFFERING の idle境最大（115/116）／EN ターン境最大131（turn_local→absolute 窓）。主観の顔Yは JP/EN とも解消
 - 開かない: 貼り位置／口−音／pose 先送り／IDLE 廃止／`audio_ms` オフセット／pose.json／Colab／多BGV
 - JP+EN。代表 BGV 1本。常時「表示枚目=pose枚目」
 - **VirtualCam 内 BGV（猫の体・合成用動画）≠ OBS「背景」**。OBS 制御は VirtualCam BGV を切替対象にしない
+
+### 次本線希望順（書くだけ。子プロンプト・実装は出さない）
+
+| # | 内容 | 状態 |
+| --- | --- | --- |
+| 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
+| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | 指名待ち。ブランチ未作成 |
+| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | 指名待ち |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
+| 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
+
+出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
 
 ### OBS 音声ルーティング（親定義・子へ固定）
 
@@ -1458,8 +1471,8 @@
 - 貼り位置／口−音／起動 BUFFERING idle Δ／EN turn_local 窓（B7 defer。第二手法禁止）
 - Phase12 系の idle silent PCM／縫い目の品質本線化
 - 英語版 CTC（EN-RT3。当面やらない）
-- EN-DB1 / 欠 view / EN 本番システムプロンプト運用
-- ① Zoom 運営マニュアル（`docs/ops_zoom_third_party.md` 済み。再発行しない）
+- EN-DB1 / 欠 view
+- Zoom 運営マニュアル再発行（`docs/ops_zoom_third_party.md` 済み）
 - スミス増殖加速（任意）
 - 当てフリの Python scale／座標拡大
 - Slack トリガ本番化
@@ -2134,7 +2147,7 @@
 - **Pass-with-defer。** 方式C Keep。②（BGV顔Y vs M0顔Y）クローズ。B8／第二手法なし
 - Fail/Revert にしない（冒頭無反応＋ズレは T1 実PCMまで idle_silent＋IDLE_BG_ADVANCE。enter_playing で BG を pose へ戻す）
 - 開かない: 貼り位置／口−音／Colab／pose.json／`audio_ms` オフセット
-- 次本線=なし（ユーザー指名待ち）。commit/tag `phase-b7-pass` は親依頼時
+- 次本線=なし（ユーザー指名待ち。希望順は上表 1→4）。commit/tag `phase-b7-pass`（`813c641`）＋ `main` FF は **完了**（2026-08-25）
 
 ---
 
@@ -3252,3 +3265,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-23 | 新親着任。本線=② B仕上げ再開（ズレ再発）。B6=調査のみ（合成瞬間 display_bg↔pose Δ、JP+EN）。実装・+40〜80・pose先送り・Colab禁止。① Zoomマニュアルは触らない |
 | 2026-08-23 | Phase B6 Pass。B3生き。定常PLAYING Δ≈0〜1。idle/ターン境でBG進み（仮説2）。方式C採用。次=B7（境でBGをpose/M0枚へ戻す）。pose先送り/IDLE廃止/audio_msオフセット/pose.json先修正は出さない |
 | 2026-08-24 | Phase B7 Pass-with-defer。方式C Keep。定常PLAYING/高速上下 Δ最大1。EN PLAYING最大275消滅。JP+EN主観で顔Y一致。②クローズ。次本線なし。貼り/口−音/第二手法は開かない |
+| 2026-08-25 | `main` へ `feature/local-vad-restore` を FF-only マージ（`813c641` / `phase-b7-pass`）。希望順のみ記録（1=女性声 2=EN本番prompt 3=event catalog 4=第三者コマンドdocs）。①以降はまだ出さない |
