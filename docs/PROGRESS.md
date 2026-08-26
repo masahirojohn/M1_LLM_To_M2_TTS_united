@@ -1419,12 +1419,13 @@
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
+| P1 | EN 本番システムプロンプト差し替え＋テスト | `in_progress` | 2026-08-26 着手（希望順②） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** V1 Pass-with-note。希望順②以降は指名待ち（子は出さない）
-- V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない
+- **今の本線 = P1（EN 本番 prompt）。** 希望順②。③④は出さない
+- V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
 - defer: 起動 BUFFERING の idle境最大（115/116）／EN ターン境最大131（turn_local→absolute 窓）。主観の顔Yは JP/EN とも解消
@@ -1437,8 +1438,8 @@
 | # | 内容 | 状態 |
 | --- | --- | --- |
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
-| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。ブランチ `feature/live-voice-kore` |
-| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | 指名待ち |
+| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
+| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **in_progress = P1**。ブランチ `feature/en-prod-prompts`（from `main` `b4f7d5c`） |
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
@@ -2194,8 +2195,51 @@
 - **Pass-with-note。** 声一本化は成立。Kore 名は Keep できない
 - Keep = prebuilt **Aoede**（両分岐）＋ camelCase wire。Puck 既定に戻さない。`--voice_name` CLI なし。JP/EN 同じ接続。`language_code` / `if language` なし
 - 出さない: 追加の声 A/B、CLI、JP/EN 言語 if、prompt 編集、B/O 再開
-- 次本線=なし（希望順②は指名待ち。今は出さない）
+- 次本線=**P1**（2026-08-26 着手）。Keep All（commit / tag `phase-v1-pass`）は親実施済。`main` FF 済
 - Keep All（commit / tag `phase-v1-pass`）は **親が実施**。子は commit / tag / Keep しない
+
+---
+
+## Phase P1: EN 本番システムプロンプト差し替え＋テスト
+
+**目的:** 本番 EN の system prompt を通常／バトル 2 系統の `--prompt_dir` に分け、割り込み／主導権定型を EN dir 横の英語ファイルから読む。Studio 検証済文面はバトル正。要約・改作しない。
+
+**確定事実（再調査で覆すな）:**
+- 本番 EN = `--prompt_dir configs/prompts_en`。長さ SSOT は今 `00_base` の "Keep replies short, about one sentence."
+- loader は dir 内を全部連結する → **同じ dir に 20 と 30 の長さ方針を両方書くな**。切替は `--prompt_dir` 2系統
+- `prompts_en_dur` は DUR 検証用。本番例にしない。通常パスに残すな
+- JP `configs/prompts` は無断上書き禁止
+- `_build_battle_interrupt_prompt` と admin 定型は日本語の「短く／1文」。control は system 一文に負ける。主導権＝床取り（mute）。「短く話せ」は用途と逆
+- `if language` 禁止。英語定型は **prompt_dir 横の同名ファイル**（JP dir は日本語のまま）
+- Studio 文面 SSOT = `US_system_prompt_1.md`（Downloads 同名可）。**prompts_en_battle の 10/30**。通常 `00/20` に丸ごと載せるな
+- Studio 自己対戦は文面の事前検証。M1 で二重 Live は出さない。Pass は本番 EN 1本＋人間/interrupt
+- 「short, snappy」はテンポ。00_base の1文硬拘束ではない。バトル＝さえぎられるまで。few-shot は 2–4 文でよい
+- V1 Keep（Aoede＋camelCase）は触るな。声を prompt で女性化しない
+- 現行 `prompts_en/00_base` の emo_id 規則と「[emo:] を読み上げるな」「Never reply in Japanese」は残す。M1 は inline_emo 必須
+- `[System: Phase/Action]` は既存 interrupt/control ファイルへ載せるだけ。session_loop に新プロトコルを足すな
+
+**スコープ:**
+1. `configs/prompts_en`: `00_base` から1文硬拘束を外す。`20_normal`＝1〜2文。`30_battle` は空のまま
+2. 新 `configs/prompts_en_battle`: 同じ 00（1文なし）＋ Studio 原文を `_studio_source.md` にコピーしてから 10/30 へ分割。`20_normal` は空。`30`＝さえぎられるまで話してよい
+3. 割り込み／主導権定型の英語ファイルを EN prompt_dir 横に置き、admin と session_loop ラッパは **今の prompt_dir から読む**。英語文面は床取り（短く話せ／1文で返せ、を書くな）
+4. テスト（ローカル mic。Banana/Zoom 不要。Zoom で主導権 mute+interrupt は使うな）:
+   - EN 通常 dir・必須3フラグ・Aoede Keep・2–3t: 英語で 1〜2文（DUR の 60s 化は Fail）
+   - EN battle dir 短確認: 一文で終わらず、割り込みで切れる
+   - 英語 interrupt が実際に飛ぶこと
+5. V1 Keep・方式2・図A・N=2・`--no-fast_inmemory`・jitter 300/240・silence 350・B7 方式C 非破壊
+
+**スコープ外（P1 禁止）:**
+- JP prompts 編集、`prompts_en_dur` を本番化、`--no-skip` 本線化、I1 を長文装置化
+- session_loop に language if、Aoede/camelCase 改変、B 再開、N↑、ジッタ延長、音声先行 enqueue、二重 Live、③ catalog
+- Studio 文面の要約・改作・「もっと短く」、声の prompt 女性化
+- `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
+
+**Pass 基準:**
+- [ ] 上のテスト＋ JP prompts 未変更＋ 通常/バトルが prompt_dir で切替
+- [ ] Studio 文面が battle 10/30 に載り、通常 00/20 に丸ごと入っていない
+- [ ] 親向けサマリーのみ
+
+**親判定:** （子サマリー待ち）
 
 ---
 
@@ -3316,3 +3360,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-25 | `main` へ `feature/local-vad-restore` を FF-only マージ（`813c641` / `phase-b7-pass`）。希望順のみ記録（1=女性声 2=EN本番prompt 3=event catalog 4=第三者コマンドdocs）。①以降はまだ出さない |
 | 2026-08-25 | 希望順①着手。Phase V1=Live 声 Kore 固定。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`）。②以降は出さない |
 | 2026-08-26 | Phase V1 Pass-with-note。Keep=Aoede＋camelCase wire（snake_case は Live 無視→Puck）。Kore 名は Keep 不可。JP 中性は同一 Aoede の言語差として受容。②は出さない |
+| 2026-08-26 | `main` へ `feature/live-voice-kore` を FF-only（`b4f7d5c` / `phase-v1-pass`）。希望順②着手。Phase P1。ブランチ `feature/en-prod-prompts`。③④は出さない |
