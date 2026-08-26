@@ -505,12 +505,62 @@ def _build_system_instruction_from_prompt_dir(
     return system_instruction
 
 
+def _patch_mldev_speech_config_aliases() -> None:
+    """google-genai 2.10.0 mldev は SpeechConfig を snake_case のまま送る。
+
+    Live はその内側を無視して既定 Puck（男性）になる。Vertex 側は camelCase 変換済み。
+    t_live_speech_config の戻りを alias dump にして wire を公式例と同じにする。
+    """
+    from google.genai import _transformers as _genai_t
+
+    orig = _genai_t.t_live_speech_config
+    if getattr(orig, "_m1_alias_dump", False):
+        return
+
+    def _alias_dump(origin: Any) -> Any:
+        cfg = orig(origin)
+        if cfg is None:
+            return None
+        return cfg.model_dump(exclude_none=True, by_alias=True)
+
+    _alias_dump._m1_alias_dump = True  # type: ignore[attr-defined]
+    _genai_t.t_live_speech_config = _alias_dump
+
+
+def _speech_config_wire_voice_name(speech_config: Any) -> Any:
+    if speech_config is None or not hasattr(speech_config, "model_dump"):
+        return None
+    dumped = speech_config.model_dump(exclude_none=True, by_alias=True)
+    return ((dumped.get("voiceConfig") or {}).get("prebuiltVoiceConfig") or {}).get(
+        "voiceName"
+    )
+
+
+def _live_speech_setup_payload(config: Any) -> Any:
+    """mldev が実際に送る setup.generationConfig.speechConfig（1行ログ用）。"""
+    from google.genai import _common
+    from google.genai import _live_converters as _lc
+
+    class _Dummy:
+        vertexai = False
+
+    dumped = types.LiveConnectParameters(model="x", config=config).model_dump(
+        exclude_none=True
+    )
+    req = _lc._LiveConnectParameters_to_mldev(
+        api_client=_Dummy(), from_object=dumped
+    )
+    req = _common.convert_to_dict(req)
+    return ((req.get("setup") or {}).get("generationConfig") or {}).get("speechConfig")
+
+
 def _build_live_config(
     system_instruction: str,
     *,
     enable_tools: bool = True,
     output_audio_transcription: bool = False,
 ) -> types.LiveConnectConfig:
+    _patch_mldev_speech_config_aliases()
     extra_kwargs: dict[str, Any] = {}
 
     if output_audio_transcription:
@@ -523,10 +573,21 @@ def _build_live_config(
         ),
     )
 
+    # Live 未指定の既定は Puck（男性）。Kore は wire 到達後も主観が男性（Firm）。
+    # 公式女性は Aoede（Breezy）。CLI/言語分岐/30声漁りは出さない。
+    speech_config = types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                voice_name="Aoede",
+            )
+        ),
+    )
+
     if not enable_tools:
         return types.LiveConnectConfig(
             system_instruction=system_instruction,
             response_modalities=["AUDIO"],
+            speech_config=speech_config,
             **extra_kwargs,
         )
 
@@ -544,6 +605,7 @@ def _build_live_config(
         system_instruction=system_instruction,
         tools=[types.Tool(function_declarations=[set_emotion])],
         response_modalities=["AUDIO"],
+        speech_config=speech_config,
         **extra_kwargs,
     )
 
@@ -6193,12 +6255,20 @@ async def _run(args: argparse.Namespace) -> int:
             "automatic_activity_detection",
             None,
         )
+        _pvc = getattr(
+            getattr(getattr(config, "speech_config", None), "voice_config", None),
+            "prebuilt_voice_config",
+            None,
+        )
         print(
             "[session_loop][live_config]",
             f"automatic_activity_detection.disabled={getattr(_aad, 'disabled', None)}",
             f"mic_vad_end_enabled={bool(args.mic_vad_end_enabled)}",
             f"skip_response_trigger={bool(args.skip_response_trigger)}",
             f"drop_initial_audio_ms_forced=0",
+            f"voice_name={getattr(_pvc, 'voice_name', None)}",
+            f"voice_wire={_speech_config_wire_voice_name(getattr(config, 'speech_config', None))}",
+            f"speech_setup={json.dumps(_live_speech_setup_payload(config), ensure_ascii=False)}",
             flush=True,
         )
         print(

@@ -1418,12 +1418,13 @@
 | （任意後日） | きれいスプライト資産更新 | — | 必須ではない。差替時は位置・25fps・4ch 短確認。**JP 本線に混ぜない** |
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
-| V1 | Live 声 Kore 固定 | `in_progress` | 2026-08-25 着手（希望順①） |
+| V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = V1（Live 声 Kore 固定）。** 希望順①。②以降は出さない
+- **今の本線 = なし。** V1 Pass-with-note。希望順②以降は指名待ち（子は出さない）
+- V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
 - defer: 起動 BUFFERING の idle境最大（115/116）／EN ターン境最大131（turn_local→absolute 窓）。主観の顔Yは JP/EN とも解消
@@ -1436,7 +1437,7 @@
 | # | 内容 | 状態 |
 | --- | --- | --- |
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
-| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **in_progress = V1**。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`） |
+| 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。ブランチ `feature/live-voice-kore` |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | 指名待ち |
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
@@ -2177,12 +2178,24 @@
 - `docs/PROGRESS.md` 編集
 
 **Pass 基準:**
-- [ ] ログに `voice_name=Kore`
-- [ ] 主観: JP 2–3t と EN 2–3t が同じ女性（Kore）。EN は必須3フラグ（`--prompt_dir configs/prompts_en`・`--output_audio_transcription`・`--stream_mouth_gt_glob data/knn_db/en_10files.phoneme_gt.f1f2.json`）
-- [ ] Keep 非破壊: 方式2・図A・N=2・`--no-fast_inmemory`・jitter 300/240・silence 350・B7 方式C・B3
-- [ ] 親向けサマリーのみ
+- [x] ログに `voice_name`（当初 Kore。Keep は **Aoede**）＋ `voice_wire` / `speech_setup`
+- [x] 主観: EN 女性。JP は中性として同一 Aoede の言語差を受容（これ以上の声漁り・prompt 女性化は②）
+- [x] Keep 非破壊: 方式2・図A・N=2・`--no-fast_inmemory`・jitter 300/240・silence 350・B7 方式C・B3
+- [x] 親向けサマリーのみ。追加 A/B・CLI・言語 if なし
 
-**親判定:** （子サマリー待ち）
+**子報告要約（2026-08-25〜26）:**
+- `_build_live_config` 両分岐に `speech_config`。本番は `--inline_emo_tag_mode` のため tools なし。probe / worker / `--voice_name` CLI 未追加
+- 初手 Kore は connect OK だが、google-genai 2.10.0 mldev が snake_case で送り Live が無視 → Puck 既定のまま。`t_live_speech_config` を camelCase alias dump
+- Kore は wire 到達後も JP 主観が男性 → **Aoede 1本**（A/B・30声漁りではない）
+- オペレーター主観: EN `134218` 女性。JP `134051` / `134121` 中性。同一 Aoede の言語差として受容
+- 変更: `run_mic_input_obs_realtime_session_loop.py` のみ。Keep All は親（commit / tag）
+
+**親判定（2026-08-26）:**
+- **Pass-with-note。** 声一本化は成立。Kore 名は Keep できない
+- Keep = prebuilt **Aoede**（両分岐）＋ camelCase wire。Puck 既定に戻さない。`--voice_name` CLI なし。JP/EN 同じ接続。`language_code` / `if language` なし
+- 出さない: 追加の声 A/B、CLI、JP/EN 言語 if、prompt 編集、B/O 再開
+- 次本線=なし（希望順②は指名待ち。今は出さない）
+- Keep All（commit / tag `phase-v1-pass`）は **親が実施**。子は commit / tag / Keep しない
 
 ---
 
@@ -3302,3 +3315,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-24 | Phase B7 Pass-with-defer。方式C Keep。定常PLAYING/高速上下 Δ最大1。EN PLAYING最大275消滅。JP+EN主観で顔Y一致。②クローズ。次本線なし。貼り/口−音/第二手法は開かない |
 | 2026-08-25 | `main` へ `feature/local-vad-restore` を FF-only マージ（`813c641` / `phase-b7-pass`）。希望順のみ記録（1=女性声 2=EN本番prompt 3=event catalog 4=第三者コマンドdocs）。①以降はまだ出さない |
 | 2026-08-25 | 希望順①着手。Phase V1=Live 声 Kore 固定。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`）。②以降は出さない |
+| 2026-08-26 | Phase V1 Pass-with-note。Keep=Aoede＋camelCase wire（snake_case は Live 無視→Puck）。Kore 名は Keep 不可。JP 中性は同一 Aoede の言語差として受容。②は出さない |
