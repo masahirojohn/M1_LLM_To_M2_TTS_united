@@ -1420,12 +1420,13 @@
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
+| E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `in_progress` | 2026-08-27 着手（希望順③） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** P1 Pass-with-note。希望順③④は指名待ち（子は出さない）
-- P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視
+- **今の本線 = E1（event catalog＋admin プルダウン）。** 希望順③。④は出さない
+- P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視。`main` FF 済（`f117d51` / `phase-p1-pass`）
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
@@ -1440,8 +1441,8 @@
 | --- | --- | --- |
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
-| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。ブランチ `feature/en-prod-prompts` |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
+| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **in_progress = E1**。ブランチ `feature/event-catalog-admin`（from `main` `f117d51`） |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
@@ -2254,7 +2255,39 @@
 - **Pass-with-note。** 口 barge-in を既存 talkover 例外に接続。二重 InputStream は監視（本線化しない）
 - Fail にしない: admin sidebar 既定 JP（Live wrap は EN）。先頭〜10s 無音＝接続待ち。かぶり気味。cut 後 BGV Δ
 - 出さない: この子への追作業、再生中 mic の新経路、B 再開、ジッタ延長、主導権 Zoom、二重 Live、③④
-- Keep All（commit / tag `phase-p1-pass`）は **親が実施**。子は commit / tag / Keep しない。`in/*.txt` は入れない
+- Keep All（commit / tag `phase-p1-pass`）は **親が実施**。子は commit / tag / Keep しない。`in/*.txt` は入れない。`main` FF 済。次=**E1**
+
+---
+
+## Phase E1: イベント動画 catalog 最大10＋管理画面プルダウン
+
+**目的:** `in/event_catalog.json` を最大10件の SSOT にし、管理画面は catalog プルダウンから `event_runtime_live.txt` へ投入する。既存 event_runtime（VirtualCam 挿入）は壊さない。
+
+**確定事実（覆すな）:**
+- 現行 catalog は 2件（`evt_001` / `evt_voice_001`）。投入は `event_runtime_live.txt`
+- 管理画面は event_id 手入力＋決め打ち2ボタン。catalog を読んでいない
+- イベント動画＝既存 event_runtime（VirtualCam 側の挿入）。OBS「背景」静止画/BGM（O1）とは別。VirtualCam 内 BGV（猫の体）は切替対象外
+- 画面コンパクト化は同時で可（制御を消すな。expander 等で短くするだけ）
+
+**スコープ:**
+1. catalog は **最大10**。今の2件は残す。実ファイルの無い id を捏造するな（空枠8個を作るな）
+2. 管理画面は catalog のプルダウンから選んで投入。決め打ち2ボタンは不要（dropdown が正）
+3. 既存 write_event / session_loop の event 経路は壊すな。新プロトコル・session_loop sleep・OBS でイベント動画再生は出さない
+4. コンパクトは同じ PR で可。主導権／VAD／OBS／当てフリ／スミスは残す
+5. 短確認: 画面に catalog（≤10）が出る。1件選ぶと `event_runtime_live.txt` にその event_id。Live が走っていれば既存どおり挿入（Zoom 不要）
+
+**スコープ外（E1 禁止）:**
+- B 再開、ジッタ延長、N↑、音声先行 enqueue、主導権 Zoom、二重 Live、④ docs
+- JP prompts / `prompts_en_dur` / P1 文面の改作
+- event を OBS WS 再生に付け替える、catalog を 10 超、ダミー mp4 量産
+- P1 子の再利用。`docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
+
+**Pass 基準:**
+- [ ] プルダウン＝catalog、最大10、既存2件生存、1件投入がファイルに出る
+- [ ] Keep 非破壊（P1 / V1 / 方式2 / 図A / N=2 / jitter / B7 / O1 音声ルーティング）
+- [ ] 親向けサマリーのみ
+
+**親判定:** （子サマリー待ち）
 
 ---
 
@@ -3377,3 +3410,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-26 | Phase V1 Pass-with-note。Keep=Aoede＋camelCase wire（snake_case は Live 無視→Puck）。Kore 名は Keep 不可。JP 中性は同一 Aoede の言語差として受容。②は出さない |
 | 2026-08-26 | `main` へ `feature/live-voice-kore` を FF-only（`b4f7d5c` / `phase-v1-pass`）。希望順②着手。Phase P1。ブランチ `feature/en-prod-prompts`。③④は出さない |
 | 2026-08-27 | Phase P1 Pass-with-note。prompts_en / prompts_en_battle 切替。口 barge-in＝既存 talkover。140322 Fail→175716 Pass。Keep All は親。③④は出さない |
+| 2026-08-27 | `main` へ `feature/en-prod-prompts` を FF-only（`f117d51` / `phase-p1-pass`）。希望順③着手。Phase E1。ブランチ `feature/event-catalog-admin`。④は出さない |
