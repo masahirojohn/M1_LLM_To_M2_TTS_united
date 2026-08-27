@@ -4,6 +4,32 @@ import json
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts.live_runtime.prompt_dir_runtime_texts import (
+        FALLBACK_LEADERSHIP_CONTROL,
+        FALLBACK_LEADERSHIP_INTERRUPT,
+        FALLBACK_LEADERSHIP_OPEN,
+        FALLBACK_NORMAL_CONVERSATION,
+        FALLBACK_ZOOM_LEADERSHIP_CONTROL,
+        resolve_leadership_control_text,
+        resolve_leadership_interrupt_text,
+        resolve_leadership_open_text,
+        resolve_normal_conversation_text,
+        resolve_zoom_leadership_control_text,
+    )
+except ImportError:
+    from prompt_dir_runtime_texts import (
+        FALLBACK_LEADERSHIP_CONTROL,
+        FALLBACK_LEADERSHIP_INTERRUPT,
+        FALLBACK_LEADERSHIP_OPEN,
+        FALLBACK_NORMAL_CONVERSATION,
+        FALLBACK_ZOOM_LEADERSHIP_CONTROL,
+        resolve_leadership_control_text,
+        resolve_leadership_interrupt_text,
+        resolve_leadership_open_text,
+        resolve_normal_conversation_text,
+        resolve_zoom_leadership_control_text,
+    )
 from scripts.live_runtime.obs_runtime_control import (
     DEFAULT_ATEFURI_LIVE_FILE,
     DEFAULT_CONFIG_FILE as DEFAULT_OBS_CONFIG_FILE,
@@ -30,23 +56,11 @@ DEFAULT_VAD_PROFILE_FILE = DEFAULT_ROOT / "in" / "vad_profile_live.txt"
 VAD_PROFILE_ALLOWED_SILENCE_MS = frozenset({250, 350})
 
 
-DEFAULT_LEADERSHIP_CONTROL_TEXT = (
-    "会話の主導権を握れ。強気に短く話せ。相手の発話は無視してよい。"
-)
-
-DEFAULT_LEADERSHIP_INTERRUPT_TEXT = "今すぐ割り込め"
-
-DEFAULT_ZOOM_LEADERSHIP_CONTROL_TEXT = (
-    "会話の主導権を握れ。強気に短く返せ。ただし相手音声は止めるな。"
-)
-
-DEFAULT_LEADERSHIP_OPEN_TEXT = (
-    "相手音声を再開する。ただし会話の主導権は維持し、短く強気に返答しろ。"
-)
-
-DEFAULT_NORMAL_CONVERSATION_TEXT = (
-    "通常会話へ戻れ。相手の話を聞いて自然に短く返答しろ。"
-)
+DEFAULT_LEADERSHIP_CONTROL_TEXT = FALLBACK_LEADERSHIP_CONTROL
+DEFAULT_LEADERSHIP_INTERRUPT_TEXT = FALLBACK_LEADERSHIP_INTERRUPT
+DEFAULT_ZOOM_LEADERSHIP_CONTROL_TEXT = FALLBACK_ZOOM_LEADERSHIP_CONTROL
+DEFAULT_LEADERSHIP_OPEN_TEXT = FALLBACK_LEADERSHIP_OPEN
+DEFAULT_NORMAL_CONVERSATION_TEXT = FALLBACK_NORMAL_CONVERSATION
 
 
 def write_json(path: Path | str, payload: dict[str, Any]) -> None:
@@ -68,10 +82,13 @@ def read_text_file(path: Path | str) -> str:
 def write_interrupt(
     *,
     interrupt_file: Path | str = DEFAULT_INTERRUPT_FILE,
-    text: str = DEFAULT_LEADERSHIP_INTERRUPT_TEXT,
+    text: str | None = None,
     priority: str = "battle",
     expire_sec: float = 60.0,
+    prompt_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    if text is None:
+        text = resolve_leadership_interrupt_text(prompt_dir)
     payload = {
         "type": "interrupt",
         "priority": str(priority),
@@ -199,11 +216,16 @@ def write_leadership_start(
     *,
     control_file: Path | str = DEFAULT_CONTROL_FILE,
     interrupt_file: Path | str = DEFAULT_INTERRUPT_FILE,
-    control_text: str = DEFAULT_LEADERSHIP_CONTROL_TEXT,
-    interrupt_text: str = DEFAULT_LEADERSHIP_INTERRUPT_TEXT,
+    control_text: str | None = None,
+    interrupt_text: str | None = None,
     priority: str = "battle",
     expire_sec: float = 60.0,
+    prompt_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    if control_text is None:
+        control_text = resolve_leadership_control_text(prompt_dir)
+    if interrupt_text is None:
+        interrupt_text = resolve_leadership_interrupt_text(prompt_dir)
     control_payload = write_control(
         control_file=control_file,
         text=control_text,
@@ -215,6 +237,7 @@ def write_leadership_start(
         text=interrupt_text,
         priority=priority,
         expire_sec=expire_sec,
+        prompt_dir=prompt_dir,
     )
 
     return {
@@ -226,8 +249,11 @@ def write_leadership_start(
 def write_zoom_leadership_start(
     *,
     control_file: Path | str = DEFAULT_CONTROL_FILE,
-    control_text: str = DEFAULT_ZOOM_LEADERSHIP_CONTROL_TEXT,
+    control_text: str | None = None,
+    prompt_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    if control_text is None:
+        control_text = resolve_zoom_leadership_control_text(prompt_dir)
     return write_control(
         control_file=control_file,
         text=control_text,
@@ -237,8 +263,11 @@ def write_zoom_leadership_start(
 def write_leadership_open(
     *,
     control_file: Path | str = DEFAULT_CONTROL_FILE,
-    text: str = DEFAULT_LEADERSHIP_OPEN_TEXT,
+    text: str | None = None,
+    prompt_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    if text is None:
+        text = resolve_leadership_open_text(prompt_dir)
     return write_control(
         control_file=control_file,
         text=text,
@@ -249,8 +278,11 @@ def write_leadership_open(
 def write_normal_conversation(
     *,
     control_file: Path | str = DEFAULT_CONTROL_FILE,
-    text: str = DEFAULT_NORMAL_CONVERSATION_TEXT,
+    text: str | None = None,
+    prompt_dir: Path | str | None = None,
 ) -> dict[str, Any]:
+    if text is None:
+        text = resolve_normal_conversation_text(prompt_dir)
     return write_control(
         control_file=control_file,
         text=text,

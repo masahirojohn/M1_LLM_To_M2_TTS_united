@@ -1419,12 +1419,13 @@
 | （本線移管） | 英語版 Realtime | → EN-RT | **RT+LIVE1 クローズ済（2026-08-19）**。番号は `EN-RT0/1/2`＋`EN-LIVE1`。JP リポ現状維持 |
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
-| P1 | EN 本番システムプロンプト差し替え＋テスト | `in_progress` | 2026-08-26 着手（希望順②） |
+| P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = P1（EN 本番 prompt）。** 希望順②。③④は出さない
+- **今の本線 = なし。** P1 Pass-with-note。希望順③④は指名待ち（子は出さない）
+- P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
@@ -1439,7 +1440,7 @@
 | --- | --- | --- |
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
-| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **in_progress = P1**。ブランチ `feature/en-prod-prompts`（from `main` `b4f7d5c`） |
+| 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。ブランチ `feature/en-prod-prompts` |
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | 指名待ち |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
@@ -1480,6 +1481,7 @@
 - 当てフリの Python scale／座標拡大
 - Slack トリガ本番化
 - B全面再オープン／リップ品質本線化
+- 再生中 mic の新 barge-in 経路／二重 InputStream 本線化／主導権を Zoom で使う
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -2235,11 +2237,24 @@
 - `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
 
 **Pass 基準:**
-- [ ] 上のテスト＋ JP prompts 未変更＋ 通常/バトルが prompt_dir で切替
-- [ ] Studio 文面が battle 10/30 に載り、通常 00/20 に丸ごと入っていない
-- [ ] 親向けサマリーのみ
+- [x] 上のテスト＋ JP prompts 未変更＋ 通常/バトルが prompt_dir で切替
+- [x] Studio 文面が battle 10/30 に載り、通常 00/20 に丸ごと入っていない
+- [x] 親向けサマリーのみ。口 barge-in は既存 talkover 例外に接続（140322 Fail → 175716 Pass）
 
-**親判定:** （子サマリー待ち）
+**子報告要約（2026-08-26〜27）:**
+- 通常 dir: 20あり・30空。battle dir: 20空・30=Studio。同居なし。`_studio_source.md` は Downloads と SHA256 一致。emo は両 00 に残置
+- interrupt/leadership は今の `--prompt_dir` から読む。JP dir に無いときは日本語 fallback。英語 wrap は飛ぶ（sidebar raw が JP でも Live へは EN）
+- 無人: 通常 `212912` 1〜2文。battle `213855` 一文で終わらず＋管理 interrupt cut_in
+- オペレータ通常: `133310` / `133646`（1〜2文。60s 化なし。かぶりは EN-LIVE1 観察・Gate にしない）
+- battle `140322` は口で止まらない＝実装漏れ Fail。口 barge-in を既存 talkover `clear_queue` に接続（mute は切らない）
+- 再主観 `175716`: 口で停止。`barge_in` playback_watch + mic_voice → `clear_queue:talkover_cut_in`。PLAYING 中 Δ 0±1。cut 後 BUFFERING の Δ は B 再開しない
+- JP prompts / `prompts_en_dur` / Aoede wire 未変更。`if language` なし
+
+**親判定（2026-08-27）:**
+- **Pass-with-note。** 口 barge-in を既存 talkover 例外に接続。二重 InputStream は監視（本線化しない）
+- Fail にしない: admin sidebar 既定 JP（Live wrap は EN）。先頭〜10s 無音＝接続待ち。かぶり気味。cut 後 BGV Δ
+- 出さない: この子への追作業、再生中 mic の新経路、B 再開、ジッタ延長、主導権 Zoom、二重 Live、③④
+- Keep All（commit / tag `phase-p1-pass`）は **親が実施**。子は commit / tag / Keep しない。`in/*.txt` は入れない
 
 ---
 
@@ -3361,3 +3376,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-25 | 希望順①着手。Phase V1=Live 声 Kore 固定。ブランチ `feature/live-voice-kore`（from `main` `354d1e4`）。②以降は出さない |
 | 2026-08-26 | Phase V1 Pass-with-note。Keep=Aoede＋camelCase wire（snake_case は Live 無視→Puck）。Kore 名は Keep 不可。JP 中性は同一 Aoede の言語差として受容。②は出さない |
 | 2026-08-26 | `main` へ `feature/live-voice-kore` を FF-only（`b4f7d5c` / `phase-v1-pass`）。希望順②着手。Phase P1。ブランチ `feature/en-prod-prompts`。③④は出さない |
+| 2026-08-27 | Phase P1 Pass-with-note。prompts_en / prompts_en_battle 切替。口 barge-in＝既存 talkover。140322 Fail→175716 Pass。Keep All は親。③④は出さない |

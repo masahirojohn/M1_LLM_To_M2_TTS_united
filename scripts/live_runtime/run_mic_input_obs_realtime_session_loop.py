@@ -63,6 +63,11 @@ from run_mic_input_obs_realtime_step1 import (
     _watch_stream_pcm_chunks,
     _watch_stream_mouth_and_render_m0,
 )
+from prompt_dir_runtime_texts import (
+    format_battle_control_prompt,
+    format_battle_interrupt_prompt,
+    format_battle_interrupt_reserve_prompt,
+)
 
 
 ALLOWED_EMO_IDS = {
@@ -1123,6 +1128,9 @@ async def _send_mic_once(
     ai_audio_started_event: asyncio.Event | None = None,
     mic_result_ref: dict[str, Any] | None = None,
     turn_no: int | None = None,
+    audio_player_proc: subprocess.Popen | None = None,
+    turn_state: dict[str, Any] | None = None,
+    cut_in_on_user_voice: bool = False,
 ) -> int:
     """
     Mic PCM を Live API へ送信する。
@@ -1335,6 +1343,17 @@ async def _send_mic_once(
                                         f"rms={rms:.5f}",
                                         f"start_threshold={vad_start_threshold:.5f}",
                                         flush=True,
+                                    )
+                                if cut_in_on_user_voice:
+                                    await _maybe_user_voice_talkover_cut_in(
+                                        audio_player_proc=audio_player_proc,
+                                        turn_state=turn_state,
+                                        mic_gate_ref=mic_gate_ref,
+                                        source="mic_voice",
+                                        extra=(
+                                            f"turn={turn_no} rms={rms:.5f} "
+                                            f"i={i}"
+                                        ),
                                     )
                                 await _emit_activity_start(i)
                         else:
@@ -1568,14 +1587,18 @@ def _build_idle_utterance_prompt(raw_text: str | None = None) -> str:
 
 
 # --- [ADD] Battle Runtime: admin CLI interrupt helpers ---
-def _build_battle_interrupt_prompt(raw_text: str) -> str:
-    raw_text = str(raw_text).strip()
-    return (
-        "【管理者割り込み指示】"
-        "相手の発話終了を待たず、今すぐ短く被せて話してください。"
-        "人気ライバーのように、テンポよく、1文で返してください。"
-        f"指示内容: {raw_text}"
+def _build_battle_interrupt_prompt(
+    raw_text: str,
+    prompt_dir: Path | None = None,
+) -> str:
+    prompt, source = format_battle_interrupt_prompt(raw_text, prompt_dir)
+    print(
+        "[battle_interrupt][prompt_template]",
+        f"source={source}",
+        f"chars={len(prompt)}",
+        flush=True,
     )
+    return prompt
 
 
 # --- [ADD] Battle Runtime: queue file loader ---
@@ -1774,6 +1797,166 @@ async def _apply_user_interrupt_clear(
         turn_state["interrupt_clear_in_progress"] = False
 
 
+def _mic_gate_is_mute(mic_gate_ref: dict[str, str] | None) -> bool:
+    if mic_gate_ref is None:
+        return False
+    return str(mic_gate_ref.get("value", "open")).strip().lower() == "mute"
+
+
+def _player_has_talkover_leftover(turn_state: dict[str, Any] | None) -> bool:
+    """True when player still holds prior-turn AI audio (not idle-silent ~jitter)."""
+    if turn_state is None:
+        return False
+    pending_ms, _state, initial_buffer_ms = _read_player_buffer_snapshot(turn_state)
+    floor_ms = max(float(initial_buffer_ms), 300.0) + 80.0
+    return float(pending_ms) >= floor_ms
+
+
+async def _maybe_user_voice_talkover_cut_in(
+    *,
+    audio_player_proc: subprocess.Popen | None,
+    turn_state: dict[str, Any] | None,
+    mic_gate_ref: dict[str, str] | None,
+    source: str,
+    extra: str = "",
+) -> bool:
+    """User-voice interrupt exception. Skip leadership mute and idle-silent PLAYING."""
+    if turn_state is None:
+        return False
+    if _mic_gate_is_mute(mic_gate_ref):
+        return False
+    if not _player_has_talkover_leftover(turn_state):
+        return False
+    print(
+        "[battle_talkover][barge_in]",
+        f"source={source}",
+        extra,
+        flush=True,
+    )
+    await _apply_user_interrupt_clear(
+        audio_player_proc=audio_player_proc,
+        turn_state=turn_state,
+        reason="talkover_cut_in",
+    )
+    return True
+
+
+async def _watch_playback_barge_in(
+    *,
+    barge_in_event: asyncio.Event,
+    stop_event: asyncio.Event,
+    audio_player_proc: subprocess.Popen | None,
+    turn_state: dict[str, Any],
+    input_sr: int,
+    chunk_ms: int,
+    device: int | str | None,
+    mic_vad_rms_threshold: float,
+    mic_vad_min_voice_ms: int,
+    mic_gate_ref: dict[str, str] | None,
+    turn_no: int,
+) -> None:
+    """Listen-only VAD during AI playback. Does not send PCM to Live."""
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except Exception as e:
+        raise RuntimeError("sounddevice / numpy required") from e
+
+    block_samples = int(input_sr * chunk_ms / 1000.0)
+    actual_chunk_ms = (
+        block_samples / float(input_sr) * 1000.0
+        if input_sr > 0
+        else float(chunk_ms)
+    )
+    min_voice_blocks = max(
+        1,
+        int(round(float(mic_vad_min_voice_ms) / actual_chunk_ms)),
+    )
+    vad_start_threshold = float(mic_vad_rms_threshold)
+
+    q: asyncio.Queue[bytes] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def callback(indata: Any, frames: int, time_info: Any, status: Any) -> None:
+        x = indata[:, 0]
+        x = np.clip(x, -1.0, 1.0)
+        pcm = (x * 32767.0).astype(np.int16).tobytes()
+        loop.call_soon_threadsafe(q.put_nowait, pcm)
+
+    input_device = device
+    if input_device is not None:
+        try:
+            input_device = int(input_device)
+        except (TypeError, ValueError):
+            input_device = str(input_device)
+
+    print(
+        "[battle_talkover][barge_watch_begin]",
+        f"turn={turn_no}",
+        f"device={device}",
+        f"start_threshold={vad_start_threshold:.5f}",
+        f"voice_blocks={min_voice_blocks}",
+        flush=True,
+    )
+
+    voice_blocks = 0
+    try:
+        with sd.InputStream(
+            samplerate=int(input_sr),
+            channels=1,
+            dtype="float32",
+            blocksize=block_samples,
+            callback=callback,
+            device=input_device,
+        ):
+            while not stop_event.is_set() and not barge_in_event.is_set():
+                try:
+                    chunk = await asyncio.wait_for(q.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    continue
+
+                if _mic_gate_is_mute(mic_gate_ref):
+                    voice_blocks = 0
+                    continue
+
+                samples = np.frombuffer(chunk, dtype=np.int16)
+                if samples.size > 0:
+                    rms = float(
+                        np.sqrt(
+                            np.mean(
+                                (samples.astype(np.float32) / 32768.0) ** 2
+                            )
+                        )
+                    )
+                else:
+                    rms = 0.0
+
+                if rms >= vad_start_threshold:
+                    voice_blocks += 1
+                    if voice_blocks >= min_voice_blocks:
+                        print(
+                            "[battle_talkover][barge_in]",
+                            f"source=playback_watch turn={turn_no} rms={rms:.5f}",
+                            flush=True,
+                        )
+                        await _apply_user_interrupt_clear(
+                            audio_player_proc=audio_player_proc,
+                            turn_state=turn_state,
+                            reason="talkover_cut_in",
+                        )
+                        barge_in_event.set()
+                        return
+                else:
+                    voice_blocks = 0
+    finally:
+        print(
+            "[battle_talkover][barge_watch_end]",
+            f"turn={turn_no}",
+            f"fired={int(barge_in_event.is_set())}",
+            flush=True,
+        )
+
+
 def _start_battle_interrupt_cli_thread(
     *,
     q: asyncio.Queue[str],
@@ -1832,6 +2015,7 @@ async def _battle_interrupt_send_loop(
     cut_in_event: asyncio.Event | None = None,
     audio_player_proc: subprocess.Popen | None = None,
     turn_state: dict[str, Any] | None = None,
+    prompt_dir: Path | None = None,
 ) -> None:
     """
     admin CLI queue から受け取った割り込み指示を、
@@ -1847,7 +2031,7 @@ async def _battle_interrupt_send_loop(
         except asyncio.TimeoutError:
             continue
 
-        prompt = _build_battle_interrupt_prompt(raw_text)
+        prompt = _build_battle_interrupt_prompt(raw_text, prompt_dir)
 
         try:
             send_t0 = time.perf_counter()
@@ -1879,6 +2063,7 @@ async def _battle_interrupt_send_loop(
             print(
                 "[battle_interrupt][sent]",
                 f"text={raw_text}",
+                f"prompt={prompt}",
                 f"send_sec={time.perf_counter() - send_t0:.3f}",
                 flush=True,
             )
@@ -6244,6 +6429,16 @@ async def _run(args: argparse.Namespace) -> int:
             inline_emo_tag_mode=bool(args.inline_emo_tag_mode),
             audio_priority_mode=bool(args.audio_priority_mode),
         )
+        _interrupt_probe, _interrupt_source = format_battle_interrupt_prompt(
+            "",
+            prompt_dir,
+        )
+        print(
+            "[battle_interrupt][prompt_dir_template]",
+            f"prompt_dir={prompt_dir}",
+            f"source={_interrupt_source}",
+            flush=True,
+        )
 
         config = _build_live_config(
             system_instruction,
@@ -7003,6 +7198,9 @@ async def _run(args: argparse.Namespace) -> int:
                 ai_audio_started_event=ai_audio_started_event,
                 mic_result_ref=mic_result_ref,
                 turn_no=int(turn_no),
+                audio_player_proc=audio_player_proc,
+                turn_state=turn_state,
+                cut_in_on_user_voice=bool(args.battle_talkover_cut_in_on_interrupt),
             )
             idle_utterance_fired = bool(mic_result_ref.get("idle_fired"))
 
@@ -7199,24 +7397,32 @@ async def _run(args: argparse.Namespace) -> int:
                             flush=True,
                         )
                     else:
-                        prompt = _build_battle_interrupt_prompt(interrupt_text_to_send)
+                        prompt = _build_battle_interrupt_prompt(
+                            interrupt_text_to_send,
+                            prompt_dir,
+                        )
                         print(
                             "[battle_interrupt][activity_path_sent]",
                             f"turn={turn_no}",
                             f"text={interrupt_text_to_send}",
+                            f"prompt={prompt}",
                             flush=True,
                         )
                         await session.send_realtime_input(text=prompt)
                 elif control_text_to_send:
+                    control_prompt, control_source = format_battle_control_prompt(
+                        control_text_to_send,
+                        prompt_dir,
+                    )
                     print(
                         "[battle_control][activity_path_sent]",
                         f"turn={turn_no}",
                         f"text={control_text_to_send}",
+                        f"source={control_source}",
+                        f"prompt={control_prompt}",
                         flush=True,
                     )
-                    await session.send_realtime_input(
-                        text=f"【管理者制御】{control_text_to_send}"
-                    )
+                    await session.send_realtime_input(text=control_prompt)
             else:
                 # debug only: legacy response_trigger 合成（通常運用では skip=True）
                 if idle_utterance_fired:
@@ -7236,12 +7442,12 @@ async def _run(args: argparse.Namespace) -> int:
                         )
                         response_trigger = (
                             f"{response_trigger}\n"
-                            f"【管理者制御】{active_control}"
+                            f"{format_battle_control_prompt(active_control, prompt_dir)[0]}"
                         )
                     if interrupt_text_to_send:
                         response_trigger = (
                             f"{response_trigger}\n"
-                            f"【管理者割り込み予約】{interrupt_text_to_send}"
+                            f"{format_battle_interrupt_reserve_prompt(interrupt_text_to_send, prompt_dir)[0]}"
                         )
                     print(
                         f"[session_loop][response_trigger] "
@@ -7260,134 +7466,190 @@ async def _run(args: argparse.Namespace) -> int:
             # first_audio 到着待ち
             wait_t0 = time.perf_counter()
             turn_audio_ok = False
-
-            while True:
-                if turn_state.get("first_audio_sec") is not None:
-                    turn_audio_ok = True
-                    print(
-                        f"[session_loop][turn_first_audio_detected] turn={turn_no}",
-                        flush=True,
-                    )
-                    if idle_utterance_fired:
-                        print(
-                            "[idle_utterance][first_audio]",
-                            f"turn={turn_no}",
-                            f"first_audio_sec={float(turn_state.get('first_audio_sec') or 0.0):.3f}",
-                            flush=True,
-                        )
-
-                    # --- [FIX] Battle Runtime: enqueue queue-file interrupts only once after first audio ---
-                    if (
-                        battle_interrupt_queue is not None
-                        and battle_interrupt_lines
-                        and not battle_interrupt_queue_enqueued_once
-                    ):
-                        battle_interrupt_queue_enqueued_once = True
-
-                        asyncio.create_task(
-                            _enqueue_battle_interrupt_lines_after_first_audio(
-                                q=battle_interrupt_queue,
-                                lines=battle_interrupt_lines,
-                                interval_s=float(args.battle_interrupt_queue_interval_s),
-                                turn=turn_no,
-                            )
-                        )
-
-                    break
-
-                wait_sec = time.perf_counter() - wait_t0
-
-                if wait_sec >= float(args.turn_first_audio_timeout_s):
-                    print(
-                        f"[session_loop][WARN] first_audio timeout turn={turn_no}",
-                        flush=True,
-                    )
-                    if idle_utterance_fired:
-                        print(
-                            "[idle_utterance][WARN]",
-                            f"turn={turn_no}",
-                            "reason=no_first_audio_after_text_fire",
-                            "note=text_only_may_be_silent_on_Live_do_not_add_activity",
-                            flush=True,
-                        )
-                    break
-
-                await asyncio.sleep(0.02)
-
-            # --- [ADD] Battle Runtime: retry first turn once if no audio chunk returned ---
-            if (
-                not turn_audio_ok
-                and turn_no == 1
-                and bool(args.first_turn_audio_retry)
-                and not bool(args.skip_response_trigger)
-                and response_trigger
-            ):
-                wait_s = float(args.first_turn_audio_retry_s)
-                if wait_s > 0:
-                    await asyncio.sleep(wait_s)
-
-                print(
-                    f"[session_loop][first_turn_audio_retry] "
-                    f"turn={turn_no} wait_s={wait_s} text={response_trigger}",
-                    flush=True,
+            barge_in_event = asyncio.Event()
+            barge_watch_stop = asyncio.Event()
+            barge_watch_task: asyncio.Task | None = None
+            if bool(args.battle_talkover_cut_in_on_interrupt):
+                barge_watch_task = asyncio.create_task(
+                    _watch_playback_barge_in(
+                        barge_in_event=barge_in_event,
+                        stop_event=barge_watch_stop,
+                        audio_player_proc=audio_player_proc,
+                        turn_state=turn_state,
+                        input_sr=int(args.input_sr),
+                        chunk_ms=int(args.step_ms),
+                        device=args.mic_input_device,
+                        mic_vad_rms_threshold=float(args.mic_vad_rms_threshold),
+                        mic_vad_min_voice_ms=int(args.mic_vad_min_voice_ms),
+                        mic_gate_ref=battle_mic_gate_ref,
+                        turn_no=int(turn_no),
+                    ),
+                    name=f"playback_barge_in_turn_{turn_no}",
                 )
 
-                turn_state["first_audio_sec"] = None
-                turn_state["last_audio_perf"] = None
-
-                await session.send_realtime_input(text=response_trigger)
-
-                retry_t0 = time.perf_counter()
-
+            try:
                 while True:
-                    if turn_state.get("first_audio_sec") is not None:
-                        turn_audio_ok = True
+                    if barge_in_event.is_set():
                         print(
-                            f"[session_loop][first_turn_audio_retry_ok] turn={turn_no}",
+                            "[session_loop][playback_barge_in]",
+                            f"turn={turn_no}",
+                            "phase=first_audio_wait",
                             flush=True,
                         )
                         break
 
-                    retry_wait_sec = time.perf_counter() - retry_t0
-
-                    if retry_wait_sec >= float(args.turn_first_audio_timeout_s):
+                    if turn_state.get("first_audio_sec") is not None:
+                        turn_audio_ok = True
                         print(
-                            f"[session_loop][WARN] first_turn_audio_retry_timeout turn={turn_no}",
+                            f"[session_loop][turn_first_audio_detected] turn={turn_no}",
                             flush=True,
                         )
+                        if idle_utterance_fired:
+                            print(
+                                "[idle_utterance][first_audio]",
+                                f"turn={turn_no}",
+                                f"first_audio_sec={float(turn_state.get('first_audio_sec') or 0.0):.3f}",
+                                flush=True,
+                            )
+
+                        # --- [FIX] Battle Runtime: enqueue queue-file interrupts only once after first audio ---
+                        if (
+                            battle_interrupt_queue is not None
+                            and battle_interrupt_lines
+                            and not battle_interrupt_queue_enqueued_once
+                        ):
+                            battle_interrupt_queue_enqueued_once = True
+
+                            asyncio.create_task(
+                                _enqueue_battle_interrupt_lines_after_first_audio(
+                                    q=battle_interrupt_queue,
+                                    lines=battle_interrupt_lines,
+                                    interval_s=float(args.battle_interrupt_queue_interval_s),
+                                    turn=turn_no,
+                                )
+                            )
+
+                        break
+
+                    wait_sec = time.perf_counter() - wait_t0
+
+                    if wait_sec >= float(args.turn_first_audio_timeout_s):
+                        print(
+                            f"[session_loop][WARN] first_audio timeout turn={turn_no}",
+                            flush=True,
+                        )
+                        if idle_utterance_fired:
+                            print(
+                                "[idle_utterance][WARN]",
+                                f"turn={turn_no}",
+                                "reason=no_first_audio_after_text_fire",
+                                "note=text_only_may_be_silent_on_Live_do_not_add_activity",
+                                flush=True,
+                            )
                         break
 
                     await asyncio.sleep(0.02)
 
-            # このturnの応答音声が止まるまで待つ
-            drain_t0 = time.perf_counter()
+                # --- [ADD] Battle Runtime: retry first turn once if no audio chunk returned ---
+                if (
+                    not barge_in_event.is_set()
+                    and not turn_audio_ok
+                    and turn_no == 1
+                    and bool(args.first_turn_audio_retry)
+                    and not bool(args.skip_response_trigger)
+                    and response_trigger
+                ):
+                    wait_s = float(args.first_turn_audio_retry_s)
+                    if wait_s > 0:
+                        await asyncio.sleep(wait_s)
 
-            while True:
-                if battle_abort_requested.is_set():
                     print(
-                        f"[battle_interrupt][abort_turn] turn={turn_no}",
+                        f"[session_loop][first_turn_audio_retry] "
+                        f"turn={turn_no} wait_s={wait_s} text={response_trigger}",
                         flush=True,
                     )
-                    break
 
-                latest_audio_perf = turn_state.get("last_audio_perf")
+                    turn_state["first_audio_sec"] = None
+                    turn_state["last_audio_perf"] = None
 
-                # まだ1回も音声が来ていない場合も、短時間は待つ
-                if latest_audio_perf is None:
-                    if time.perf_counter() - drain_t0 >= float(args.turn_idle_wait_s):
+                    await session.send_realtime_input(text=response_trigger)
+
+                    retry_t0 = time.perf_counter()
+
+                    while True:
+                        if barge_in_event.is_set():
+                            print(
+                                "[session_loop][playback_barge_in]",
+                                f"turn={turn_no}",
+                                "phase=first_audio_retry",
+                                flush=True,
+                            )
+                            break
+
+                        if turn_state.get("first_audio_sec") is not None:
+                            turn_audio_ok = True
+                            print(
+                                f"[session_loop][first_turn_audio_retry_ok] turn={turn_no}",
+                                flush=True,
+                            )
+                            break
+
+                        retry_wait_sec = time.perf_counter() - retry_t0
+
+                        if retry_wait_sec >= float(args.turn_first_audio_timeout_s):
+                            print(
+                                f"[session_loop][WARN] first_turn_audio_retry_timeout turn={turn_no}",
+                                flush=True,
+                            )
+                            break
+
+                        await asyncio.sleep(0.02)
+
+                # このturnの応答音声が止まるまで待つ
+                drain_t0 = time.perf_counter()
+
+                while True:
+                    if barge_in_event.is_set():
+                        print(
+                            "[session_loop][playback_barge_in]",
+                            f"turn={turn_no}",
+                            "phase=drain",
+                            flush=True,
+                        )
                         break
+
+                    if battle_abort_requested.is_set():
+                        print(
+                            f"[battle_interrupt][abort_turn] turn={turn_no}",
+                            flush=True,
+                        )
+                        break
+
+                    latest_audio_perf = turn_state.get("last_audio_perf")
+
+                    # まだ1回も音声が来ていない場合も、短時間は待つ
+                    if latest_audio_perf is None:
+                        if time.perf_counter() - drain_t0 >= float(args.turn_idle_wait_s):
+                            break
+                        await asyncio.sleep(0.05)
+                        continue
+
+                    idle_sec = time.perf_counter() - float(latest_audio_perf)
+                    if idle_sec >= float(args.turn_idle_wait_s):
+                        break
+
+                    # 安全上限
+                    if time.perf_counter() - drain_t0 >= 3.0:
+                        break
+
                     await asyncio.sleep(0.05)
-                    continue
-
-                idle_sec = time.perf_counter() - float(latest_audio_perf)
-                if idle_sec >= float(args.turn_idle_wait_s):
-                    break
-
-                # 安全上限
-                if time.perf_counter() - drain_t0 >= 3.0:
-                    break
-
-                await asyncio.sleep(0.05)
+            finally:
+                barge_watch_stop.set()
+                if barge_watch_task is not None:
+                    await _cancel_tasks_safely(
+                        [barge_watch_task],
+                        tag=f"playback_barge_in_turn_{turn_no}",
+                    )
 
             if idle_silent_stop is not None:
                 idle_silent_stop.set()
@@ -7720,6 +7982,7 @@ async def _run(args: argparse.Namespace) -> int:
                                         ),
                                         audio_player_proc=audio_player_proc,
                                         turn_state=turn_state,
+                                        prompt_dir=prompt_dir,
                                     )
                                 )
 
@@ -8098,9 +8361,11 @@ def main() -> int:
         "--battle_talkover_cut_in_on_interrupt",
         action="store_true",
         help=(
-            "Talkover cut-in: on battle interrupt, stop mic early, send activity_end, "
-            "then interrupt-exception clear_queue + cancel in-flight chunk tasks "
-            "(not audio_stream_end). Normal turns still never clear before tail drain."
+            "Talkover cut-in: on battle interrupt file/CLI, stop mic early, send "
+            "activity_end, then interrupt-exception clear_queue + cancel in-flight "
+            "chunk tasks (not audio_stream_end). Also cut player on user voice while "
+            "AI audio is playing (opponent barge-in). Leadership mic_gate=mute does "
+            "not cut. Normal turns still never clear before tail drain."
         ),
     )
     ap.add_argument(

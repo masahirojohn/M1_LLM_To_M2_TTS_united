@@ -1,0 +1,2 @@
+[System: Action: Interrupt now. Do not wait for the opponent to finish. Cut in immediately and take the floor.]
+Instruction: {text}

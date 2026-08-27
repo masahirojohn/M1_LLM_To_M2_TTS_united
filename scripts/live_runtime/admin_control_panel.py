@@ -9,14 +9,10 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     DEFAULT_CONTROL_FILE,
     DEFAULT_INTERRUPT_FILE,
     DEFAULT_EVENT_FILE,
+    DEFAULT_ROOT,
     DEFAULT_VAD_PROFILE_FILE,
     DEFAULT_OBS_CONFIG_FILE,
     DEFAULT_OBS_LOCAL_CONFIG_FILE,
-    DEFAULT_LEADERSHIP_CONTROL_TEXT,
-    DEFAULT_LEADERSHIP_INTERRUPT_TEXT,
-    DEFAULT_LEADERSHIP_OPEN_TEXT,
-    DEFAULT_NORMAL_CONVERSATION_TEXT,
-    DEFAULT_ZOOM_LEADERSHIP_CONTROL_TEXT,
     clear_control,
     read_obs_admin_state,
     read_status,
@@ -34,6 +30,13 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     write_atefuri_zoom,
     write_smith_effect,
     write_vad_profile,
+)
+from scripts.live_runtime.prompt_dir_runtime_texts import (
+    resolve_leadership_control_text,
+    resolve_leadership_interrupt_text,
+    resolve_leadership_open_text,
+    resolve_normal_conversation_text,
+    resolve_zoom_leadership_control_text,
 )
 
 
@@ -92,12 +95,18 @@ def main() -> None:
             value=str(DEFAULT_OBS_CONFIG_FILE),
         )
 
+        prompt_dir_str = st.text_input(
+            "prompt_dir",
+            value=str(DEFAULT_ROOT / "configs" / "prompts"),
+        )
+
         control_file = Path(control_file_str)
         interrupt_file = Path(interrupt_file_str)
         event_file = Path(event_file_str)
         vad_profile_file = Path(vad_profile_file_str)
         obs_config_file = Path(obs_config_file_str)
         obs_local_config_file = DEFAULT_OBS_LOCAL_CONFIG_FILE
+        prompt_dir = Path(prompt_dir_str)
 
         st.divider()
 
@@ -108,13 +117,15 @@ def main() -> None:
         st.code(f"vad_profile: {vad_profile_file}")
         st.code(f"obs_config:  {obs_config_file}")
         st.code(f"obs_local:   {obs_local_config_file}")
+        st.code(f"prompt_dir:  {prompt_dir}")
 
     st.header("基本操作")
 
-    quick_interrupt_text = DEFAULT_LEADERSHIP_INTERRUPT_TEXT
-    leadership_control_text = DEFAULT_LEADERSHIP_CONTROL_TEXT
-    leadership_open_text = DEFAULT_LEADERSHIP_OPEN_TEXT
-    zoom_leadership_control_text = DEFAULT_ZOOM_LEADERSHIP_CONTROL_TEXT
+    quick_interrupt_text = resolve_leadership_interrupt_text(prompt_dir)
+    leadership_control_text = resolve_leadership_control_text(prompt_dir)
+    leadership_open_text = resolve_leadership_open_text(prompt_dir)
+    zoom_leadership_control_text = resolve_zoom_leadership_control_text(prompt_dir)
+    normal_conversation_text = resolve_normal_conversation_text(prompt_dir)
 
     b1, b2, b3, b4, b5 = st.columns(5)
 
@@ -125,8 +136,9 @@ def main() -> None:
                 text=quick_interrupt_text,
                 priority="battle",
                 expire_sec=60.0,
+                prompt_dir=prompt_dir,
             )
-            _append_ui_log("interrupt text=今すぐ割り込め")
+            _append_ui_log(f"interrupt text={quick_interrupt_text}")
             st.success("割り込みを投入しました。")
 
     with b2:
@@ -138,6 +150,7 @@ def main() -> None:
                 interrupt_text=quick_interrupt_text,
                 priority="battle",
                 expire_sec=60.0,
+                prompt_dir=prompt_dir,
             )
             _append_ui_log("leadership start")
             st.success("主導権奪取を投入しました。")
@@ -147,6 +160,7 @@ def main() -> None:
             write_zoom_leadership_start(
                 control_file=control_file,
                 control_text=zoom_leadership_control_text,
+                prompt_dir=prompt_dir,
             )
             _append_ui_log("zoom leadership control only")
             st.success("Zoom主導権 control を投入しました。")
@@ -156,6 +170,7 @@ def main() -> None:
             write_leadership_open(
                 control_file=control_file,
                 text=leadership_open_text,
+                prompt_dir=prompt_dir,
             )
             _append_ui_log("leadership open")
             st.success("主導権解除 / OPEN を投入しました。")
@@ -164,7 +179,8 @@ def main() -> None:
         if st.button("通常会話へ戻す", use_container_width=True):
             write_normal_conversation(
                 control_file=control_file,
-                text=DEFAULT_NORMAL_CONVERSATION_TEXT,
+                text=normal_conversation_text,
+                prompt_dir=prompt_dir,
             )
             _append_ui_log("normal conversation open")
             st.success("通常会話復帰を投入しました。")
