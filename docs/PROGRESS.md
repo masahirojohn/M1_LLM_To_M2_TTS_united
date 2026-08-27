@@ -1421,11 +1421,12 @@
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
+| E1b | イベント完了まで Live PCM drop ゲート | `in_progress` | 2026-08-27 着手（設計ロック済） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** E1 Pass-with-defer。希望順④は指名待ち（子は出さない）
+- **今の本線 = E1b（イベント完了まで Live PCM drop）。** ブランチは `feature/event-catalog-admin` のまま。main 未マージ。④は出さない
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視。`main` FF 済（`f117d51` / `phase-p1-pass`）
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
@@ -1443,7 +1444,7 @@
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**（2026-08-27）。完了ゲートは E1b 予約。ブランチ `feature/event-catalog-admin` |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**（2026-08-27）。**E1b in_progress**（完了ゲート。設計ロック済。同一ブランチ） |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
@@ -1484,7 +1485,6 @@
 - Slack トリガ本番化
 - B全面再オープン／リップ品質本線化
 - 再生中 mic の新 barge-in 経路／二重 InputStream 本線化／主導権を Zoom で使う
-- イベント完了まで AI を待つゲート（E1b。親設計ロック前は出さない。session_loop sleep／ジッタ延長／M0停止ゲート禁止）
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -2301,7 +2301,52 @@
 **親判定（2026-08-27）:**
 - **Pass-with-defer。** 完了ゲートは E1b（親設計ロック後の新子）。session_loop sleep／ジッタ延長／M0停止ゲートは出さない
 - Keep All（commit / tag `phase-e1-pass`）は **親が実施**。子はしない。`in/*.txt` は入れない
-- 出さない: ④、E1b 今すぐ、B 再開、ジッタ延長。次本線=なし（指名待ち）
+- 出さない: ④、B 再開、ジッタ延長。次=**E1b**（2026-08-27 着手。同一ブランチ）
+
+---
+
+## Phase E1b: イベント完了まで Live PCM drop ゲート
+
+**目的:** イベント動画のあいだ Live の声と口を出さない。完了後に通常ターンへ戻す。
+
+**作業ブランチ:** `feature/event-catalog-admin` のまま。main へ FF しない。新ブランチを切らない。E1 子は使わない（新規子）。
+
+**設計ロック（覆すな。これ以外は Fail）:**
+
+完了の定義 = 既存 event_runtime の duration 後。ログは `[event_runtime][mic_gate_open]` と `[virtualcam_persistent][bg_restore]`。B7 seek ではない。
+
+既存 Keep: event file thread の duration 待ち（`_open_later` の sleep）。これは session_loop sleep ではない。足すな・移すな。
+
+ゲート:
+- 対象 = Live API から来た AI PCM の player enqueue と、それに乗る口（M0 FG）
+- 非対象 = イベント wav（`evt_voice_001` の play_wav）。既存 `mic_gate=mute`（相手 mic）。既存 `clear_queue reason=event_runtime`
+- 位置 = enqueue（dispatcher または `_enqueue_playback_audio_sync`）。override 中の Live PCM は **捨てる（drop）**
+- restore 後に溜め込みをバースト再生するな（Hold-flush 禁止。等速 enqueue が崩れる）
+- `_receive_loop` は止めない。後続チャンクの受信・並列開始は維持。チャンク内は KNN→M0→enqueue のまま（載せたチャンクだけ）
+- 初手は `activity_end` / Live 切断を足すな。mic_gate + clear_queue + Live PCM drop で足りるか見る
+
+**スコープ:**
+1. 計測1本: 発話中に `evt_001`。override 区間で Live first_audio / player enqueue が 0。restore 後に通常ターン（図A）
+2. 回帰1本: `evt_voice_001` は頭から＋イベント音が鳴る（drop で潰すな）
+3. 短確認: イベント後に次のユーザー発話→ AI 返答＋口。バースト無し
+
+**スコープ外（E1b 禁止）:**
+- session_loop への sleep / ポーリング待ち
+- ジッタ延長、初期バッファ増、rebuffer 目標の変更
+- `player_buffering` 連動の M0 供給停止ゲート（M0 worker を止めるな。override 中の Live chunk を載せない／enqueue しないだけ）
+- 音声先行 enqueue、frame drop、口形捨て
+- B 再開、pose 先送り、IDLE_BG_ADVANCE 廃止、audio_ms 全体オフセット
+- ④ docs、ops_zoom 再発行、二重 Live、session_loop Zoom ミックス、主導権 Zoom
+- P1/V1 改変、catalog 捏造、決め打ちボタン復活、sequential_from_0 / frame0 seek の巻き戻し
+- `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
+
+**Pass 基準:**
+- [ ] override 中 Live enqueue 0（ログ）。restore 後は図Aの通常ターン
+- [ ] `evt_voice_001` のイベント音が残る
+- [ ] イベント後の次発話で AI＋口。バースト無し
+- [ ] Keep 非破壊。親向けサマリーのみ
+
+**親判定:** （子サマリー待ち）
 
 ---
 
@@ -3427,3 +3472,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-27 | `main` へ `feature/en-prod-prompts` を FF-only（`f117d51` / `phase-p1-pass`）。希望順③着手。Phase E1。ブランチ `feature/event-catalog-admin`。④は出さない |
 | 2026-08-27 | E1 途中。dropdown Keep 候補。まだ Pass/Keep All しない。次=E1hf（evt_001 末尾飛び・open直後 frame0 seek）。完了ゲートは E1b 予約 |
 | 2026-08-27 | Phase E1 Pass-with-defer。evt_001 頭から順再生（232324）。完了ゲートは E1b。Keep All は親。④は出さない |
+| 2026-08-27 | E1b 着手。設計ロック=override 中 Live PCM drop（enqueue）。session_loop sleep／ジッタ／M0停止ゲート禁止。ブランチは `feature/event-catalog-admin` のまま。④は出さない |
