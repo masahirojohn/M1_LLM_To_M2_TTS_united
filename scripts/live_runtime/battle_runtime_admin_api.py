@@ -51,7 +51,10 @@ DEFAULT_ROOT = Path(r"C:\dev\M1_LLM_To_M2_TTS_united")
 DEFAULT_CONTROL_FILE = DEFAULT_ROOT / "in" / "battle_control_live.txt"
 DEFAULT_INTERRUPT_FILE = DEFAULT_ROOT / "in" / "battle_interrupt_live.txt"
 DEFAULT_EVENT_FILE = DEFAULT_ROOT / "in" / "event_runtime_live.txt"
+DEFAULT_EVENT_CATALOG_FILE = DEFAULT_ROOT / "in" / "event_catalog.json"
 DEFAULT_VAD_PROFILE_FILE = DEFAULT_ROOT / "in" / "vad_profile_live.txt"
+
+EVENT_CATALOG_MAX = 10
 
 VAD_PROFILE_ALLOWED_SILENCE_MS = frozenset({250, 350})
 
@@ -99,6 +102,43 @@ def write_interrupt(
     write_json(interrupt_file, payload)
 
     return payload
+
+
+def load_event_catalog(
+    *,
+    catalog_file: Path | str = DEFAULT_EVENT_CATALOG_FILE,
+    max_items: int = EVENT_CATALOG_MAX,
+) -> list[dict[str, Any]]:
+    """Read event_catalog.json for admin dropdown. Cap at max_items. No padding."""
+    path = Path(catalog_file)
+    if not path.exists():
+        return []
+
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    if not isinstance(obj, dict):
+        return []
+
+    cap = max(0, int(max_items))
+    out: list[dict[str, Any]] = []
+    for raw_id, item in obj.items():
+        event_id = str(raw_id or "").strip()
+        if not event_id or not isinstance(item, dict):
+            continue
+        out.append(
+            {
+                "id": event_id,
+                "event_mode": str(item.get("event_mode") or ""),
+                "bg_video": str(item.get("bg_video") or ""),
+                "audio": bool(item.get("audio", False)),
+            }
+        )
+        if len(out) >= cap:
+            break
+    return out
 
 
 def write_event(

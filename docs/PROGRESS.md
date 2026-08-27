@@ -1420,12 +1420,13 @@
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
-| E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `in_progress` | 2026-08-27 着手（希望順③） |
+| E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = E1（event catalog＋admin プルダウン）。** 希望順③。④は出さない
+- **今の本線 = なし。** E1 Pass-with-defer。希望順④は指名待ち（子は出さない）
+- E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視。`main` FF 済（`f117d51` / `phase-p1-pass`）
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
@@ -1442,7 +1443,7 @@
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **in_progress = E1**。ブランチ `feature/event-catalog-admin`（from `main` `f117d51`） |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**（2026-08-27）。完了ゲートは E1b 予約。ブランチ `feature/event-catalog-admin` |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
@@ -1483,6 +1484,7 @@
 - Slack トリガ本番化
 - B全面再オープン／リップ品質本線化
 - 再生中 mic の新 barge-in 経路／二重 InputStream 本線化／主導権を Zoom で使う
+- イベント完了まで AI を待つゲート（E1b。親設計ロック前は出さない。session_loop sleep／ジッタ延長／M0停止ゲート禁止）
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -2283,11 +2285,23 @@
 - P1 子の再利用。`docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
 
 **Pass 基準:**
-- [ ] プルダウン＝catalog、最大10、既存2件生存、1件投入がファイルに出る
-- [ ] Keep 非破壊（P1 / V1 / 方式2 / 図A / N=2 / jitter / B7 / O1 音声ルーティング）
-- [ ] 親向けサマリーのみ
+- [x] プルダウン＝catalog、最大10、既存2件生存、1件投入がファイルに出る
+- [x] `evt_001` が頭から順再生（末尾飛びクローズ）— `232324` first_frame idx=0 total=73
+- [x] Keep 非破壊（P1 / V1 / 方式2 / 図A / N=2 / jitter / B7 PLAYING / O1 音声ルーティング）
+- [x] 親向けサマリーのみ。完了ゲートは defer（E1b）
 
-**親判定:** （子サマリー待ち）
+**子報告要約（2026-08-27）:**
+- catalog 2件（捏造なし）。決め打ち2ボタン廃止。投入は既存 `write_event`
+- 管理画面は M1 `in/event_catalog.json` のみ読む。M3.5 `in/` スキャンしない
+- compact: expander。主導権／VAD／OBS／当てフリ／スミスは残置
+- イベント中 sequential_from_0。復帰時は古い pose lock を捨てる（`220810` 顔ずれ → `222518`/`222628` 主観OK）
+- E1hf: `232324` `evt_001` 発話中投入で頭から最後まで。first_frame idx=0 total=73。override 中 B7 なし。復帰 0→102（古い pose 63 ではない）。`pos_after_count=0` で FRAME_COUNT→末尾仮説は否定
+- ②未実施: turn2 first_audio は restore 前。完了ゲートなし
+
+**親判定（2026-08-27）:**
+- **Pass-with-defer。** 完了ゲートは E1b（親設計ロック後の新子）。session_loop sleep／ジッタ延長／M0停止ゲートは出さない
+- Keep All（commit / tag `phase-e1-pass`）は **親が実施**。子はしない。`in/*.txt` は入れない
+- 出さない: ④、E1b 今すぐ、B 再開、ジッタ延長。次本線=なし（指名待ち）
 
 ---
 
@@ -3411,3 +3425,5 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-26 | `main` へ `feature/live-voice-kore` を FF-only（`b4f7d5c` / `phase-v1-pass`）。希望順②着手。Phase P1。ブランチ `feature/en-prod-prompts`。③④は出さない |
 | 2026-08-27 | Phase P1 Pass-with-note。prompts_en / prompts_en_battle 切替。口 barge-in＝既存 talkover。140322 Fail→175716 Pass。Keep All は親。③④は出さない |
 | 2026-08-27 | `main` へ `feature/en-prod-prompts` を FF-only（`f117d51` / `phase-p1-pass`）。希望順③着手。Phase E1。ブランチ `feature/event-catalog-admin`。④は出さない |
+| 2026-08-27 | E1 途中。dropdown Keep 候補。まだ Pass/Keep All しない。次=E1hf（evt_001 末尾飛び・open直後 frame0 seek）。完了ゲートは E1b 予約 |
+| 2026-08-27 | Phase E1 Pass-with-defer。evt_001 頭から順再生（232324）。完了ゲートは E1b。Keep All は親。④は出さない |

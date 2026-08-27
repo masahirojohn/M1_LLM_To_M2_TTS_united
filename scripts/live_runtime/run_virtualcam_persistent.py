@@ -855,6 +855,7 @@ def main() -> int:
     override_until_t = 0.0
     override_active = False
     override_last_mtime = 0.0
+    override_first_frame_logged = False
 
     width = int(args.width)
     height = int(args.height)
@@ -939,6 +940,11 @@ def main() -> int:
                 b3_lock_audio_ms = None
                 b3_lock_bg_frame = None
                 b3_lock_frame_offset = None
+                b3_last_drive_state = None
+                b3_last_good_playback_state = None
+                b3_last_playing_audio_ms = None
+                b3_last_playing_frame_offset = None
+                last_fg_pose_idx = None
                 override_active = False
 
                 print(
@@ -974,10 +980,21 @@ def main() -> int:
                     cap = next_cap
                     bg_video = next_bg
                     bg_total = _bg_frame_count(cap)
+                    try:
+                        pos_after_count = int(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0)
+                    except Exception:
+                        pos_after_count = -1
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
                     bg_pos = -1
+                    override_first_frame_logged = False
                     b3_lock_audio_ms = None
                     b3_lock_bg_frame = None
                     b3_lock_frame_offset = None
+                    b3_last_drive_state = None
+                    b3_last_good_playback_state = None
+                    b3_last_playing_audio_ms = None
+                    b3_last_playing_frame_offset = None
+                    last_fg_pose_idx = None
                     override_active = duration_s > 0
                     override_until_t = time.monotonic() + max(0.0, duration_s)
 
@@ -985,6 +1002,10 @@ def main() -> int:
                         "[virtualcam_persistent][bg_override]",
                         f"bg_video={bg_video}",
                         f"duration_s={duration_s:.3f}",
+                        "play=sequential_from_0",
+                        f"total={int(bg_total)}",
+                        f"pos_after_count={int(pos_after_count)}",
+                        "seek0=1",
                         flush=True,
                     )
 
@@ -996,6 +1017,40 @@ def main() -> int:
                         f"[virtualcam_persistent][bg_override_error] {type(e).__name__}: {e}",
                         flush=True,
                     )
+
+            # Event overlay: decode from frame 0 at cam fps. Never B3/B7-seek
+            # using the live player clock (that snaps to last keyframe).
+            if override_active:
+                ok, bg, bg_pos = _read_bg_sequential(cap, loop_bg=False)
+                if ok and not override_first_frame_logged:
+                    print(
+                        "[virtualcam_persistent][bg_override_first_frame]",
+                        f"idx={int(bg_pos)}",
+                        f"total={int(bg_total)}",
+                        flush=True,
+                    )
+                    override_first_frame_logged = True
+                if not ok:
+                    if last_rgb is not None:
+                        cam.send(last_rgb)
+                        cam.sleep_until_next_frame()
+                        sent += 1
+                        continue
+                    print(
+                        "[virtualcam_persistent][bg_override_frame_warn] failed to read bg frame",
+                        flush=True,
+                    )
+                    time.sleep(float(args.poll_s))
+                    continue
+                bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
+                comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
+                cam.send(comp_rgb)
+                cam.sleep_until_next_frame()
+                last_rgb = comp_rgb
+                sent += 1
+                if sent % 25 == 0:
+                    print(f"[virtualcam_persistent] sent={sent}", flush=True)
+                continue
 
             # Phase B3/B3hf/B3hf2: one playback_state + sync_meta snapshot per tick.
             # Adopt meta (META_DEFER rules) BEFORE resolve; BG+FG share one target.
@@ -1225,13 +1280,6 @@ def main() -> int:
                 b3_bg_mode = "seq"
 
             if not ok:
-                if override_active:
-                    print(
-                        "[virtualcam_persistent][bg_override_frame_warn] failed to read bg frame",
-                        flush=True,
-                    )
-                    time.sleep(float(args.poll_s))
-                    continue
                 raise RuntimeError("failed to read bg frame")
             bg_read_n += 1
             bg_cursor_audio_ms = (
@@ -1259,19 +1307,6 @@ def main() -> int:
             )
 
             bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
-
-            if override_active:
-                comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
-                cam.send(comp_rgb)
-                cam.sleep_until_next_frame()
-
-                last_rgb = comp_rgb
-                sent += 1
-
-                if sent % 25 == 0:
-                    print(f"[virtualcam_persistent] sent={sent}", flush=True)
-
-                continue
 
             fg_path: Path | None = None
             target = None

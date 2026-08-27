@@ -9,11 +9,14 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     DEFAULT_CONTROL_FILE,
     DEFAULT_INTERRUPT_FILE,
     DEFAULT_EVENT_FILE,
+    DEFAULT_EVENT_CATALOG_FILE,
     DEFAULT_ROOT,
     DEFAULT_VAD_PROFILE_FILE,
     DEFAULT_OBS_CONFIG_FILE,
     DEFAULT_OBS_LOCAL_CONFIG_FILE,
+    EVENT_CATALOG_MAX,
     clear_control,
+    load_event_catalog,
     read_obs_admin_state,
     read_status,
     write_control,
@@ -85,6 +88,11 @@ def main() -> None:
             value=str(DEFAULT_EVENT_FILE),
         )
 
+        event_catalog_file_str = st.text_input(
+            "event_catalog.json",
+            value=str(DEFAULT_EVENT_CATALOG_FILE),
+        )
+
         vad_profile_file_str = st.text_input(
             "vad_profile_live.txt",
             value=str(DEFAULT_VAD_PROFILE_FILE),
@@ -103,6 +111,7 @@ def main() -> None:
         control_file = Path(control_file_str)
         interrupt_file = Path(interrupt_file_str)
         event_file = Path(event_file_str)
+        event_catalog_file = Path(event_catalog_file_str)
         vad_profile_file = Path(vad_profile_file_str)
         obs_config_file = Path(obs_config_file_str)
         obs_local_config_file = DEFAULT_OBS_LOCAL_CONFIG_FILE
@@ -110,14 +119,15 @@ def main() -> None:
 
         st.divider()
 
-        st.write("Current paths")
-        st.code(f"control:     {control_file}")
-        st.code(f"interrupt:   {interrupt_file}")
-        st.code(f"event:       {event_file}")
-        st.code(f"vad_profile: {vad_profile_file}")
-        st.code(f"obs_config:  {obs_config_file}")
-        st.code(f"obs_local:   {obs_local_config_file}")
-        st.code(f"prompt_dir:  {prompt_dir}")
+        with st.expander("Current paths", expanded=False):
+            st.code(f"control:     {control_file}")
+            st.code(f"interrupt:   {interrupt_file}")
+            st.code(f"event:       {event_file}")
+            st.code(f"catalog:     {event_catalog_file}")
+            st.code(f"vad_profile: {vad_profile_file}")
+            st.code(f"obs_config:  {obs_config_file}")
+            st.code(f"obs_local:   {obs_local_config_file}")
+            st.code(f"prompt_dir:  {prompt_dir}")
 
     st.header("基本操作")
 
@@ -187,41 +197,52 @@ def main() -> None:
 
     st.divider()
 
-    st.header("マイクゲート")
+    with st.expander("マイクゲート", expanded=False):
+        g1, g2 = st.columns(2)
 
-    g1, g2 = st.columns(2)
+        with g1:
+            if st.button("MUTE 相手音声停止", type="primary", use_container_width=True):
+                write_mic_gate(
+                    control_file=control_file,
+                    mic_gate="mute",
+                )
+                _append_ui_log("mic_gate=mute")
+                st.success("mic_gate=mute を投入しました。")
 
-    with g1:
-        if st.button("MUTE 相手音声停止", type="primary", use_container_width=True):
-            write_mic_gate(
-                control_file=control_file,
-                mic_gate="mute",
-            )
-            _append_ui_log("mic_gate=mute")
-            st.success("mic_gate=mute を投入しました。")
-
-    with g2:
-        if st.button("OPEN 相手音声再開", use_container_width=True):
-            write_mic_gate(
-                control_file=control_file,
-                mic_gate="open",
-            )
-            _append_ui_log("mic_gate=open")
-            st.success("mic_gate=open を投入しました。")
+        with g2:
+            if st.button("OPEN 相手音声再開", use_container_width=True):
+                write_mic_gate(
+                    control_file=control_file,
+                    mic_gate="open",
+                )
+                _append_ui_log("mic_gate=open")
+                st.success("mic_gate=open を投入しました。")
 
     st.divider()
 
     st.header("イベント動画")
 
-    event_id = st.text_input(
-        "event_id",
-        value="evt_001",
-        help="event_catalog.json に登録済みの event_id を指定してください。",
+    st.caption(
+        "catalog から選んで event_runtime_live.txt へ投入。"
+        "VirtualCam 挿入。OBS 背景/BGM とは別。最大10件。"
+        " M3.5 の in/ に mp4 を置くだけでは出ない。"
+        " M1 の in/event_catalog.json に event_id を足して再読込。"
     )
 
-    e1, e2, e3 = st.columns(3)
-
-    with e1:
+    catalog_items = load_event_catalog(catalog_file=event_catalog_file)
+    n_cat = len(catalog_items)
+    st.write(f"catalog {n_cat}/{EVENT_CATALOG_MAX}")
+    if st.button("catalog 再読込", use_container_width=True):
+        st.rerun()
+    if not catalog_items:
+        st.caption("catalog 空（in/event_catalog.json を確認）")
+    else:
+        event_ids = [x["id"] for x in catalog_items]
+        event_id = st.selectbox(
+            "event_id（catalog）",
+            options=event_ids,
+            key="event_catalog_select",
+        )
         if st.button("イベント投入", type="primary", use_container_width=True):
             write_event(
                 event_file=event_file,
@@ -230,378 +251,376 @@ def main() -> None:
             _append_ui_log(f"event event_id={event_id}")
             st.success(f"イベントを投入しました: {event_id}")
 
-    with e2:
-        if st.button("evt_001 即投入", use_container_width=True):
-            write_event(
-                event_file=event_file,
-                event_id="evt_001",
-            )
-            _append_ui_log("event event_id=evt_001")
-            st.success("evt_001 を投入しました。")
-
-    with e3:
-        if st.button("evt_voice_001 即投入", use_container_width=True):
-            write_event(
-                event_file=event_file,
-                event_id="evt_voice_001",
-            )
-            _append_ui_log("event event_id=evt_voice_001")
-            st.success("evt_voice_001 を投入しました。")
+    with st.expander("catalog に動画を足す", expanded=False):
+        st.markdown(
+            "1. mp4（必要なら pose json）を `C:\\dev\\M3.5_final\\in\\` に置く  \n"
+            "2. **このリポ** `in/event_catalog.json` に event_id を追加（最大10。"
+            " 空枠は作らない）  \n"
+            "3. `bg_video` は `in/ファイル名.mp4`（M3.5 側の相対パス）  \n"
+            "4. 上の **catalog 再読込**（または管理画面を再実行）  \n"
+            "例:\n"
+            "```json\n"
+            '"evt_002": {\n'
+            '  "event_mode": "bg_only",\n'
+            '  "bg_video": "in/evt_002.mp4",\n'
+            '  "pose_json": "in/pose_timeline_evt_002.json",\n'
+            '  "duration_s": 3.0,\n'
+            '  "audio": false\n'
+            "}\n"
+            "```"
+        )
 
     st.divider()
 
-    st.header("VAD プロファイル（silence_ms）")
+    with st.expander("VAD プロファイル（silence_ms）", expanded=False):
+        st.caption(
+            "再起動なしで mic_vad_silence_ms を切替。"
+            "通常=350 / 攻め腕=250。許可値以外は API 側で拒否。"
+        )
 
-    st.caption(
-        "再起動なしで mic_vad_silence_ms を切替。"
-        "通常=350 / 攻め腕=250。許可値以外は API 側で拒否。"
-    )
+        v1, v2 = st.columns(2)
 
-    v1, v2 = st.columns(2)
+        with v1:
+            if st.button("通常 350", type="primary", use_container_width=True):
+                write_vad_profile(
+                    vad_profile_file=vad_profile_file,
+                    silence_ms=350,
+                )
+                _append_ui_log("vad_profile silence_ms=350")
+                st.success("通常プロファイル (350) を書き込みました。")
 
-    with v1:
-        if st.button("通常 350", type="primary", use_container_width=True):
-            write_vad_profile(
-                vad_profile_file=vad_profile_file,
-                silence_ms=350,
-            )
-            _append_ui_log("vad_profile silence_ms=350")
-            st.success("通常プロファイル (350) を書き込みました。")
-
-    with v2:
-        if st.button("攻め腕 250", use_container_width=True):
-            write_vad_profile(
-                vad_profile_file=vad_profile_file,
-                silence_ms=250,
-            )
-            _append_ui_log("vad_profile silence_ms=250")
-            st.success("攻め腕プロファイル (250) を書き込みました。")
+        with v2:
+            if st.button("攻め腕 250", use_container_width=True):
+                write_vad_profile(
+                    vad_profile_file=vad_profile_file,
+                    silence_ms=250,
+                )
+                _append_ui_log("vad_profile silence_ms=250")
+                st.success("攻め腕プロファイル (250) を書き込みました。")
 
     st.divider()
 
-    st.header("OBS 背景静止画 / BGM")
+    with st.expander("OBS 背景静止画 / BGM / 当てフリ / スミス", expanded=False):
 
-    st.caption(
-        "OBS WebSocket で背景静止画ソースと BGM メディアソースを切替。"
-        "VirtualCam 内 BGV・AI PCM は対象外。"
-        "接続失敗でも Live パイプラインは継続。"
-        "当てフリは発話開始トリガ（この画面は ON/OFF と手動テスト）。"
-    )
-
-    obs_state = read_obs_admin_state(
-        obs_config_file=obs_config_file,
-        obs_local_config_file=obs_local_config_file,
-    )
-    probe = obs_state.get("probe") or {}
-    ws_meta = obs_state.get("websocket") or {}
-    sources = obs_state.get("sources") or {}
-
-    if obs_state.get("config_error"):
-        st.error(f"OBS config error: {obs_state['config_error']}")
-
-    if probe.get("ok"):
-        st.success(
-            f"OBS connected: {probe.get('host')}:{probe.get('port')} "
-            f"(obs {probe.get('obs_version')})"
-        )
-    else:
-        st.warning(
-            "OBS 未接続（Live は継続可）。"
-            f" reason={probe.get('error') or 'unknown'}"
+        st.caption(
+            "OBS WebSocket で背景静止画ソースと BGM メディアソースを切替。"
+            "VirtualCam 内 BGV・AI PCM は対象外。"
+            "接続失敗でも Live パイプラインは継続。"
+            "当てフリは発話開始トリガ（この画面は ON/OFF と手動テスト）。"
         )
 
-    st.code(
-        "host={host} port={port} password_set={pw}\n"
-        "background_source={bg}\n"
-        "bgm_source={bgm}\n"
-        "atefuri_normal={an}\n"
-        "atefuri_zoom={az}\n"
-        "smith_clones={sc}\n"
-        "smith_audio={sa} filter={sf}".format(
-            host=ws_meta.get("host"),
-            port=ws_meta.get("port"),
-            pw=ws_meta.get("password_set"),
-            bg=sources.get("background_image"),
-            bgm=sources.get("bgm_media"),
-            an=sources.get("atefuri_normal"),
-            az=sources.get("atefuri_zoom"),
-            sc=", ".join((obs_state.get("smith") or {}).get("clone_sources") or [])
-            or "(none)",
-            sa=(obs_state.get("smith") or {}).get("audio_source") or "",
-            sf=(obs_state.get("smith") or {}).get("filter_name") or "",
+        obs_state = read_obs_admin_state(
+            obs_config_file=obs_config_file,
+            obs_local_config_file=obs_local_config_file,
         )
-    )
+        probe = obs_state.get("probe") or {}
+        ws_meta = obs_state.get("websocket") or {}
+        sources = obs_state.get("sources") or {}
 
-    backgrounds = obs_state.get("backgrounds") or []
-    bgm_items = obs_state.get("bgm") or []
+        if obs_state.get("config_error"):
+            st.error(f"OBS config error: {obs_state['config_error']}")
 
-    o1, o2 = st.columns(2)
-
-    with o1:
-        st.subheader("背景静止画")
-        if not backgrounds:
-            st.caption("catalog 空（in/obs_control_config.json を確認）")
+        if probe.get("ok"):
+            st.success(
+                f"OBS connected: {probe.get('host')}:{probe.get('port')} "
+                f"(obs {probe.get('obs_version')})"
+            )
         else:
-            bg_labels = {
-                f"{x['label']} ({x['id']})": x["id"] for x in backgrounds
-            }
-            bg_choice = st.selectbox(
-                "背景を選択",
-                options=list(bg_labels.keys()),
-                key="obs_bg_select",
+            st.warning(
+                "OBS 未接続（Live は継続可）。"
+                f" reason={probe.get('error') or 'unknown'}"
             )
-            if st.button("背景を切替", type="primary", use_container_width=True):
-                result = write_obs_background(
-                    item_id=bg_labels[bg_choice],
+
+        st.code(
+            "host={host} port={port} password_set={pw}\n"
+            "background_source={bg}\n"
+            "bgm_source={bgm}\n"
+            "atefuri_normal={an}\n"
+            "atefuri_zoom={az}\n"
+            "smith_clones={sc}\n"
+            "smith_audio={sa} filter={sf}".format(
+                host=ws_meta.get("host"),
+                port=ws_meta.get("port"),
+                pw=ws_meta.get("password_set"),
+                bg=sources.get("background_image"),
+                bgm=sources.get("bgm_media"),
+                an=sources.get("atefuri_normal"),
+                az=sources.get("atefuri_zoom"),
+                sc=", ".join((obs_state.get("smith") or {}).get("clone_sources") or [])
+                or "(none)",
+                sa=(obs_state.get("smith") or {}).get("audio_source") or "",
+                sf=(obs_state.get("smith") or {}).get("filter_name") or "",
+            )
+        )
+
+        backgrounds = obs_state.get("backgrounds") or []
+        bgm_items = obs_state.get("bgm") or []
+
+        o1, o2 = st.columns(2)
+
+        with o1:
+            st.subheader("背景静止画")
+            if not backgrounds:
+                st.caption("catalog 空（in/obs_control_config.json を確認）")
+            else:
+                bg_labels = {
+                    f"{x['label']} ({x['id']})": x["id"] for x in backgrounds
+                }
+                bg_choice = st.selectbox(
+                    "背景を選択",
+                    options=list(bg_labels.keys()),
+                    key="obs_bg_select",
+                )
+                if st.button("背景を切替", type="primary", use_container_width=True):
+                    result = write_obs_background(
+                        item_id=bg_labels[bg_choice],
+                        obs_config_file=obs_config_file,
+                        obs_local_config_file=obs_local_config_file,
+                    )
+                    if result.get("ok"):
+                        _append_ui_log(
+                            f"obs_background id={result.get('id')} "
+                            f"source={result.get('source')}"
+                        )
+                        st.success(
+                            f"背景切替 OK: {result.get('id')} → {result.get('path')}"
+                        )
+                    else:
+                        _append_ui_log(
+                            f"obs_background FAIL id={result.get('id')} "
+                            f"err={result.get('error')}"
+                        )
+                        st.error(f"背景切替失敗: {result.get('error')}")
+
+        with o2:
+            st.subheader("BGM")
+            if not bgm_items:
+                st.caption("catalog 空（in/obs_control_config.json を確認）")
+            else:
+                bgm_labels = {
+                    f"{x['label']} ({x['id']})": x["id"] for x in bgm_items
+                }
+                bgm_choice = st.selectbox(
+                    "BGM を選択",
+                    options=list(bgm_labels.keys()),
+                    key="obs_bgm_select",
+                )
+                if st.button("BGM を切替", type="primary", use_container_width=True):
+                    result = write_obs_bgm(
+                        item_id=bgm_labels[bgm_choice],
+                        obs_config_file=obs_config_file,
+                        obs_local_config_file=obs_local_config_file,
+                    )
+                    if result.get("ok"):
+                        _append_ui_log(
+                            f"obs_bgm id={result.get('id')} "
+                            f"source={result.get('source')}"
+                        )
+                        st.success(
+                            f"BGM 切替 OK: {result.get('id')} → {result.get('path')}"
+                        )
+                    else:
+                        _append_ui_log(
+                            f"obs_bgm FAIL id={result.get('id')} "
+                            f"err={result.get('error')}"
+                        )
+                        st.error(f"BGM 切替失敗: {result.get('error')}")
+
+        st.subheader("当てフリ（通常⇔ドアップ 見せ消し）")
+        st.caption(
+            "OBS に事前配置した通常ソースとドアップソースの可視性だけ切替。"
+            "拡大は OBS 側の配置。トリガは AI 発話開始（first_audio）。"
+            "default ON。OFF にすると発話開始でも切替しない。"
+        )
+        atefuri = obs_state.get("atefuri") or {}
+        atefuri_on = bool(atefuri.get("enabled", True))
+        st.write(
+            f"now={'ON' if atefuri_on else 'OFF'} "
+            f"(config default={'ON' if atefuri.get('enabled_default', True) else 'OFF'}) "
+            f"scene={atefuri.get('scene') or '(current program)'}"
+        )
+        t1, t2, t3, t4 = st.columns(4)
+        with t1:
+            if st.button("当てフリ ON", type="primary", use_container_width=True):
+                result = write_atefuri_enabled(
+                    enabled=True,
+                    obs_config_file=obs_config_file,
+                    obs_local_config_file=obs_local_config_file,
+                )
+                _append_ui_log("atefuri enabled=ON")
+                st.success("当てフリ ON（次の発話開始でズームソース）")
+        with t2:
+            if st.button("当てフリ OFF", use_container_width=True):
+                result = write_atefuri_enabled(
+                    enabled=False,
+                    obs_config_file=obs_config_file,
+                    obs_local_config_file=obs_local_config_file,
+                )
+                restore = result.get("restore") or {}
+                if restore.get("ok"):
+                    _append_ui_log("atefuri enabled=OFF restore=ok")
+                    st.warning("当てフリ OFF（通常ソースへ戻した）")
+                else:
+                    _append_ui_log(
+                        f"atefuri enabled=OFF restore_err={restore.get('error')}"
+                    )
+                    st.warning(
+                        "当てフリ OFF を記録。"
+                        f" 戻し: {restore.get('error') or 'skipped'}"
+                    )
+        with t3:
+            if st.button("テスト ズーム", use_container_width=True):
+                result = write_atefuri_zoom(
+                    zoomed=True,
+                    obs_config_file=obs_config_file,
+                    obs_local_config_file=obs_local_config_file,
+                )
+                if result.get("ok"):
+                    _append_ui_log("atefuri test zoomed=1")
+                    st.success(
+                        f"ズーム表示: {result.get('zoom_source')} "
+                        f"(hide {result.get('normal_source')})"
+                    )
+                else:
+                    _append_ui_log(f"atefuri test FAIL {result.get('error')}")
+                    st.error(f"ズーム失敗: {result.get('error')}")
+        with t4:
+            if st.button("テスト 通常", use_container_width=True):
+                result = write_atefuri_zoom(
+                    zoomed=False,
+                    obs_config_file=obs_config_file,
+                    obs_local_config_file=obs_local_config_file,
+                )
+                if result.get("ok"):
+                    _append_ui_log("atefuri test zoomed=0")
+                    st.success(
+                        f"通常表示: {result.get('normal_source')} "
+                        f"(hide {result.get('zoom_source')})"
+                    )
+                else:
+                    _append_ui_log(f"atefuri test FAIL {result.get('error')}")
+                    st.error(f"通常戻し失敗: {result.get('error')}")
+
+        st.subheader("エージェントスミス（クローン＋音声フィルタ）")
+        st.caption(
+            "OBS 事前配置クローンを一斉表示し、AI拾い音声ソースのフィルタを ON。"
+            "BGM には掛けない。transform / 増殖加速なし。session_loop 非触。"
+            "開始＝表示＋フィルタON／リセット＝非表示＋フィルタOFF。"
+        )
+        smith = obs_state.get("smith") or {}
+        st.write(
+            f"clones={', '.join(smith.get('clone_sources') or []) or '(none)'} "
+            f"audio={smith.get('audio_source') or '(unset)'} "
+            f"filter={smith.get('filter_name') or '(unset)'} "
+            f"scene={smith.get('scene') or '(current program)'}"
+        )
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("スミス開始", type="primary", use_container_width=True):
+                result = write_smith_effect(
+                    active=True,
                     obs_config_file=obs_config_file,
                     obs_local_config_file=obs_local_config_file,
                 )
                 if result.get("ok"):
                     _append_ui_log(
-                        f"obs_background id={result.get('id')} "
-                        f"source={result.get('source')}"
+                        "smith start clones="
+                        + ",".join(result.get("applied") or [])
+                        + f" filter={result.get('filter_name')}"
                     )
                     st.success(
-                        f"背景切替 OK: {result.get('id')} → {result.get('path')}"
+                        f"スミス ON: clones={', '.join(result.get('applied') or [])} "
+                        f"filter={result.get('audio_source')}/{result.get('filter_name')}"
                     )
                 else:
-                    _append_ui_log(
-                        f"obs_background FAIL id={result.get('id')} "
-                        f"err={result.get('error')}"
-                    )
-                    st.error(f"背景切替失敗: {result.get('error')}")
-
-    with o2:
-        st.subheader("BGM")
-        if not bgm_items:
-            st.caption("catalog 空（in/obs_control_config.json を確認）")
-        else:
-            bgm_labels = {
-                f"{x['label']} ({x['id']})": x["id"] for x in bgm_items
-            }
-            bgm_choice = st.selectbox(
-                "BGM を選択",
-                options=list(bgm_labels.keys()),
-                key="obs_bgm_select",
-            )
-            if st.button("BGM を切替", type="primary", use_container_width=True):
-                result = write_obs_bgm(
-                    item_id=bgm_labels[bgm_choice],
+                    _append_ui_log(f"smith start FAIL {result.get('error')}")
+                    st.error(f"スミス開始失敗: {result.get('error')}")
+        with s2:
+            if st.button("スミス リセット", use_container_width=True):
+                result = write_smith_effect(
+                    active=False,
                     obs_config_file=obs_config_file,
                     obs_local_config_file=obs_local_config_file,
                 )
                 if result.get("ok"):
-                    _append_ui_log(
-                        f"obs_bgm id={result.get('id')} "
-                        f"source={result.get('source')}"
-                    )
-                    st.success(
-                        f"BGM 切替 OK: {result.get('id')} → {result.get('path')}"
-                    )
+                    _append_ui_log("smith reset ok")
+                    st.warning("スミス OFF（クローン非表示＋フィルタOFF）")
                 else:
-                    _append_ui_log(
-                        f"obs_bgm FAIL id={result.get('id')} "
-                        f"err={result.get('error')}"
-                    )
-                    st.error(f"BGM 切替失敗: {result.get('error')}")
-
-    st.subheader("当てフリ（通常⇔ドアップ 見せ消し）")
-    st.caption(
-        "OBS に事前配置した通常ソースとドアップソースの可視性だけ切替。"
-        "拡大は OBS 側の配置。トリガは AI 発話開始（first_audio）。"
-        "default ON。OFF にすると発話開始でも切替しない。"
-    )
-    atefuri = obs_state.get("atefuri") or {}
-    atefuri_on = bool(atefuri.get("enabled", True))
-    st.write(
-        f"now={'ON' if atefuri_on else 'OFF'} "
-        f"(config default={'ON' if atefuri.get('enabled_default', True) else 'OFF'}) "
-        f"scene={atefuri.get('scene') or '(current program)'}"
-    )
-    t1, t2, t3, t4 = st.columns(4)
-    with t1:
-        if st.button("当てフリ ON", type="primary", use_container_width=True):
-            result = write_atefuri_enabled(
-                enabled=True,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            _append_ui_log("atefuri enabled=ON")
-            st.success("当てフリ ON（次の発話開始でズームソース）")
-    with t2:
-        if st.button("当てフリ OFF", use_container_width=True):
-            result = write_atefuri_enabled(
-                enabled=False,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            restore = result.get("restore") or {}
-            if restore.get("ok"):
-                _append_ui_log("atefuri enabled=OFF restore=ok")
-                st.warning("当てフリ OFF（通常ソースへ戻した）")
-            else:
-                _append_ui_log(
-                    f"atefuri enabled=OFF restore_err={restore.get('error')}"
-                )
-                st.warning(
-                    "当てフリ OFF を記録。"
-                    f" 戻し: {restore.get('error') or 'skipped'}"
-                )
-    with t3:
-        if st.button("テスト ズーム", use_container_width=True):
-            result = write_atefuri_zoom(
-                zoomed=True,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            if result.get("ok"):
-                _append_ui_log("atefuri test zoomed=1")
-                st.success(
-                    f"ズーム表示: {result.get('zoom_source')} "
-                    f"(hide {result.get('normal_source')})"
-                )
-            else:
-                _append_ui_log(f"atefuri test FAIL {result.get('error')}")
-                st.error(f"ズーム失敗: {result.get('error')}")
-    with t4:
-        if st.button("テスト 通常", use_container_width=True):
-            result = write_atefuri_zoom(
-                zoomed=False,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            if result.get("ok"):
-                _append_ui_log("atefuri test zoomed=0")
-                st.success(
-                    f"通常表示: {result.get('normal_source')} "
-                    f"(hide {result.get('zoom_source')})"
-                )
-            else:
-                _append_ui_log(f"atefuri test FAIL {result.get('error')}")
-                st.error(f"通常戻し失敗: {result.get('error')}")
-
-    st.subheader("エージェントスミス（クローン＋音声フィルタ）")
-    st.caption(
-        "OBS 事前配置クローンを一斉表示し、AI拾い音声ソースのフィルタを ON。"
-        "BGM には掛けない。transform / 増殖加速なし。session_loop 非触。"
-        "開始＝表示＋フィルタON／リセット＝非表示＋フィルタOFF。"
-    )
-    smith = obs_state.get("smith") or {}
-    st.write(
-        f"clones={', '.join(smith.get('clone_sources') or []) or '(none)'} "
-        f"audio={smith.get('audio_source') or '(unset)'} "
-        f"filter={smith.get('filter_name') or '(unset)'} "
-        f"scene={smith.get('scene') or '(current program)'}"
-    )
-    s1, s2 = st.columns(2)
-    with s1:
-        if st.button("スミス開始", type="primary", use_container_width=True):
-            result = write_smith_effect(
-                active=True,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            if result.get("ok"):
-                _append_ui_log(
-                    "smith start clones="
-                    + ",".join(result.get("applied") or [])
-                    + f" filter={result.get('filter_name')}"
-                )
-                st.success(
-                    f"スミス ON: clones={', '.join(result.get('applied') or [])} "
-                    f"filter={result.get('audio_source')}/{result.get('filter_name')}"
-                )
-            else:
-                _append_ui_log(f"smith start FAIL {result.get('error')}")
-                st.error(f"スミス開始失敗: {result.get('error')}")
-    with s2:
-        if st.button("スミス リセット", use_container_width=True):
-            result = write_smith_effect(
-                active=False,
-                obs_config_file=obs_config_file,
-                obs_local_config_file=obs_local_config_file,
-            )
-            if result.get("ok"):
-                _append_ui_log("smith reset ok")
-                st.warning("スミス OFF（クローン非表示＋フィルタOFF）")
-            else:
-                _append_ui_log(f"smith reset FAIL {result.get('error')}")
-                st.error(f"スミスリセット失敗: {result.get('error')}")
+                    _append_ui_log(f"smith reset FAIL {result.get('error')}")
+                    st.error(f"スミスリセット失敗: {result.get('error')}")
 
     st.divider()
 
-    st.header("戦闘管制")
+    with st.expander("戦闘管制", expanded=False):
+        st.caption(
+            "AI猫の会話方針・口調・相手メタ情報を入れる欄。"
+            "即時割り込みではなく、主に次回以降の応答に効きます。"
+        )
 
-    st.caption(
-        "AI猫の会話方針・口調・相手メタ情報を入れる欄。"
-        "即時割り込みではなく、主に次回以降の応答に効きます。"
-    )
+        control_text = st.text_area(
+            "戦闘管制テキスト",
+            value="会話の主導権を握れ。強気に短く話せ。相手の発話は無視してよい。",
+            height=80,
+        )
 
-    control_text = st.text_area(
-        "戦闘管制テキスト",
-        value="会話の主導権を握れ。強気に短く話せ。相手の発話は無視してよい。",
-        height=120,
-    )
+        c1, c2 = st.columns(2)
 
-    c1, c2 = st.columns(2)
+        with c1:
+            if st.button("戦闘管制 投入", type="primary", use_container_width=True):
+                write_control(
+                    control_file=control_file,
+                    text=control_text,
+                )
+                _append_ui_log(f"control text={control_text}")
+                st.success("戦闘管制を投入しました。")
 
-    with c1:
-        if st.button("戦闘管制 投入", type="primary", use_container_width=True):
-            write_control(
-                control_file=control_file,
-                text=control_text,
-            )
-            _append_ui_log(f"control text={control_text}")
-            st.success("戦闘管制を投入しました。")
-
-    with c2:
-        if st.button("戦闘管制 解除", use_container_width=True):
-            clear_control(
-                control_file=control_file,
-            )
-            _append_ui_log("control clear")
-            st.warning("戦闘管制 clear を投入しました。")
+        with c2:
+            if st.button("戦闘管制 解除", use_container_width=True):
+                clear_control(
+                    control_file=control_file,
+                )
+                _append_ui_log("control clear")
+                st.warning("戦闘管制 clear を投入しました。")
 
     st.divider()
 
-    st.header("Status / Debug")
+    with st.expander("Status / Debug", expanded=False):
+        status = read_status(
+            control_file=control_file,
+            interrupt_file=interrupt_file,
+            event_file=event_file,
+            vad_profile_file=vad_profile_file,
+        )
 
-    status = read_status(
-        control_file=control_file,
-        interrupt_file=interrupt_file,
-        event_file=event_file,
-        vad_profile_file=vad_profile_file,
-    )
+        control_text_now = status["control"]
+        interrupt_text_now = status["interrupt"]
+        event_text_now = status["event"]
+        vad_profile_text_now = status["vad_profile"]
 
-    control_text_now = status["control"]
-    interrupt_text_now = status["interrupt"]
-    event_text_now = status["event"]
-    vad_profile_text_now = status["vad_profile"]
+        d1, d2, d3, d4 = st.columns(4)
 
-    d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.subheader("battle_control_live.txt")
+            st.code(control_text_now)
 
-    with d1:
-        st.subheader("battle_control_live.txt")
-        st.code(control_text_now)
+        with d2:
+            st.subheader("battle_interrupt_live.txt")
+            st.code(interrupt_text_now)
 
-    with d2:
-        st.subheader("battle_interrupt_live.txt")
-        st.code(interrupt_text_now)
+        with d3:
+            st.subheader("event_runtime_live.txt")
+            st.code(event_text_now)
 
-    with d3:
-        st.subheader("event_runtime_live.txt")
-        st.code(event_text_now)
+        with d4:
+            st.subheader("vad_profile_live.txt")
+            st.code(vad_profile_text_now)
 
-    with d4:
-        st.subheader("vad_profile_live.txt")
-        st.code(vad_profile_text_now)
+        st.subheader("UI Operation Log")
 
-    st.subheader("UI Operation Log")
-
-    if st.session_state.get("ui_logs"):
-        st.code("\n".join(st.session_state["ui_logs"]))
-    else:
-        st.caption("No UI operations yet.")
+        if st.session_state.get("ui_logs"):
+            st.code("\n".join(st.session_state["ui_logs"]))
+        else:
+            st.caption("No UI operations yet.")
 
 
 if __name__ == "__main__":
