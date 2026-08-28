@@ -856,6 +856,10 @@ def main() -> int:
     override_active = False
     override_last_mtime = 0.0
     override_first_frame_logged = False
+    override_t0 = 0.0
+    override_shown_n = 0
+    override_eof = False
+    override_hold_logged = False
 
     width = int(args.width)
     height = int(args.height)
@@ -996,7 +1000,11 @@ def main() -> int:
                     b3_last_playing_frame_offset = None
                     last_fg_pose_idx = None
                     override_active = duration_s > 0
-                    override_until_t = time.monotonic() + max(0.0, duration_s)
+                    override_t0 = time.monotonic()
+                    override_until_t = override_t0 + max(0.0, duration_s)
+                    override_shown_n = 0
+                    override_eof = False
+                    override_hold_logged = False
 
                     print(
                         "[virtualcam_persistent][bg_override]",
@@ -1020,33 +1028,50 @@ def main() -> int:
 
             # Event overlay: decode from frame 0 at cam fps. Never B3/B7-seek
             # using the live player clock (that snaps to last keyframe).
+            # Advance at most one source frame per wall-clock slot so
+            # cam.sleep_until_next_frame catch-up cannot dump the mp4 and
+            # freeze on the last frame for the rest of duration_s.
             if override_active:
-                ok, bg, bg_pos = _read_bg_sequential(cap, loop_bg=False)
-                if ok and not override_first_frame_logged:
-                    print(
-                        "[virtualcam_persistent][bg_override_first_frame]",
-                        f"idx={int(bg_pos)}",
-                        f"total={int(bg_total)}",
-                        flush=True,
-                    )
-                    override_first_frame_logged = True
-                if not ok:
-                    if last_rgb is not None:
-                        cam.send(last_rgb)
-                        cam.sleep_until_next_frame()
-                        sent += 1
-                        continue
+                fps_n = max(1, int(fps))
+                want_idx = int(
+                    max(0.0, (time.monotonic() - float(override_t0)) * float(fps_n))
+                )
+                if (not override_eof) and int(override_shown_n) <= want_idx:
+                    ok, bg, bg_pos = _read_bg_sequential(cap, loop_bg=False)
+                    if ok:
+                        if not override_first_frame_logged:
+                            print(
+                                "[virtualcam_persistent][bg_override_first_frame]",
+                                f"idx={int(bg_pos)}",
+                                f"total={int(bg_total)}",
+                                flush=True,
+                            )
+                            override_first_frame_logged = True
+                        bg = cv2.resize(
+                            bg, (width, height), interpolation=cv2.INTER_LINEAR
+                        )
+                        last_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
+                        override_shown_n = int(override_shown_n) + 1
+                    else:
+                        override_eof = True
+                        if not override_hold_logged:
+                            print(
+                                "[virtualcam_persistent][bg_override_hold_last]",
+                                f"shown_n={int(override_shown_n)}",
+                                f"total={int(bg_total)}",
+                                f"want_idx={int(want_idx)}",
+                                flush=True,
+                            )
+                            override_hold_logged = True
+                if last_rgb is None:
                     print(
                         "[virtualcam_persistent][bg_override_frame_warn] failed to read bg frame",
                         flush=True,
                     )
                     time.sleep(float(args.poll_s))
                     continue
-                bg = cv2.resize(bg, (width, height), interpolation=cv2.INTER_LINEAR)
-                comp_rgb = cv2.cvtColor(bg, cv2.COLOR_BGR2RGB)
-                cam.send(comp_rgb)
+                cam.send(last_rgb)
                 cam.sleep_until_next_frame()
-                last_rgb = comp_rgb
                 sent += 1
                 if sent % 25 == 0:
                     print(f"[virtualcam_persistent] sent={sent}", flush=True)

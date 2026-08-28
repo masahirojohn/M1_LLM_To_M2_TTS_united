@@ -1421,13 +1421,15 @@
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
-| E1b | イベント完了まで Live PCM drop ゲート | `in_progress` | 2026-08-27 着手（設計ロック済） |
+| E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = E1b（イベント完了まで Live PCM drop）。** ブランチは `feature/event-catalog-admin` のまま。main 未マージ。④は出さない
+- **今の本線 = なし。** E1b Pass-with-note。希望順④は指名待ち（子は出さない）
+- E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
+- 運用メモ: 追加イベントは 25fps・尺を duration/音に合わせる。60fps 長尺はスロー/途中 restore の可能性（別 Phase）
 - P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空30=Studio）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視。`main` FF 済（`f117d51` / `phase-p1-pass`）
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
@@ -1444,7 +1446,7 @@
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**（2026-08-27）。**E1b in_progress**（完了ゲート。設計ロック済。同一ブランチ） |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**（2026-08-28）。ブランチ `feature/event-catalog-admin`。main 未マージ |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
@@ -2341,12 +2343,22 @@
 - `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
 
 **Pass 基準:**
-- [ ] override 中 Live enqueue 0（ログ）。restore 後は図Aの通常ターン
-- [ ] `evt_voice_001` のイベント音が残る
-- [ ] イベント後の次発話で AI＋口。バースト無し
-- [ ] Keep 非破壊。親向けサマリーのみ
+- [x] override 中 Live enqueue drop（`132041`。drop_on〜drop_off 間）
+- [x] `evt_voice_001` のイベント音が残る（映像と同期）
+- [ ] イベント後の次発話は本測未記載 — **note**（バースト無しは 130811 末尾ホールド Fail を壁時計1枚/スロットで閉鎖）
+- [x] Keep 非破壊。親向けサマリーのみ
 
-**親判定:** （子サマリー待ち）
+**子報告要約（2026-08-28）:**
+- drop 適用点: `_pipeline_enqueue_dispatcher_loop` の `_enqueue_one`（`_enqueue_playback_audio_sync` 直前。Hold しない。play_wav 非経由）
+- 初報は実機未計測。再主観 `132041`: 発話中 `evt_voice_001`。映像＋イベント音同期。終盤フリーズなし。Live enqueue drop。restore=`mic_gate_open` / `bg_restore`
+- 直前 Fail `130811`: cam catch-up でコマを先に排出→末尾ホールド。Fix=`run_virtualcam_persistent.py` の override を壁時計1枚/スロット（動画専用分岐ではない）
+- `evt_001` 専用1本は未記載（drop は同一経路）
+
+**親判定（2026-08-28）:**
+- **Pass-with-note。** 次発話の短確認と `evt_001` 専用は必須にしない（同一 drop。運用で足りる）
+- Keep All（commit / tag `phase-e1b-pass`）は **親が実施**。子はしない。`in/*.txt` は入れない
+- 出さない: ④、60fps 長尺 Phase、B 再開、ジッタ延長、session_loop sleep、M0停止ゲート。次本線=なし（指名待ち）
+- 運用: 追加イベントは 25fps・尺を duration/音に合わせる
 
 ---
 
@@ -3473,3 +3485,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-27 | E1 途中。dropdown Keep 候補。まだ Pass/Keep All しない。次=E1hf（evt_001 末尾飛び・open直後 frame0 seek）。完了ゲートは E1b 予約 |
 | 2026-08-27 | Phase E1 Pass-with-defer。evt_001 頭から順再生（232324）。完了ゲートは E1b。Keep All は親。④は出さない |
 | 2026-08-27 | E1b 着手。設計ロック=override 中 Live PCM drop（enqueue）。session_loop sleep／ジッタ／M0停止ゲート禁止。ブランチは `feature/event-catalog-admin` のまま。④は出さない |
+| 2026-08-28 | Phase E1b Pass-with-note。dispatcher drop＋override 壁時計1枚/スロット。132041 映像/音同期。130811 末尾ホールド閉鎖。Keep All は親。④は出さない |

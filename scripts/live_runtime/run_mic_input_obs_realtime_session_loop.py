@@ -1803,6 +1803,16 @@ def _mic_gate_is_mute(mic_gate_ref: dict[str, str] | None) -> bool:
     return str(mic_gate_ref.get("value", "open")).strip().lower() == "mute"
 
 
+def _event_live_pcm_drop_active(turn_state: dict[str, Any] | None) -> bool:
+    """True while event_runtime override should discard Live PCM at enqueue."""
+    if not isinstance(turn_state, dict):
+        return False
+    ref = turn_state.get("event_live_pcm_drop_ref")
+    if not isinstance(ref, dict):
+        return False
+    return bool(ref.get("active"))
+
+
 def _player_has_talkover_leftover(turn_state: dict[str, Any] | None) -> bool:
     """True when player still holds prior-turn AI audio (not idle-silent ~jitter)."""
     if turn_state is None:
@@ -2782,6 +2792,7 @@ def _start_event_runtime_file_thread(
     m35_repo: Path | None = None,
     m1_repo: Path | None = None,
     battle_control_file: Path | None = None,
+    event_live_pcm_drop_ref: dict[str, Any] | None = None,
 ) -> Thread:
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2791,6 +2802,13 @@ def _start_event_runtime_file_thread(
 
     def _open_later(event_id: str, duration_s: float, post_control: str = "") -> None:
         time.sleep(max(0.0, float(duration_s)))
+        if event_live_pcm_drop_ref is not None:
+            event_live_pcm_drop_ref["active"] = False
+            print(
+                "[event_runtime][live_pcm_drop_off]",
+                f"event_id={event_id}",
+                flush=True,
+            )
         battle_mic_gate_ref["value"] = "open"
         print(
             "[event_runtime][mic_gate_open]",
@@ -2881,6 +2899,13 @@ def _start_event_runtime_file_thread(
                     flush=True,
                 )
 
+                if event_live_pcm_drop_ref is not None:
+                    event_live_pcm_drop_ref["active"] = True
+                    print(
+                        "[event_runtime][live_pcm_drop_on]",
+                        f"event_id={event_id}",
+                        flush=True,
+                    )
                 battle_mic_gate_ref["value"] = "mute"
                 print(
                     "[event_runtime][trigger]",
@@ -3412,6 +3437,7 @@ class _AudioPipelineJob:
     fast_inmemory: bool
     skip_archive_pcm: bool
     is_idle_silent: bool = False
+    event_drop: bool = False
 
 
 @dataclass
@@ -4368,7 +4394,20 @@ async def _pipeline_enqueue_dispatcher_loop(
                 0.0, (t_enqueue0 - float(item.t_enqueued)) * 1000.0
             )
         try:
-            if item.effective_playback:
+            drop_event_pcm = bool(getattr(item.job, "event_drop", False)) or (
+                _event_live_pcm_drop_active(turn_state)
+            )
+            if drop_event_pcm and item.effective_playback:
+                # Discard at enqueue. Do not hold for restore flush (等速維持).
+                print(
+                    "[event_runtime][live_pcm_drop]",
+                    f"chunk_idx={int(item.job.playback_chunk_idx)}",
+                    f"pipeline_seq={int(item.pipeline_seq)}",
+                    f"bytes={len(item.effective_playback)}",
+                    f"idle_silent={int(bool(getattr(item.job, 'is_idle_silent', False)))}",
+                    flush=True,
+                )
+            elif item.effective_playback:
                 # Final guard + late catch-up: M0 coverage must reach until_t1
                 # before player enqueue (図A). Runs even when chunk task left
                 # enqueue_blocked after a stalled claim/watermark.
@@ -4819,6 +4858,7 @@ async def _idle_silent_pcm_loop(
                 # Idle silence: skip archive I/O; still enqueues to player for SSOT.
                 skip_archive_pcm=True,
                 is_idle_silent=True,
+                event_drop=_event_live_pcm_drop_active(turn_state),
             )
             task = asyncio.create_task(
                 _process_pipeline_chunk_task(
@@ -5235,6 +5275,7 @@ async def _receive_loop(
                                 fast_inmemory=bool(fast_inmemory),
                                 skip_archive_pcm=bool(skip_archive_pcm),
                                 is_idle_silent=False,
+                                event_drop=_event_live_pcm_drop_active(turn_state),
                             )
                             audio_chunk_idx += 1
                             task = asyncio.create_task(
@@ -6312,6 +6353,7 @@ async def _run(args: argparse.Namespace) -> int:
         battle_control_lines: list[dict[str, Any]] = []
         battle_control_active_ref: dict[str, str] = {"value": ""}
         battle_mic_gate_ref: dict[str, str] = {"value": "open"}
+        event_live_pcm_drop_ref: dict[str, Any] = {"active": False}
         battle_file_pending_lines: list[str] = []
         battle_interrupt_queue_enqueued_once = False
         battle_abort_requested = asyncio.Event()
@@ -6350,6 +6392,7 @@ async def _run(args: argparse.Namespace) -> int:
                     if args.battle_control_file
                     else None
                 ),
+                event_live_pcm_drop_ref=event_live_pcm_drop_ref,
             )
 
         inline_emo_queue: dict[int, str] = {}
@@ -6485,6 +6528,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
         turn_state: dict[str, Any] = {}
+        turn_state["event_live_pcm_drop_ref"] = event_live_pcm_drop_ref
         # Phase29hf: session-scoped last-good player clock (reattached after clear).
         playback_clock_guard: dict[str, int] = {
             "played_samples": 0,
@@ -6511,6 +6555,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
             turn_state.clear()
+            turn_state["event_live_pcm_drop_ref"] = event_live_pcm_drop_ref
             turn_state["active_turn"] = f"bootstrap_{attempt}"
             turn_state["turn_start_perf"] = time.perf_counter()
             turn_state["first_audio_sec"] = None
@@ -6643,6 +6688,7 @@ async def _run(args: argparse.Namespace) -> int:
                 )
 
                 turn_state.clear()
+                turn_state["event_live_pcm_drop_ref"] = event_live_pcm_drop_ref
                 turn_state["active_turn"] = f"warmup_{turn_no}"
                 turn_state["turn_start_perf"] = time.perf_counter()
                 turn_state["first_audio_sec"] = None
@@ -6884,6 +6930,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
 
             turn_state.clear()
+            turn_state["event_live_pcm_drop_ref"] = event_live_pcm_drop_ref
             turn_state["playback_clock_guard"] = playback_clock_guard
             turn_state["mouth_streamer"] = mouth_streamer
             turn_state["active_turn"] = None
