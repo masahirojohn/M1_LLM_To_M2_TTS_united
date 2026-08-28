@@ -1422,11 +1422,13 @@
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 | E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
+| D1 | 第三者向け主要コマンド＋事前準備 docs | `pass` | 2026-08-28 |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** E1b Pass-with-note。希望順④は指名待ち（子は出さない）
+- **今の本線 = なし。** D1 Pass。希望順 0–4 クローズ。次指名待ち（子は出さない）
+- E1+E1b: `main` FF 済（2026-08-28。`e37893a` / `phase-e1b-pass`）
 - E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - 運用メモ: 追加イベントは 25fps・尺を duration/音に合わせる。60fps 長尺はスロー/途中 restore の可能性（別 Phase）
@@ -1446,8 +1448,8 @@
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**（2026-08-28）。ブランチ `feature/event-catalog-admin`。main 未マージ |
-| 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**。`main` FF 済（2026-08-28。`e37893a` / `phase-e1b-pass`） |
+| 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | **D1 Pass**（2026-08-28）。成果物 `docs/ops_third_party.md`。ops_zoom は再発行しない |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
 
@@ -2359,6 +2361,42 @@
 - Keep All（commit / tag `phase-e1b-pass`）は **親が実施**。子はしない。`in/*.txt` は入れない
 - 出さない: ④、60fps 長尺 Phase、B 再開、ジッタ延長、session_loop sleep、M0停止ゲート。次本線=なし（指名待ち）
 - 運用: 追加イベントは 25fps・尺を duration/音に合わせる
+
+---
+
+## Phase D1: 第三者向け主要コマンド＋事前準備 docs
+
+**目的:** 第三者が `docs/ops_third_party.md` と `docs/ops_zoom_third_party.md` だけ見て、JP ローカル / JP Zoom / EN 通常 / EN battle / イベント投入を取り違えない。コード実装なし。
+
+**前提:**
+- E1+E1b を `main` へ FF-only 済（`e37893a` / `phase-e1b-pass`）。docs はその tip から
+- 抜き出し元は `docs/PROGRESS.md` と `docs/ops_zoom_third_party.md` のみ。チャット全文・ログ・gemini*.md は使わない
+- `docs/ops_zoom_third_party.md` は再発行・本文改稿しない
+
+**スコープ:**
+1. 新規 `docs/ops_third_party.md`（目次ロック 6 節。増やさない）
+2. 合格コマンドは出典のコピー。Zoom 配線・JP Zoom コマンド全文は ops_zoom へ参照
+3. 発明フラグ 0。device 番号の永久固定なし。DUR 例外を本番に載せない
+
+**スコープ外（D1 禁止）:**
+- コード変更、図A/凍結/B7/P1/V1/E1b の改変
+- ops_zoom 再発行、ARCHITECTURE / event_runtime_ops / battle_runtime の再発行
+- ジッタ延長、N↑、二重 Live、B 再開、実装子
+
+**Pass 基準:**
+- [x] 第三者が SSOT 2ファイル（`ops_third_party.md` + `ops_zoom_third_party.md`）だけで上記 5 起動を間違えない
+- [x] コマンドは出典のコピー。発明フラグ 0
+- [x] ops_zoom 本文未改稿。コード差分なし
+
+**親作業（2026-08-28）:**
+- step 0: `feature/event-catalog-admin` → `main` FF-only＋push（`f117d51..e37893a`）
+- ブランチ `feature/ops-third-party`。成果物 `docs/ops_third_party.md`
+- Keep All（commit / tag `phase-d1-pass`）は親。`in/*.txt` は入れない
+
+**親判定（2026-08-28）:**
+- **Pass。** 目次 6 節ロック。JP Zoom 全文は ops_zoom 参照。EN 必須3フラグと prompt_dir 2系統を明記。イベントは catalog プルダウン＋ M1 `in/event_catalog.json`
+- 出さない: コード子、ops_zoom 改稿、DUR 例外、device 永久固定、main マージ（別依頼）
+- 次本線=なし（指名待ち）
 
 ---
 
@@ -3486,3 +3524,5 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-27 | Phase E1 Pass-with-defer。evt_001 頭から順再生（232324）。完了ゲートは E1b。Keep All は親。④は出さない |
 | 2026-08-27 | E1b 着手。設計ロック=override 中 Live PCM drop（enqueue）。session_loop sleep／ジッタ／M0停止ゲート禁止。ブランチは `feature/event-catalog-admin` のまま。④は出さない |
 | 2026-08-28 | Phase E1b Pass-with-note。dispatcher drop＋override 壁時計1枚/スロット。132041 映像/音同期。130811 末尾ホールド閉鎖。Keep All は親。④は出さない |
+| 2026-08-28 | `main` へ `feature/event-catalog-admin` を FF-only（`e37893a` / `phase-e1b-pass`）。希望順④着手。Phase D1。ブランチ `feature/ops-third-party`。コード実装子は出さない |
+| 2026-08-28 | Phase D1 Pass。`docs/ops_third_party.md` 新設。ops_zoom 未改稿。コード差分なし。Keep All は親。次本線なし |
