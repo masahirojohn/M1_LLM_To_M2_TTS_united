@@ -1420,13 +1420,14 @@
 | （本線） | 英語検証／配信 | → EN-DUR / Z | **Z2b Pass（2026-08-22）**。遠隔受信=Banana。EN 短確認は任意。**main マージ済（2026-08-25）** |
 | V1 | Live 声 prebuilt 固定（Aoede） | `pass` | 2026-08-26（Pass-with-note。Kore 名は Keep 不可） |
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
+| P1b | EN battle システムプロンプト差し替え | `in_progress` | 2026-09-09 |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 | E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** E1b Pass-with-note。希望順④は指名待ち（子は出さない）
+- **今の本線 = P1b**（EN battle プロンプト差し替え。コード実装子は出さない。prompt 子のみ）
 - E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - 運用メモ: 追加イベントは 25fps・尺を duration/音に合わせる。60fps 長尺はスロー/途中 restore の可能性（別 Phase）
@@ -1446,8 +1447,9 @@
 | 0 | 本マージ（B7 ベース） | **済**（2026-08-25。`phase-b7-pass` / `813c641` を `main` FF。本 PROGRESS 追記も FF） |
 | 1 | Live 声の女性一本化（LiveConnectConfig の speech_config／女性 prebuilt。prompt だけではない） | **V1 Pass-with-note**（2026-08-26）。Keep=**Aoede**＋camelCase wire。`main` FF 済（`b4f7d5c` / `phase-v1-pass`） |
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
-| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**（2026-08-28）。ブランチ `feature/event-catalog-admin`。main 未マージ |
-| 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | 指名待ち |
+| 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**。`main` FF 済（2026-08-28。`e37893a` / `phase-e1b-pass`） |
+| 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | **D1 Pass**（2026-08-28）。`docs/ops_third_party.md` / tag `phase-d1-pass`。ブランチ `feature/ops-third-party`。**main 未マージ** |
+| P1b | EN battle システムプロンプト差し替え（trash_talk 分割。コードなし） | **in_progress**（2026-09-09）。ブランチ `feature/en-battle-prompt` |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
 
@@ -2260,6 +2262,34 @@
 - Fail にしない: admin sidebar 既定 JP（Live wrap は EN）。先頭〜10s 無音＝接続待ち。かぶり気味。cut 後 BGV Δ
 - 出さない: この子への追作業、再生中 mic の新経路、B 再開、ジッタ延長、主導権 Zoom、二重 Live、③④
 - Keep All（commit / tag `phase-p1-pass`）は **親が実施**。子は commit / tag / Keep しない。`in/*.txt` は入れない。`main` FF 済。次=**E1**
+
+---
+
+## Phase P1b: EN battle システムプロンプト差し替え
+
+**目的:** 本番 EN battle（`--prompt_dir configs/prompts_en_battle`）の本文を添付 `trash_talk_cat.txt.md` に差し替える。分割のみ。要約・改作しない。コードなし。
+
+**作業ブランチ:** `feature/en-battle-prompt`（from `main` `e37893a`）。コード実装子は出さない。prompt 子のみ。
+
+**確定事実（覆すな）:**
+- loader は dir 内の番号ファイルを連結する → **20 と 30 に長さ方針を同居させるな**。20 は空のまま
+- P1 Keep: `20` 空、`30`＝原則+few-shot、`10`＝persona/tone、`00`＝制約＋emo。JP fallback。口 barge-in＝talkover
+- 更新本文 SSOT = `trash_talk_cat.txt.md`（SHA256 `6AD768BCA808465D2C4F291000CA2E7FD54A201CF483232EF3BF336724D1A919`）
+- emo 参考 = `emo_id_20260910` の「（参考）」だけ。現行 `00` の `2_0`＝surprise は誤り。`x_0`（`1_1` 以外）は出させない
+- YAML（`emo_id_to_expression.yaml`）はタグ後の顔マッピング。Live には渡らない。**今フェーズで YAML を直すな**
+- `--inline_emo_tag_mode` が `[emo:…]` 冒頭を追加する。許可リストは `00` に残す
+- 許可 emo_id のみ: `1_1` / `1_2` / `2_1` / `2_2` / `3_1` / `9_1`。`8_1` surprise は YAML が normal のため今は出させない。`2_0` を surprise と書くな
+- 30 末尾に現行 **Keep talking until you are interrupted.** を残す（更新版本文に無い。落とすな）
+
+**スコープ（子）:** `configs/prompts_en_battle/` の `00` / `10` / `30` のみ。`20` 空。40–80・interrupt/leadership・`_studio_source.md`・JP / `prompts_en` / yaml / session_loop は触るな
+
+**スコープ外:** Zoom 主観（親／ユーザー。子 Gate にしない）。コード、ジッタ、N↑、二重 Live、④ docs、PROGRESS 編集、commit / tag
+
+**Pass 基準:**
+- [ ] 分割が 10＝Role&Persona＋Tone&Style、30＝Principles 1–9＋Few-Shot＋until interrupted
+- [ ] emo 許可がロックどおり。`2_0` surprise なし。参考の全10系統を `00` に貼っていない
+- [ ] Keep 非破壊（P1 2系統 / V1 Aoede / 方式2 / 図A / N=2 / jitter 300/240 / silence 350 / B7 / E1b）
+- [ ] Zoom 主観は親
 
 ---
 
@@ -3486,3 +3516,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-08-27 | Phase E1 Pass-with-defer。evt_001 頭から順再生（232324）。完了ゲートは E1b。Keep All は親。④は出さない |
 | 2026-08-27 | E1b 着手。設計ロック=override 中 Live PCM drop（enqueue）。session_loop sleep／ジッタ／M0停止ゲート禁止。ブランチは `feature/event-catalog-admin` のまま。④は出さない |
 | 2026-08-28 | Phase E1b Pass-with-note。dispatcher drop＋override 壁時計1枚/スロット。132041 映像/音同期。130811 末尾ホールド閉鎖。Keep All は親。④は出さない |
+| 2026-09-09 | Phase P1b 着手。EN battle 本文を trash_talk 分割。ブランチ `feature/en-battle-prompt`（from `main` `e37893a`）。コード実装子は出さない |
