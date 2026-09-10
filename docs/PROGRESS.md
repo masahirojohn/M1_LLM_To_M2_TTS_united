@@ -1422,14 +1422,15 @@
 | P1 | EN 本番システムプロンプト差し替え＋テスト | `pass` | 2026-08-27（Pass-with-note。口 barge-in＝既存 talkover） |
 | P1b | EN battle システムプロンプト差し替え | `pass` | 2026-09-10（Pass-with-note。device 再クエリ後成立） |
 | L1 | 長話口閉じ計測（実装なし） | `pass` | 2026-09-10（Pass-with-note。定番3否定。残り=VC audio_ms=0 seam） |
+| L2 | 長話口閉じの表示 clock 最小修正 | `in_progress` | 2026-09-10 |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 | E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** L1 Pass-with-note。次指名待ち（子は出さない）
-- L1 Keep: 長話口閉じ指紋は **A**（PLAYING＋pending 秒単位。VC だけ `audio_ms=0` / `shown_fg=frame_offset`）。再発は長ターン開始 seam（主観の「同ターン再発」は idle 連続）。定番3（wait_mouth / order_wait HOL / M0 N）は長話主因ではない。141259 のバースト HOL・中盤 REB は長話と別指紋。表示 clock 実装・N↑・ジッタ延長は出さない
+- **今の本線 = L2**（seam の VC 表示 clock。L1 はやり直さない）
+- L1 Keep: 長話口閉じ指紋は **A**（PLAYING＋pending 秒単位。VC だけ `audio_ms=0` / `shown_fg=frame_offset`）。再発は長ターン開始 seam（主観の「同ターン再発」は idle 連続）。定番3（wait_mouth / order_wait HOL / M0 N）は長話主因ではない。141259 のバースト HOL・中盤 REB は長話と別指紋。`phase-l1-pass` = `a222313`
 - E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - 運用メモ: 追加イベントは 25fps・尺を duration/音に合わせる。60fps 長尺はスロー/途中 restore の可能性（別 Phase）
@@ -1453,7 +1454,8 @@
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**。`main` FF 済（2026-08-28。`e37893a` / `phase-e1b-pass`） |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | **D1 Pass**（2026-08-28）。`docs/ops_third_party.md` / tag `phase-d1-pass`。ブランチ `feature/ops-third-party`。**main 未マージ** |
 | P1b | EN battle システムプロンプト差し替え（trash_talk 分割。コードなし） | **Pass-with-note**（2026-09-10）。ブランチ `feature/en-battle-prompt`。**main 未マージ** |
-| L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。新ブランチなし |
+| L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。`phase-l1-pass` / `a222313`。**main 未マージ** |
+| L2 | 長話口閉じの表示 clock 最小修正 | **in_progress**（2026-09-10）。ブランチ `feature/vc-audio-ms-seam` |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
 
@@ -1494,7 +1496,8 @@
 - B全面再オープン／リップ品質本線化
 - 再生中 mic の新 barge-in 経路／二重 InputStream 本線化／主導権を Zoom で使う
 - P1b 観察の Live first PCM 遅延／`audio_ms=0` 口閉じ。**バースト専用処理は新設しない**
-- L1 残り（表示 clock）: ターン seam で VC `audio_ms=0` が追いつかない。実装しない。指名なしに `enqueue_timeline_end` vs VC `audio_ms` 再測も出さない。N↑・ジッタ延長・虐殺短文化は出さない
+- L1 残り（表示 clock）: ターン seam で VC `audio_ms=0` が追いつかない → **L2 で最小修正中**。N↑・ジッタ延長・虐殺短文化・バースト専用は出さない
+- 141259 のバースト HOL／中盤 REB（L2 対象外）
 
 ### 全プロダクト Phase 共通禁止（子）
 
@@ -2355,7 +2358,34 @@
 - 主観の「同ターン再発」は idle 連続が一息に聞こえるため。VC 上は長ターン開始 seam ごと
 - 出さない: 実装子、N↑、ジッタ延長、バースト専用、虐殺短文化、次本線。指名なしに再測子も出さない
 - Keep All（commit / tag `phase-l1-pass`）は **親が実施**。コード差分なし。`in/*.txt`・logs は入れない
-- 次本線=なし（指名待ち）
+- 次本線=なし（指名待ち）→ **L2**（2026-09-10 着手。表示 clock 最小修正）
+
+---
+
+## Phase L2: 長話口閉じの表示 clock 最小修正
+
+**目的:** 長ターン開始 seam で player は PLAYING なのに VC が `audio_ms=0` の閉じ口を数秒出す、を止める。L1 はやり直さない。
+
+**作業ブランチ:** `feature/vc-audio-ms-seam`（from `feature/en-battle-prompt` `a222313` / `phase-l1-pass`）。
+
+**確定事実（覆すな）:**
+- L1 指紋=A。定番3否定。残り=ターン seam で VC `audio_ms=0` が追いつかない
+- 再発は長ターン開始 seam。141259 の HOL／中盤 REB は対象外
+- 表示時刻 SSOT = `player_local_ms` → `audio_ms`。全体オフセットは禁止
+- E1b Keep: イベント override は壁時計1枚/スロット（cam catch-up でコマ先排出は禁止のまま）
+
+**Before:** `logs/sess_en_live1_subj_20260910_162939.log` / `163855.log`  
+**対照:** `143450.log`（短文 talkover。壊すな）
+
+**スコープ（子）:** virtualcam の表示時刻が playback SSOT に追従する経路のみ。seam で `audio_ms` が 0 に張り付く原因を特定し、SSOT どおり進める最小修正。
+
+**スコープ外:** N↑、ジッタ延長、バースト専用、先行 enqueue、`audio_ms` オフセット、frame drop、口形捨て、session_loop のターン尺、prompt／虐殺短文化、IDLE 廃止、YAML、JP、割り込み／主導権、PROGRESS、commit / tag、L1 再計測、141259 HOL 直し
+
+**Pass 基準:**
+- [ ] 長話相当で seam の数秒 A（口閉じ＋音声継続）が Before 比で消えるか、残るなら計測で閉じる
+- [ ] 短文 talkover（143450）を壊さない
+- [ ] Keep 非破壊（図A／方式2／N=2／jitter 300/240／E1b override／P1b）
+- [ ] 親向けサマリーのみ
 
 ---
 
@@ -3586,3 +3616,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-09-10 | Phase P1b Pass-with-note。00 許可 1_1/1_2/2_1/2_2/3_1/9_1。141259 成立。番号ずれ初回は Fail にしない。バースト専用は出さない。Keep All は親。次本線なし |
 | 2026-09-10 | Phase L1 着手。長話口閉じ計測のみ。実装子は出さない。新ブランチなし。162939 / 163855 vs 141259 / 143450 |
 | 2026-09-10 | Phase L1 Pass-with-note。指紋=A（seam の VC audio_ms=0）。定番3否定。実装・次本線は出さない。Keep All は親 |
+| 2026-09-10 | Phase L2 着手。seam の VC 表示 clock 最小修正。ブランチ `feature/vc-audio-ms-seam`（from `a222313`）。L1 はやり直さない |
