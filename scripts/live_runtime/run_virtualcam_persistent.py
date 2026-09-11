@@ -419,7 +419,7 @@ def _resolve_ssot_target(
     step_ms: int,
     frame_offset_cli: int,
 ) -> dict:
-    """Map player played_samples → mouth/M0 audio_ms → target PNG frame index."""
+    """Map player_local_ms → turn-relative audio_ms → target PNG frame index."""
     step = int(step_ms)
     if sync_meta is not None and int(sync_meta.get("step_ms", 0) or 0) > 0:
         step = int(sync_meta.get("step_ms") or step)
@@ -447,8 +447,14 @@ def _resolve_ssot_target(
         else:
             player_local_ms = float(played_samples) * 1000.0 / float(sample_rate)
 
-    rel_samples = max(0, int(played_samples) - int(base_samples))
-    audio_ms = int(rel_samples * 1000.0 / float(sample_rate))
+    # SSOT: audio_ms follows player_local_ms. Do not clamp at 0.
+    # session_loop commits base = played + pending (new-turn audio origin).
+    # max(0, played-base) then sticks audio_ms=0 / shown_fg=frame_offset
+    # (closed mouth) for the leftover pending duration while state=PLAYING.
+    # Negative audio_ms maps onto pre-offset frames and stays continuous
+    # with the previous-turn origin; no overall offset and no catch-up dump.
+    base_ms = float(base_samples) * 1000.0 / float(sample_rate)
+    audio_ms = int(player_local_ms - base_ms)
     target_t_ms = int(origin_ms) + int(audio_ms)
     target_frame = int(frame_offset) + int(target_t_ms // max(1, step))
 
