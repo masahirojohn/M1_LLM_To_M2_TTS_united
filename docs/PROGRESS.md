@@ -1430,13 +1430,13 @@
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
 - **今の本線 = なし。** L2 Pass-with-note。次指名待ち（子は出さない）
-- L2 Keep: VC `audio_ms = player_local_ms − base_ms`（0 クランプしない）。負の `audio_ms` は offset より前の既存 FG に連続マップ。全体オフセットでも catch-up 先出しでもない。`run_virtualcam_persistent.py` のみ runtime。`phase-l2-pass` は feature（main 未マージ）
+- L2 Keep: VC `audio_ms = player_local_ms − base_ms`（0 クランプしない）。負の `audio_ms` は offset より前の既存 FG に連続マップ。全体オフセットでも catch-up 先出しでもない。`run_virtualcam_persistent.py` のみ runtime。`main` FF 済（`523f7f6` / `phase-l2-pass`）
 - L1 Keep: 長話口閉じ指紋は **A**（PLAYING＋pending 秒単位。VC だけ `audio_ms=0` / `shown_fg=frame_offset`）。再発は長ターン開始 seam（主観の「同ターン再発」は idle 連続）。定番3（wait_mouth / order_wait HOL / M0 N）は長話主因ではない。141259 のバースト HOL・中盤 REB は長話と別指紋。`phase-l1-pass` = `a222313`
 - E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
 - E1 Keep: catalog プルダウン（最大10・既存2件・決め打ちボタンなし）。イベント中 sequential_from_0（B3/B7 不使用）。open 直後 frame0 seek。復帰は古い pose lock を捨てる。SSOT=M1 `in/event_catalog.json`（M3.5 `in/` スキャンしない）
 - 運用メモ: 追加イベントは 25fps・尺を duration/音に合わせる。60fps 長尺はスロー/途中 restore の可能性（別 Phase）
 - P1 Keep: `--prompt_dir` 2系統（`prompts_en`＝20あり30空 / `prompts_en_battle`＝20空・30=trash_talk）。interrupt/leadership は今の prompt_dir 横。JP fallback。口 barge-in＝既存 talkover `clear_queue`（mute は切らない）。二重 InputStream は監視。`main` FF 済（`f117d51` / `phase-p1-pass`）
-- P1b Keep: battle `00` 許可 emo は `1_1` / `1_2` / `2_1` / `2_2` / `3_1` / `9_1` のみ。`2_0` surprise 禁止。YAML は今フェーズ未変更。`phase-p1b-pass` は feature（main 未マージ）
+- P1b Keep: battle `00` 許可 emo は `1_1` / `1_2` / `2_1` / `2_2` / `3_1` / `9_1` のみ。`2_0` surprise 禁止。YAML は今フェーズ未変更。`main` FF 済（`34458fb` / `phase-p1b-pass`）
 - V1 Keep: 本番声 = `speech_config` prebuilt **Aoede**（両分岐）。camelCase wire（`t_live_speech_config`）。`--voice_name` CLI なし。JP/EN 同一接続。Kore 名は Keep しない。`main` FF 済（`b4f7d5c` / `phase-v1-pass`）
 - ②（BGV顔Y vs M0顔Y）は B7 Pass で閉じた。B8／第二手法は出さない
 - 定常 PLAYING・高速上下: Δ 中央0 最大1。EN PLAYING 最大275は消えた
@@ -1454,9 +1454,9 @@
 | 2 | EN 本番システムプロンプト差し替え＋テスト（prompt_dir。20/30 役割維持。割り込み／主導権定型の英語化） | **P1 Pass-with-note**（2026-08-27）。`main` FF 済（`f117d51` / `phase-p1-pass`） |
 | 3 | イベント動画 catalog 最大10＋管理画面プルダウン | **E1 Pass-with-defer**＋**E1b Pass-with-note**。`main` FF 済（2026-08-28。`e37893a` / `phase-e1b-pass`） |
 | 4 | 第三者向け「主要コマンド＋事前準備」docs（PROGRESS・ops_zoom・合格コマンドから抜く。チャット全文の要約にしない。ops_zoom は再発行しない） | **D1 Pass**（2026-08-28）。`docs/ops_third_party.md` / tag `phase-d1-pass`。ブランチ `feature/ops-third-party`。**main 未マージ** |
-| P1b | EN battle システムプロンプト差し替え（trash_talk 分割。コードなし） | **Pass-with-note**（2026-09-10）。ブランチ `feature/en-battle-prompt`。**main 未マージ** |
-| L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。`phase-l1-pass` / `a222313`。**main 未マージ** |
-| L2 | 長話口閉じの表示 clock 最小修正 | **Pass-with-note**（2026-09-11）。ブランチ `feature/vc-audio-ms-seam`。**main 未マージ** |
+| P1b | EN battle システムプロンプト差し替え（trash_talk 分割。コードなし） | **Pass-with-note**（2026-09-10）。`main` FF 済（`34458fb` / `phase-p1b-pass`） |
+| L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。`main` FF 済（`a222313` / `phase-l1-pass`） |
+| L2 | 長話口閉じの表示 clock 最小修正 | **Pass-with-note**（2026-09-11）。`main` FF 済（`523f7f6` / `phase-l2-pass`） |
 
 出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
 
@@ -2400,7 +2400,7 @@
 - **Pass-with-note。** seam の数秒 A は Before 比で消滅。主観 220653 / 221154 一致
 - Fail にしない: 1 回目 BG/FG 顔上下ずれ（既知）。対話末尾の短い REB/UNDERRUN（141259 HOL ではない）
 - 出さない: N↑、ジッタ延長、バースト専用、audio_ms 全体オフセット、catch-up 先出し、B 再開、次本線
-- Keep All（commit / tag `phase-l2-pass`）は **親が実施**。`in/*.txt`・logs は入れない。`main` マージは別依頼
+- Keep All（commit / tag `phase-l2-pass`）は **親が実施**。`in/*.txt`・logs は入れない。`main` FF 済（2026-09-11。`e37893a`→`523f7f6`。D1 は入れていない）
 - 次本線=なし（指名待ち）
 
 ---
@@ -3634,3 +3634,4 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-09-10 | Phase L1 Pass-with-note。指紋=A（seam の VC audio_ms=0）。定番3否定。実装・次本線は出さない。Keep All は親 |
 | 2026-09-10 | Phase L2 着手。seam の VC 表示 clock 最小修正。ブランチ `feature/vc-audio-ms-seam`（from `a222313`）。L1 はやり直さない |
 | 2026-09-11 | Phase L2 Pass-with-note。0 クランプ撤去で seam A 消滅。221154 / 220653 主観一致。Keep All は親。次本線なし |
+| 2026-09-11 | `main` へ `feature/vc-audio-ms-seam` を FF-only（`e37893a`→`523f7f6` / `phase-l2-pass`）。含む P1b+L1+L2。D1 は入れない。次指名待ち |
