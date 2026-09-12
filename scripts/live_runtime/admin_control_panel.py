@@ -34,6 +34,11 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     write_smith_effect,
     write_vad_profile,
 )
+from scripts.live_runtime.audio_device_name_query import (
+    PROFILE_LABELS,
+    AudioRouteResolveError,
+    resolve_audio_route_profile,
+)
 from scripts.live_runtime.prompt_dir_runtime_texts import (
     resolve_leadership_control_text,
     resolve_leadership_interrupt_text,
@@ -128,6 +133,45 @@ def main() -> None:
             st.code(f"obs_config:  {obs_config_file}")
             st.code(f"obs_local:   {obs_local_config_file}")
             st.code(f"prompt_dir:  {prompt_dir}")
+
+    st.header("音声経路")
+    st.caption(
+        "第三者は経路だけ選ぶ。番号は起動のたびに名前で再クエリし、"
+        "この画面のメモリにだけ出す。編集不可。ファイルに書かない。"
+        "Live は埋め込まない。"
+    )
+    profile_label = st.radio(
+        "経路",
+        options=[PROFILE_LABELS["local_usb"], PROFILE_LABELS["zoom"]],
+        horizontal=True,
+        key="audio_route_profile_label",
+    )
+    profile_key = next(
+        key for key, label in PROFILE_LABELS.items() if label == profile_label
+    )
+    if st.button("名前で再クエリ", use_container_width=False):
+        st.rerun()
+    try:
+        resolved = resolve_audio_route_profile(profile_key)
+        st.code(
+            "profile={profile} ({label})\n"
+            "out: {out_name}\n"
+            "     index={out_index}  (読み取り専用)\n"
+            "in:  {in_name}\n"
+            "     index={in_index}  (読み取り専用)".format(
+                profile=resolved.profile,
+                label=resolved.label,
+                out_name=resolved.output.name,
+                out_index=resolved.output.index,
+                in_name=resolved.input.name,
+                in_index=resolved.input.index,
+            )
+        )
+    except AudioRouteResolveError as exc:
+        st.error(exc.reason)
+        st.code(exc.format_refuse())
+
+    st.divider()
 
     st.header("基本操作")
 

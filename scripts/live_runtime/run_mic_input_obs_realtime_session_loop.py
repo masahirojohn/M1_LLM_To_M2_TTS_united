@@ -68,6 +68,7 @@ from prompt_dir_runtime_texts import (
     format_battle_interrupt_prompt,
     format_battle_interrupt_reserve_prompt,
 )
+from audio_device_name_query import bind_audio_route_or_refuse
 
 
 ALLOWED_EMO_IDS = {
@@ -8326,6 +8327,17 @@ def main() -> int:
         help="Strengthen system instruction to prioritize AUDIO response and short spoken output.",
     )
 
+    ap.add_argument(
+        "--audio_route_profile",
+        choices=("local_usb", "zoom"),
+        default=None,
+        help=(
+            "Third-party path. Resolve MME index by name each start "
+            "(local_usb=USB PnP speaker/mic, zoom=CABLE Input + "
+            "Voicemeeter Out B1). "
+            "CLI --audio_device / --mic_input_device override if passed."
+        ),
+    )
     ap.add_argument("--audio_device", default="15")
     ap.add_argument("--input_sr", type=int, default=16000)
 
@@ -8673,6 +8685,10 @@ def main() -> int:
     ap.add_argument("--mouth_formant_max_hz", type=int, default=5500)
 
     args = ap.parse_args()
+
+    bind_rc = bind_audio_route_or_refuse(args)
+    if bind_rc != 0:
+        return bind_rc
 
     if int(args.stream_mouth_m0_chunk_len_ms) not in (80, 120, 200, 400):
         raise ValueError("stream_mouth_m0_chunk_len_ms must be 80, 120, 200, or 400")

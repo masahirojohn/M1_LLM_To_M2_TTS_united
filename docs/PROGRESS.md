@@ -1425,11 +1425,13 @@
 | L2 | 長話口閉じの表示 clock 最小修正 | `pass` | 2026-09-11（Pass-with-note。seam A 消滅。負の audio_ms で前ターン FG 連続） |
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 | E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
+| Q1 | 起動時デバイス名前再クエリ | `pass` | 2026-09-12（Pass-with-note。名前解決＋起動前 bind。Live 主観は Gate にしない） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** L2 Pass-with-note。次指名待ち（子は出さない）
+- **今の本線 = なし。** Q1 Pass-with-note。次指名待ち（子は出さない）。D1 は main に載せない。
+- Q1 Keep: 第三者経路は `--audio_route_profile`（`zoom` / `local_usb`）のみ。起動のたびに MME 名前解決。番号はメモリのみ。0件/曖昧/B1無しは起動拒否。CLI `--audio_device` / `--mic_input_device` は開発者上書き。admin は読み取り専用。ops_zoom の番号スナップショットは再発行しない
 - L2 Keep: VC `audio_ms = player_local_ms − base_ms`（0 クランプしない）。負の `audio_ms` は offset より前の既存 FG に連続マップ。全体オフセットでも catch-up 先出しでもない。`run_virtualcam_persistent.py` のみ runtime。`main` FF 済（`523f7f6` / `phase-l2-pass`）
 - L1 Keep: 長話口閉じ指紋は **A**（PLAYING＋pending 秒単位。VC だけ `audio_ms=0` / `shown_fg=frame_offset`）。再発は長ターン開始 seam（主観の「同ターン再発」は idle 連続）。定番3（wait_mouth / order_wait HOL / M0 N）は長話主因ではない。141259 のバースト HOL・中盤 REB は長話と別指紋。`phase-l1-pass` = `a222313`
 - E1b Keep: override 中 Live PCM は dispatcher `_enqueue_one` で drop（Hold しない。play_wav 非経由）。override 映像は壁時計1枚/スロット（cam catch-up 禁止）。`_open_later` duration 維持
@@ -1457,8 +1459,9 @@
 | P1b | EN battle システムプロンプト差し替え（trash_talk 分割。コードなし） | **Pass-with-note**（2026-09-10）。`main` FF 済（`34458fb` / `phase-p1b-pass`） |
 | L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。`main` FF 済（`a222313` / `phase-l1-pass`） |
 | L2 | 長話口閉じの表示 clock 最小修正 | **Pass-with-note**（2026-09-11）。`main` FF 済（`523f7f6` / `phase-l2-pass`） |
+| Q1 | 起動時デバイス名前再クエリ（番号をファイルに焼かない） | **Pass-with-note**（2026-09-12）。ブランチ `feature/device-name-query`（from `main` `f8b76a1`）。Keep All は親。main 未マージ |
 
-出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。
+出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。D1 の main マージ。ops_zoom 再発行。
 
 ### OBS 音声ルーティング（親定義・子へ固定）
 
@@ -2401,6 +2404,59 @@
 - Fail にしない: 1 回目 BG/FG 顔上下ずれ（既知）。対話末尾の短い REB/UNDERRUN（141259 HOL ではない）
 - 出さない: N↑、ジッタ延長、バースト専用、audio_ms 全体オフセット、catch-up 先出し、B 再開、次本線
 - Keep All（commit / tag `phase-l2-pass`）は **親が実施**。`in/*.txt`・logs は入れない。`main` FF 済（2026-09-11。`e37893a`→`523f7f6`。D1 は入れていない）
+- 次本線=**Q1**（2026-09-12 着手。起動時デバイス名前再クエリ）
+
+---
+
+## Phase Q1: 起動時デバイス名前再クエリ
+
+**目的:** 第三者が MME 番号を覚えず、経路（手元 USB / Zoom）を選んで起動できる。番号は起動のたびに名前解決し、**メモリにだけ持つ**。ファイルに焼くな。
+
+**作業ブランチ:** `feature/device-name-query`（from `main` `f8b76a1`）。D1（`feature/ops-third-party`）は載せるな。
+
+**確定事実（覆すな）:**
+- 番号永久固定禁止。Windows 更新で MME はずれる。第三者に番号手書きをさせない
+- 経路は **名前セット** だけ持つ。採用は起動のたびに `query_devices()`（**MME**）。前回番号を使わない
+- Zoom 出＝名前に **「CABLE Input」**（「CABLE In 16ch」ではない）。Zoom 入＝名前に **「Voicemeeter Out B1」**（「CABLE Output」ではない）
+- 手元 USB 出／入＝名前に **「USB PnP」** の speaker / mic（「WebCamera」ではない）
+- 0件または2件以上、Banana 未起動で B1 無し → **起動しない**。推測しない。一覧を出して止める
+- 画面に今回の解決番号を **読み取り専用** 表示してよい。編集させない
+- CLI `--audio_device` / `--mic_input_device` は **開発者上書きのみ**。第三者経路はプロファイルだけ
+- 管理画面に Live を埋め込まない。バトル開始ボタン・連続バトル・壁時計・割り込みゲートは出さない
+- `docs/ops_zoom_third_party.md` は再発行しない。D1 を main に載せない
+
+**スコープ（子）:**
+1. プロファイル→名前セット→MME 1件一致→そのプロセスの device index
+2. 失敗時は起動拒否＋理由（一覧付き）。推測マッチ禁止
+3. 解決結果をログと管理画面の読み取り専用に出す
+4. 呼び出しは session_loop 起動時と admin。図A・player・M0・prompt は触るな
+
+**スコープ外（Q1 禁止）:**
+- 番号の SSOT ファイル（`in/*.txt` / `configs` に index を書くな）
+- CABLE を Hardware In、session_loop ミックス、Streamlit `asyncio.run` で Live、二重 Live
+- N↑、ジッタ延長、session_loop sleep、talkover 変更、口 barge-in、B/O 再開
+- ops_zoom 再発行、D1 merge、Q1 以外の残り開発
+- `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
+
+**Pass 基準:**
+- [x] Zoom / 手元 USB で名前解決が1件になり、起動前 bind にその index が入る
+- [x] Ambiguous / 欠落で起動しない（一覧＋理由。失敗はフィクスチャ可）
+- [x] 番号を `in/*.txt` や `configs` に書いていない
+- [x] 図A / 方式2 / L2 / P1b / E1b 非破壊
+- [x] 親向けサマリーのみ
+
+**子報告要約（2026-09-12）:**
+- ヘルパ `audio_device_name_query.py`。session_loop は `--audio_route_profile`＋`asyncio.run(_run)` 前 bind。admin は経路ラジオ＋`st.code` 読み取り専用
+- この機: Zoom 出 `CABLE Input` **23** / 入 `Voicemeeter Out B1` **10**。手元 USB 出 **17** / 入 **1**
+- 失敗 rc=2: 0件 / 曖昧 / B1 無し。推測なし。番号ファイルなし
+- 証拠範囲: Live `_run` 未起動。失敗はフィクスチャ。admin ラジオは session_loop に渡さない。プロファイル未指定は旧 default `--audio_device 15`
+
+**親判定（2026-09-12）:**
+- **Pass-with-note。** 名前1件→起動前 bind、拒否＋一覧、非永続は成立。Live 主観は Q1 Gate にしない
+- Fail にしない: admin ラジオが session_loop に渡らない（Live 埋め込み禁止どおり）。失敗フィクスチャ。B1 が ops_zoom スナップショット 9 ではなく 10（再クエリ Keep）
+- 第三者起動は `--audio_route_profile zoom` または `local_usb`。番号 CLI は開発者上書きのみ
+- 出さない: ops_zoom 再発行、default 15 変更、D1 merge、Live 埋め込み、次本線
+- Keep All（commit / tag `phase-q1-pass`）は **親が実施**。子はしない。`in/*.txt`・logs は入れない。main マージは別依頼
 - 次本線=なし（指名待ち）
 
 ---
@@ -3635,3 +3691,5 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-09-10 | Phase L2 着手。seam の VC 表示 clock 最小修正。ブランチ `feature/vc-audio-ms-seam`（from `a222313`）。L1 はやり直さない |
 | 2026-09-11 | Phase L2 Pass-with-note。0 クランプ撤去で seam A 消滅。221154 / 220653 主観一致。Keep All は親。次本線なし |
 | 2026-09-11 | `main` へ `feature/vc-audio-ms-seam` を FF-only（`e37893a`→`523f7f6` / `phase-l2-pass`）。含む P1b+L1+L2。D1 は入れない。次指名待ち |
+| 2026-09-12 | 新親着任。本線=Q1 起動時デバイス名前再クエリ。ブランチ `feature/device-name-query`（from `main` `f8b76a1`）。番号をファイルに焼くな。D1 未マージ維持。子プロンプト発行 |
+| 2026-09-12 | Phase Q1 Pass-with-note。名前解決＋起動前 bind。Live 主観は Gate 外。Keep All は親。次本線なし |
