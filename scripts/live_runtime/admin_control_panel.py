@@ -21,7 +21,7 @@ from scripts.live_runtime.battle_runtime_admin_api import (
     read_status,
     write_control,
     write_event,
-    write_interrupt,
+    write_interrupt_unless_playing,
     write_leadership_open,
     write_leadership_start,
     write_zoom_leadership_start,
@@ -88,6 +88,11 @@ def main() -> None:
             value=str(DEFAULT_INTERRUPT_FILE),
         )
 
+        playback_state_file_str = st.text_input(
+            "playback_state.json（空なら最新セッション）",
+            value="",
+        )
+
         event_file_str = st.text_input(
             "event_runtime_live.txt",
             value=str(DEFAULT_EVENT_FILE),
@@ -115,6 +120,11 @@ def main() -> None:
 
         control_file = Path(control_file_str)
         interrupt_file = Path(interrupt_file_str)
+        playback_state_file = (
+            Path(playback_state_file_str.strip())
+            if playback_state_file_str.strip()
+            else None
+        )
         event_file = Path(event_file_str)
         event_catalog_file = Path(event_catalog_file_str)
         vad_profile_file = Path(vad_profile_file_str)
@@ -127,6 +137,7 @@ def main() -> None:
         with st.expander("Current paths", expanded=False):
             st.code(f"control:     {control_file}")
             st.code(f"interrupt:   {interrupt_file}")
+            st.code(f"playback:    {playback_state_file or '(latest session)'}")
             st.code(f"event:       {event_file}")
             st.code(f"catalog:     {event_catalog_file}")
             st.code(f"vad_profile: {vad_profile_file}")
@@ -185,15 +196,24 @@ def main() -> None:
 
     with b1:
         if st.button("今すぐ割り込め", type="primary", use_container_width=True):
-            write_interrupt(
+            result = write_interrupt_unless_playing(
                 interrupt_file=interrupt_file,
+                playback_state_file=playback_state_file,
                 text=quick_interrupt_text,
                 priority="battle",
                 expire_sec=60.0,
                 prompt_dir=prompt_dir,
             )
-            _append_ui_log(f"interrupt text={quick_interrupt_text}")
-            st.success("割り込みを投入しました。")
+            if result.get("discarded"):
+                _append_ui_log(
+                    f"interrupt discarded state={result.get('state')}"
+                )
+                st.warning(
+                    "PLAYING 中のため破棄しました（ファイル未更新）。"
+                )
+            else:
+                _append_ui_log(f"interrupt text={quick_interrupt_text}")
+                st.success("割り込みを投入しました。")
 
     with b2:
         if st.button("主導権奪取", type="primary", use_container_width=True):

@@ -53,6 +53,10 @@ DEFAULT_INTERRUPT_FILE = DEFAULT_ROOT / "in" / "battle_interrupt_live.txt"
 DEFAULT_EVENT_FILE = DEFAULT_ROOT / "in" / "event_runtime_live.txt"
 DEFAULT_EVENT_CATALOG_FILE = DEFAULT_ROOT / "in" / "event_catalog.json"
 DEFAULT_VAD_PROFILE_FILE = DEFAULT_ROOT / "in" / "vad_profile_live.txt"
+DEFAULT_PLAYBACK_STATE_SESSIONS_ROOT = (
+    DEFAULT_ROOT / "out" / "obs_realtime_session_loop"
+)
+PLAYER_PLAYBACK_STATE_PLAYING = "PLAYING"
 
 EVENT_CATALOG_MAX = 10
 
@@ -102,6 +106,118 @@ def write_interrupt(
     write_json(interrupt_file, payload)
 
     return payload
+
+
+def resolve_playback_state_file(
+    *,
+    playback_state_file: Path | str | None = None,
+    sessions_root: Path | str | None = None,
+) -> Path | None:
+    """Return an existing player playback_state.json, or None.
+
+    Explicit path wins. Otherwise newest */sync/playback_state.json under
+    out/obs_realtime_session_loop. Does not invent a clock.
+    """
+    if playback_state_file is not None:
+        text = str(playback_state_file).strip()
+        if text:
+            return Path(text)
+    root = Path(sessions_root or DEFAULT_PLAYBACK_STATE_SESSIONS_ROOT)
+    if not root.is_dir():
+        return None
+    candidates = [
+        path
+        for path in root.glob("*/sync/playback_state.json")
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def read_player_playback_state(
+    playback_state_file: Path | str | None,
+) -> dict[str, Any] | None:
+    """Read player playback_state.json. None if missing or unreadable."""
+    if playback_state_file is None:
+        return None
+    path = Path(playback_state_file)
+    if not path.is_file():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
+
+
+def is_player_playback_playing(
+    playback_state_file: Path | str | None,
+) -> bool:
+    """True only when existing player state is exactly PLAYING."""
+    payload = read_player_playback_state(playback_state_file)
+    if payload is None:
+        return False
+    return str(payload.get("state", "") or "") == PLAYER_PLAYBACK_STATE_PLAYING
+
+
+def write_interrupt_unless_playing(
+    *,
+    interrupt_file: Path | str = DEFAULT_INTERRUPT_FILE,
+    playback_state_file: Path | str | None = None,
+    text: str | None = None,
+    priority: str = "battle",
+    expire_sec: float = 60.0,
+    prompt_dir: Path | str | None = None,
+    sessions_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """Admin 「今すぐ割り込め」only. Confirmed PLAYING → no write."""
+    state_path = resolve_playback_state_file(
+        playback_state_file=playback_state_file,
+        sessions_root=sessions_root,
+    )
+    payload = read_player_playback_state(state_path)
+    if payload is None:
+        state = "MISSING" if state_path is None or not Path(state_path).is_file() else "UNREADABLE"
+    else:
+        state = str(payload.get("state", "") or "") or "UNKNOWN"
+
+    if state == PLAYER_PLAYBACK_STATE_PLAYING:
+        print(
+            "[admin][interrupt_discard]",
+            f"state={state}",
+            f"playback_state={state_path}",
+            f"interrupt_file={interrupt_file}",
+            flush=True,
+        )
+        return {
+            "discarded": True,
+            "state": state,
+            "playback_state_file": str(state_path) if state_path is not None else "",
+        }
+
+    written = write_interrupt(
+        interrupt_file=interrupt_file,
+        text=text,
+        priority=priority,
+        expire_sec=expire_sec,
+        prompt_dir=prompt_dir,
+    )
+    print(
+        "[admin][interrupt_write]",
+        f"state={state}",
+        f"playback_state={state_path}",
+        f"interrupt_file={interrupt_file}",
+        flush=True,
+    )
+    return {
+        "discarded": False,
+        "state": state,
+        "playback_state_file": str(state_path) if state_path is not None else "",
+        "payload": written,
+    }
 
 
 def load_event_catalog(

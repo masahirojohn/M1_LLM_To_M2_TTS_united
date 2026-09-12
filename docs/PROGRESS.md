@@ -1426,11 +1426,14 @@
 | E1 | イベント動画 catalog 最大10＋管理画面プルダウン | `pass` | 2026-08-27（Pass-with-defer。完了ゲート→E1b） |
 | E1b | イベント完了まで Live PCM drop ゲート | `pass` | 2026-08-28（Pass-with-note。override 壁時計1枚/スロット） |
 | Q1 | 起動時デバイス名前再クエリ | `pass` | 2026-09-12（Pass-with-note。名前解決＋起動前 bind。Live 主観は Gate にしない） |
+| G1 | 管理画面「今すぐ割り込め」PLAYING ゲート | `pass` | 2026-09-12（Pass-with-note。PLAYING 破棄。2回目クリック未達は持ち越し） |
 
 ### Bライン申し送り（2026-08-25・main マージ済）
 
 - 運用 Keep: 方式 A／pose=BGV 絶対 index／B3hf2 sync／方式C（境スナップ）／IDLE_BG_ADVANCE／`[B6_DELTA]`（tag `phase-b7-pass` = `813c641`。main FF 済）
-- **今の本線 = なし。** Q1 Pass-with-note。`main` FF 済（`f8b76a1`→`99b4011` / `phase-q1-pass`）。次指名待ち（子は出さない）。D1 は main に載せない。
+- **今の本線 = なし。** G1 Pass-with-note。次指名待ち（子は出さない）。D1 は main に載せない。
+- G1 Keep: 「今すぐ割り込め」だけ。`playback_state` が PLAYING 確定なら `write_interrupt` しない（ファイル未更新＋破棄表示）。IDLE / BUFFERING / REBUFFERING / UNKNOWN / 無し・読めないは投入。主導権／Zoom主導権／talkover 非対象。`write_interrupt` 本体未改変
+- G1 持ち越し（未解決・運用必須）: 主観で2回目「今すぐ割り込め」のハンドラ行が1本だけに見える。コードに once フラグは無い。禁止＝2回目が無言で死ぬ。次主観で UI Operation Log 2本＋ターミナル `[admin][interrupt_discard|write]` 2本を切り分ける。ゲート本体とは別件。今は実装子を出さない
 - Q1 Keep: 第三者経路は `--audio_route_profile`（`zoom` / `local_usb`）のみ。起動のたびに MME 名前解決。番号はメモリのみ。0件/曖昧/B1無しは起動拒否。CLI `--audio_device` / `--mic_input_device` は開発者上書き。admin は読み取り専用。ops_zoom の番号スナップショットは再発行しない。`main` FF 済（`99b4011` / `phase-q1-pass`）
 - L2 Keep: VC `audio_ms = player_local_ms − base_ms`（0 クランプしない）。負の `audio_ms` は offset より前の既存 FG に連続マップ。全体オフセットでも catch-up 先出しでもない。`run_virtualcam_persistent.py` のみ runtime。`main` FF 済（`523f7f6` / `phase-l2-pass`）
 - L1 Keep: 長話口閉じ指紋は **A**（PLAYING＋pending 秒単位。VC だけ `audio_ms=0` / `shown_fg=frame_offset`）。再発は長ターン開始 seam（主観の「同ターン再発」は idle 連続）。定番3（wait_mouth / order_wait HOL / M0 N）は長話主因ではない。141259 のバースト HOL・中盤 REB は長話と別指紋。`phase-l1-pass` = `a222313`
@@ -1460,8 +1463,9 @@
 | L1 | 長話口閉じ計測（実装なし） | **Pass-with-note**（2026-09-10）。`main` FF 済（`a222313` / `phase-l1-pass`） |
 | L2 | 長話口閉じの表示 clock 最小修正 | **Pass-with-note**（2026-09-11）。`main` FF 済（`523f7f6` / `phase-l2-pass`） |
 | Q1 | 起動時デバイス名前再クエリ（番号をファイルに焼かない） | **Pass-with-note**（2026-09-12）。`main` FF 済（`f8b76a1`→`99b4011` / `phase-q1-pass`）。D1 は入れていない |
+| G1 | 管理画面「今すぐ割り込め」PLAYING ゲート（口 talkover は触らない） | **Pass-with-note**（2026-09-12）。ブランチ `feature/admin-interrupt-gate`。Keep All は親。main 未マージ。2回目クリック未達は持ち越し |
 
-出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。D1 の main マージ。ops_zoom 再発行。
+出さない: 二重 Live 自己対戦。B8／貼り／口−音／Colab／N↑／ジッタ延長／session_loop ミックス。D1 の main マージ。ops_zoom 再発行。口 talkover ゲート。主導権／Zoom主導権。②壁時計／③連続／④定型追記。
 
 ### OBS 音声ルーティング（親定義・子へ固定）
 
@@ -2457,6 +2461,57 @@
 - 第三者起動は `--audio_route_profile zoom` または `local_usb`。番号 CLI は開発者上書きのみ
 - 出さない: ops_zoom 再発行、default 15 変更、D1 merge、Live 埋め込み、次本線
 - Keep All（commit / tag `phase-q1-pass`）は **親が実施**。子はしない。`in/*.txt`・logs は入れない。`main` FF 済（2026-09-12。`f8b76a1`→`99b4011`。D1 は入れていない）
+- 次本線=**G1**（2026-09-12 着手。管理画面「今すぐ割り込め」PLAYING ゲート）
+
+---
+
+## Phase G1: 管理画面「今すぐ割り込め」PLAYING ゲート
+
+**目的:** 第三者の誤押し防止。猫が鳴っている最中に定型 interrupt を投げない。「今すぐ割り込め」が PLAYING 中なら no-op。
+
+**作業ブランチ:** `feature/admin-interrupt-gate`（from `main` `03915ea`＝`99b4011`＋Q1 FF記録）。D1（`feature/ops-third-party`）は載せるな。
+
+**確定事実（覆すな）:**
+- 対象ボタンは **「今すぐ割り込め」だけ**。主導権奪取 / Zoom主導権 / 主導権解除 OPEN は触るな
+- 口 barge-in＝既存 talkover。mute しない。**G1 で触るな・ゲートするな**
+- PLAYING **確定**のときだけ破棄。`in/battle_interrupt_live.txt` に書くな。UI に破棄と出す
+- IDLE / BUFFERING / REBUFFERING / UNKNOWN / 状態ファイル無し・読めない → **破棄するな**。今どおり `write_interrupt`
+- 状態は既存 player の `playback_state`（猫の再生 state）。壁時計・session_loop sleep・第二時計を作るな
+- 管理画面に Live を埋め込むな。連続バトル・壁時計尺・定型追記・自己対戦改善は出さない
+- Q1 Keep: `--audio_route_profile`。番号をファイルに焼くな。D1 を main に載せない。ops_zoom 再発行しない
+
+**スコープ（子）:**
+1. `admin_control_panel.py` の「今すぐ割り込め」だけ。必要なら状態を読む最小ヘルパ
+2. 既存 `playback_state` を読んで PLAYING なら `write_interrupt` しない
+3. 破棄ログと画面表示。ファイル未更新
+
+**スコープ外（G1 禁止）:**
+- talkover / session_loop の interrupt 消費 / 主導権 / Zoom主導権
+- 図A / player / M0 / prompt / YAML / Q1 改変
+- ②壁時計／③連続／④定型追記／⑤⑥
+- Streamlit `asyncio.run` で Live、session_loop sleep、N↑、ジッタ延長、text trigger 復活、虐殺短文化
+- `docs/PROGRESS.md` 編集。commit / tag / Keep All（親がやる）
+
+**Pass 基準:**
+- [x] PLAYING 中はファイル未更新＋破棄表示
+- [x] 非 PLAYING（IDLE / BUFFERING / REBUFFERING / UNKNOWN / 無し・読めない）は今どおり投入
+- [x] talkover / 主導権 / 図A / Q1 / L2 / P1b / E1b 非破壊
+- [x] 親向けサマリーのみ。Live 主観は Gate にしない
+
+**子報告要約（2026-09-12）:**
+- admin「今すぐ割り込め」のみ `write_interrupt_unless_playing`。`write_interrupt` 本体未改変
+- PLAYING: ファイル `SENTINEL_UNCHANGED`／未作成。ログ `[admin][interrupt_discard]`。UI 破棄表示
+- 非 PLAYING（IDLE / BUFFERING / REBUFFERING / UNKNOWN / 無し / 読めない / 空）: `write_interrupt`（text / battle / 60s 据え置き）
+- 主導権／Zoom主導権は従来関数。PLAYING でも leadership は interrupt を書く。talkover / session_loop / player 非触
+- Q1 selfcheck PASS。L2 / P1b / E1b 非触
+
+**親判定（2026-09-12）:**
+- **Pass-with-note。** PLAYING 破棄と非 PLAYING 投入は成立。Live 主観は G1 Gate にしない
+- **持ち越し（未解決・運用必須）:** 主観で2回目「今すぐ割り込め」を押したつもりだが、管理ログのハンドラは discard 1本のみ。2回目が Streamlit に届いた証拠が無い。コードに once フラグは無い。禁止状態＝ボタンがセッション中1回しか効かない／2回目が無言で死ぬ。ゲート本体とは別件。今は実装子を出さない
+- 次主観の切り分け: (1) UI Operation Log に2本目（時刻付き discard または投入）が無ければ Streamlit 未達 (2) ターミナル `[admin][interrupt_discard|write]` がクリック回数分あるか。UI に2本目があるのにターミナルだけ1本ならログ欠落 (3) 2回ともログが揃えば今回限り。判定＝2回押す→2本のハンドラ行
+- Fail にしない: 主導権が PLAYING 中も interrupt を書く（対象外どおり）
+- 出さない: talkover ゲート、主導権改変、②③④⑤⑥、次本線の実装子
+- Keep All（commit / tag `phase-g1-pass`）は **親が実施**。子はしない。`in/*.txt`・logs は入れない。main マージは別依頼
 - 次本線=なし（指名待ち）
 
 ---
@@ -3694,3 +3749,5 @@ X1+F1 commit 後。別ブランチ。スプライト 6→9＋M3英語 knn。JP �
 | 2026-09-12 | 新親着任。本線=Q1 起動時デバイス名前再クエリ。ブランチ `feature/device-name-query`（from `main` `f8b76a1`）。番号をファイルに焼くな。D1 未マージ維持。子プロンプト発行 |
 | 2026-09-12 | Phase Q1 Pass-with-note。名前解決＋起動前 bind。Live 主観は Gate 外。Keep All は親。次本線なし |
 | 2026-09-12 | `main` へ `feature/device-name-query` を FF-only（`f8b76a1`→`99b4011` / `phase-q1-pass`）。D1 は入れない。次指名待ち |
+| 2026-09-12 | 本線=G1 「今すぐ割り込め」PLAYING ゲート。ブランチ `feature/admin-interrupt-gate`（from `main` `03915ea`＝含む `99b4011`）。口 talkover 非対象。子プロンプト発行 |
+| 2026-09-12 | Phase G1 Pass-with-note。PLAYING 破棄成立。2回目クリック未達は持ち越し（次主観で切り分け。今は実装子なし）。Keep All は親。次本線なし |
